@@ -8,13 +8,14 @@
   const { midiToFreq, mapRange } = MeshAudio.helpers;
 
   // Base frequencies per payload type (in MIDI notes)
+  // Shifted up ~1 octave for brighter, more audible pings
   const PING_TONES = {
-    ADVERT: 60,      // C4 (middle C) — high, bright
-    GRP_TXT: 55,     // G3 — medium
-    TXT_MSG: 50,     // D3 — lower
-    TRACE: 45,       // A2 — deep
+    ADVERT: 72,      // C5 — high, bright
+    GRP_TXT: 67,     // G4 — medium-high
+    TXT_MSG: 62,     // D4 — medium
+    TRACE: 57,       // A3 — lower
   };
-  const DEFAULT_TONE = 55;
+  const DEFAULT_TONE = 67;
 
   function play(audioCtx, masterGain, parsed, opts) {
     const { typeName, hopCount, obsCount, payload, hops } = parsed;
@@ -25,8 +26,8 @@
     const baseFreq = midiToFreq(baseMidi);
 
     // Frequency sweep: hops → deeper sweep (more hops = lower end frequency)
-    const sweepStartFreq = baseFreq * 1.5; // start ~50% higher
-    const sweepEndMultiplier = mapRange(Math.min(hopCount, 10), 1, 10, 0.7, 0.4); // deeper for more hops
+    const sweepStartFreq = baseFreq * 1.3; // start ~30% higher (less dramatic)
+    const sweepEndMultiplier = mapRange(Math.min(hopCount, 10), 1, 10, 0.85, 0.6); // shallower sweep
     const sweepEndFreq = baseFreq * sweepEndMultiplier;
 
     // Pan from longitude (if available)
@@ -68,13 +69,13 @@
     // Oscillator: sine wave, frequency sweep
     osc.type = 'sine';
     osc.frequency.setValueAtTime(sweepStartFreq, audioCtx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(sweepEndFreq, audioCtx.currentTime + 0.15 * tm);
+    osc.frequency.exponentialRampToValueAtTime(sweepEndFreq, audioCtx.currentTime + 0.08 * tm); // shorter sweep
 
     // Envelope: sharp attack, quick decay
     const now = audioCtx.currentTime + 0.01; // small lookahead
-    const attackTime = 0.005; // very sharp attack (5ms)
-    const decayTime = 0.3 * tm;
-    const releaseTime = 0.5 * tm;
+    const attackTime = 0.003; // very sharp attack (3ms)
+    const decayTime = 0.12 * tm; // shorter decay
+    const releaseTime = 0.2 * tm; // shorter release
     const totalDuration = attackTime + decayTime + releaseTime;
 
     oscGain.gain.setValueAtTime(0.0001, now);

@@ -219,6 +219,9 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 /* Hide non-primary nav links — they appear in the More dropdown */
 .nav-links a:not([data-priority="high"]) { display: none !important; }
 
+/* Always show More button since non-priority links are hidden on all screens */
+.nav-more-wrap { display: flex !important; align-items: center; }
+
 /* Compact stat items: emoji + number only, label on hover */
 .stat-item { cursor: default; display: inline-flex; align-items: center; gap: 2px; }
 .stat-emoji { font-size: 11px; line-height: 1; }

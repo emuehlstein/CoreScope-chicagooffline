@@ -925,7 +925,7 @@
 
     // Build layer control (basemaps + CO overlays)
     const _liveLayerCtrl = window.buildLayerControl
-      ? window.buildLayerControl(map, { isDark: isDark, position: 'topright', collapsed: true })
+      ? window.buildLayerControl(map, { isDark: isDark, position: 'bottomright', collapsed: true })
       : { activeBasemap: L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { maxZoom: 19 }).addTo(map) };
     L.control.zoom({ position: 'topright' }).addTo(map);
 

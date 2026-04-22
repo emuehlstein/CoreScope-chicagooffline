@@ -191,7 +191,7 @@
 
     // Build layer control (basemaps + CO overlays)
     const _layerCtrl = window.buildLayerControl
-      ? window.buildLayerControl(map, { isDark: isDark, position: 'topright', collapsed: true })
+      ? window.buildLayerControl(map, { isDark: isDark, position: 'bottomright', collapsed: true })
       : { activeBasemap: L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { attribution: '© OpenStreetMap © CartoDB', maxZoom: 19 }).addTo(map) };
 
     // Save position on move

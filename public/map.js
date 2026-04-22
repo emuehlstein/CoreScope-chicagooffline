@@ -188,16 +188,11 @@
 
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    const tileLayer = L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, {
-      attribution: '© OpenStreetMap © CartoDB',
-      maxZoom: 19,
-    }).addTo(map);
-    const _mapThemeObs = new MutationObserver(function () {
-      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-      tileLayer.setUrl(dark ? TILE_DARK : TILE_LIGHT);
-    });
-    _mapThemeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+    // Build layer control (basemaps + CO overlays)
+    const _layerCtrl = window.buildLayerControl
+      ? window.buildLayerControl(map, { isDark: isDark, position: 'topright', collapsed: true })
+      : { activeBasemap: L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { attribution: '© OpenStreetMap © CartoDB', maxZoom: 19 }).addTo(map) };
 
     // Save position on move
     map.on('moveend', () => {

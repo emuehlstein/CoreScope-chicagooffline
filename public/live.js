@@ -923,10 +923,20 @@
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
 
-    // Build layer control (basemaps + CO overlays)
-    const _liveLayerCtrl = window.buildLayerControl
-      ? window.buildLayerControl(map, { isDark: isDark, position: 'bottomright', collapsed: true })
-      : { activeBasemap: L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { maxZoom: 19 }).addTo(map) };
+    // Init basemap via CO_BASEMAP helper (shares mode selection with main map)
+    if (window.CO_BASEMAP) {
+      window.CO_BASEMAP.init(map, isDark);
+    } else {
+      L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { maxZoom: 19 }).addTo(map);
+    }
+
+    // Swap basemap tiles when theme changes
+    const _themeObs = new MutationObserver(function () {
+      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      if (window.CO_BASEMAP) window.CO_BASEMAP.onThemeChange(dark);
+    });
+    _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     L.control.zoom({ position: 'topright' }).addTo(map);
 
     nodesLayer = L.layerGroup().addTo(map);

@@ -154,6 +154,14 @@
             </select>
           </fieldset>
           <fieldset class="mc-section">
+            <legend class="mc-label">Basemap</legend>
+            <div class="filter-group" id="mcBasemap">
+              <button class="btn" data-basemap="carto">Carto</button>
+              <button class="btn" data-basemap="satellite">Satellite</button>
+              <button class="btn" data-basemap="hillshade">Hillshade</button>
+            </div>
+          </fieldset>
+          <fieldset class="mc-section">
             <legend class="mc-label">Quick Jump</legend>
             <div class="mc-jumps" id="mcJumps" role="group" aria-label="Jump to region"></div>
           </fieldset>
@@ -189,10 +197,20 @@
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
 
-    // Build layer control (basemaps + CO overlays)
-    const _layerCtrl = window.buildLayerControl
-      ? window.buildLayerControl(map, { isDark: isDark, position: 'bottomright', collapsed: true })
-      : { activeBasemap: L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { attribution: '© OpenStreetMap © CartoDB', maxZoom: 19 }).addTo(map) };
+    // Init basemap via CO_BASEMAP helper
+    if (window.CO_BASEMAP) {
+      window.CO_BASEMAP.init(map, isDark);
+    } else {
+      L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { attribution: '© OpenStreetMap © CartoDB', maxZoom: 19 }).addTo(map);
+    }
+
+    // Swap basemap tiles when theme changes
+    const _mapThemeObs = new MutationObserver(function () {
+      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      if (window.CO_BASEMAP) window.CO_BASEMAP.onThemeChange(dark);
+    });
+    _mapThemeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
     // Save position on move
     map.on('moveend', () => {
@@ -288,6 +306,20 @@
         renderMarkers();
       });
     });
+
+    // Basemap selector buttons
+    (function () {
+      const btns = document.querySelectorAll('#mcBasemap .btn');
+      const activeMode = window.CO_BASEMAP ? window.CO_BASEMAP.getMode() : 'carto';
+      btns.forEach(btn => btn.classList.toggle('active', btn.dataset.basemap === activeMode));
+      btns.forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (!window.CO_BASEMAP) return;
+          window.CO_BASEMAP.setMode(btn.dataset.basemap);
+          btns.forEach(b => b.classList.toggle('active', b.dataset.basemap === btn.dataset.basemap));
+        });
+      });
+    })();
 
     // Byte size filter buttons
     document.querySelectorAll('#mcByteFilter .btn').forEach(btn => {

@@ -837,7 +837,7 @@ window.addEventListener('DOMContentLoaded', () => {
       const stats = await api('/stats', { ttl: CLIENT_TTL.stats });
       const el = document.getElementById('navStats');
       if (el) {
-        el.innerHTML = `📦 <span class="stat-val">${stats.totalPackets}</span> pkts · 🔵 <span class="stat-val">${stats.totalNodes}</span> nodes · 📡 <span class="stat-val">${stats.totalObservers}</span> obs${formatVersionBadge(stats.version, stats.commit, stats.engine, stats.buildTime)}`;
+        el.innerHTML = `<span class="stat-item" title="Total packets"><span class="stat-emoji">📦</span> <span class="stat-val">${stats.totalPackets}</span></span><span class="stat-sep">·</span><span class="stat-item" title="Unique nodes"><span class="stat-emoji">🔵</span> <span class="stat-val">${stats.totalNodes}</span></span><span class="stat-sep">·</span><span class="stat-item" title="Active observers"><span class="stat-emoji">📡</span> <span class="stat-val">${stats.totalObservers}</span></span>${formatVersionBadge(stats.version, stats.commit, stats.engine, stats.buildTime)}`;
         el.querySelectorAll('.stat-val').forEach(s => s.classList.add('updated'));
         setTimeout(() => { el.querySelectorAll('.stat-val').forEach(s => s.classList.remove('updated')); }, 600);
       }

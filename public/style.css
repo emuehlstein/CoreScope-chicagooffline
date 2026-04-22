@@ -215,6 +215,11 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 
 /* Hide version/commit badge in nav stats — info is still in /api/stats */
 .nav-stats .version-badge { display: none; }
+
+/* Compact stat items: emoji + number only, label on hover */
+.stat-item { cursor: default; display: inline-flex; align-items: center; gap: 2px; }
+.stat-emoji { font-size: 11px; line-height: 1; }
+.stat-sep { margin: 0 6px; opacity: 0.4; }
 /* === Nav Stats === */
 .nav-stats {
   display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--nav-text-muted);

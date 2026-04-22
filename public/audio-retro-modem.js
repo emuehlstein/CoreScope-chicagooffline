@@ -1,5 +1,5 @@
 // public/audio-retro-modem.js
-// Retro modem / FSK voice — chirps, clicks, bandpass filter.
+// "Squeaker" voice — retro modem / FSK chirps, clicks, bandpass filter.
 // Each packet plays as a short burst of modem-like tones derived from payload bytes.
 (function () {
   'use strict';
@@ -194,8 +194,9 @@
     return (chirpCount * profile.spacing + 0.15) * tm;
   }
 
-  MeshAudio.registerVoice('retro-modem', {
-    name: 'retro-modem',
+  MeshAudio.registerVoice('squeaker', {
+    name: 'squeaker',
+    defaultBpm: 80,
     play
   });
 })();

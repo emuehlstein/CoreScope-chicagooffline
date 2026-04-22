@@ -130,6 +130,10 @@
     if (window._meshAudioVoices && window._meshAudioVoices[name]) {
       currentVoice = window._meshAudioVoices[name];
       localStorage.setItem('live-audio-voice', name);
+      // Apply voice's preferred BPM if user hasn't manually set one
+      if (currentVoice.defaultBpm && !localStorage.getItem('live-audio-bpm')) {
+        bpm = currentVoice.defaultBpm;
+      }
       return true;
     }
     return false;

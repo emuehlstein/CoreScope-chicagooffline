@@ -1096,7 +1096,13 @@
         voiceSelect.appendChild(opt);
       });
       voiceSelect.value = MeshAudio.getVoiceName() || voices[0] || '';
-      voiceSelect.addEventListener('change', (e) => MeshAudio.setVoice(e.target.value));
+      voiceSelect.addEventListener('change', (e) => {
+        MeshAudio.setVoice(e.target.value);
+        // Sync BPM slider if the voice set a new default
+        const newBpm = MeshAudio.getBPM();
+        bpmSlider.value = newBpm;
+        bpmVal.textContent = newBpm;
+      });
     }
 
     audioToggle.addEventListener('change', (e) => {

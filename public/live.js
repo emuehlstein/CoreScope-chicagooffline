@@ -922,15 +922,11 @@
 
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    let tileLayer = L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { maxZoom: 19 }).addTo(map);
 
-    // Swap tiles when theme changes
-    const _themeObs = new MutationObserver(function () {
-      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-      tileLayer.setUrl(dark ? TILE_DARK : TILE_LIGHT);
-    });
-    _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    // Build layer control (basemaps + CO overlays)
+    const _liveLayerCtrl = window.buildLayerControl
+      ? window.buildLayerControl(map, { isDark: isDark, position: 'topright', collapsed: true })
+      : { activeBasemap: L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { maxZoom: 19 }).addTo(map) };
     L.control.zoom({ position: 'topright' }).addTo(map);
 
     nodesLayer = L.layerGroup().addTo(map);

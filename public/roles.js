@@ -10,8 +10,8 @@
 (function () {
   // ─── Role definitions ───
   window.ROLE_COLORS = {
-    repeater: '#dc2626', companion: '#2563eb', room: '#16a34a',
-    sensor: '#d97706', observer: '#8b5cf6', unknown: '#6b7280'
+    repeater: '#dc2626', companion: '#8b5cf6', room: '#16a34a',
+    sensor: '#d97706', observer: '#41B6E6', unknown: '#6b7280'
   };
 
   window.TYPE_COLORS = {
@@ -55,10 +55,10 @@
 
   window.ROLE_STYLE = {
     repeater:  { color: '#dc2626', shape: 'diamond',  radius: 10, weight: 2 },
-    companion: { color: '#2563eb', shape: 'circle',   radius: 8,  weight: 2 },
+    companion: { color: '#8b5cf6', shape: 'circle',   radius: 8,  weight: 2 },
     room:      { color: '#16a34a', shape: 'square',   radius: 9,  weight: 2 },
     sensor:    { color: '#d97706', shape: 'triangle', radius: 8,  weight: 2 },
-    observer:  { color: '#8b5cf6', shape: 'star',     radius: 11, weight: 2 }
+    observer:  { color: '#41B6E6', shape: 'star',     radius: 11, weight: 2 }
   };
 
   window.ROLE_EMOJI = {

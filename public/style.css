@@ -16,7 +16,8 @@
   --status-amber: #f59e0b;
   --status-amber-light: #fef3c7;
   --status-amber-text: #92400e;
-  --role-observer: #8b5cf6;
+  --role-observer: #41B6E6;  /* Chicago flag blue */
+  --role-companion: #8b5cf6;  /* purple — swapped from observer */
   --accent-hover: #6db3ff;
   --text: #1a1a2e;
   --text-muted: #5b6370;

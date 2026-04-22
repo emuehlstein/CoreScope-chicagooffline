@@ -212,6 +212,9 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 .theme-toggle-moon { left: 4px; opacity: 0; }
 .theme-toggle input:checked ~ .theme-toggle-track .theme-toggle-sun { opacity: 0; }
 .theme-toggle input:checked ~ .theme-toggle-track .theme-toggle-moon { opacity: 1; }
+
+/* Hide version/commit badge in nav stats — info is still in /api/stats */
+.nav-stats .version-badge { display: none; }
 /* === Nav Stats === */
 .nav-stats {
   display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--nav-text-muted);

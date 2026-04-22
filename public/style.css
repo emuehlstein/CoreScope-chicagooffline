@@ -177,6 +177,9 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 /* Hide version/commit badge in nav stats — info is still in /api/stats */
 .nav-stats .version-badge { display: none; }
 
+/* Hide non-primary nav links — they appear in the More dropdown */
+.nav-links a:not([data-priority="high"]) { display: none !important; }
+
 /* Compact stat items: emoji + number only, label on hover */
 .stat-item { cursor: default; display: inline-flex; align-items: center; gap: 2px; }
 .stat-emoji { font-size: 11px; line-height: 1; }

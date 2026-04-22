@@ -132,5 +132,9 @@
     return totalDuration + reverbDuration;
   }
 
-  MeshAudio.registerVoice('sonar', { name: 'sonar', play });
+  MeshAudio.registerVoice('sonar', { 
+    name: 'sonar', 
+    defaultBpm: 40,  // Slow tempo works best for submarine ping aesthetic
+    play 
+  });
 })();

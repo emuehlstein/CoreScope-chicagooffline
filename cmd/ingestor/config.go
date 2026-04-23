@@ -165,12 +165,14 @@ func LoadConfig(path string) (*Config, error) {
 func (c *Config) ResolvedSources() []MQTTSource {
 	for i := range c.MQTTSources {
 		// paho uses tcp:// and ssl:// not mqtt:// and mqtts://
+		// ws:// and wss:// are passed through as-is (paho supports WebSocket natively)
 		b := c.MQTTSources[i].Broker
 		if strings.HasPrefix(b, "mqtt://") {
 			c.MQTTSources[i].Broker = "tcp://" + b[7:]
 		} else if strings.HasPrefix(b, "mqtts://") {
 			c.MQTTSources[i].Broker = "ssl://" + b[8:]
 		}
+		// ws:// and wss:// are already valid paho schemes — no translation needed
 	}
 	return c.MQTTSources
 }

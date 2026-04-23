@@ -4,7 +4,7 @@
  * Provides window.CO_BASEMAP with three modes:
  *   'carto'      — Carto dark/light (default, theme-aware)
  *   'satellite'  — Esri World Imagery
- *   'hillshade'  — Chicago Offline hosted 3DEP hillshade (theme-aware overlay on Carto)
+ *   'hillshade'  — Chicago Offline combined 3DEP+LiDAR 9x hillshade (theme-aware overlay on Carto)
  *
  * Usage (called from map.js after Leaflet map is created):
  *   window.CO_BASEMAP.init(map, isDark);      // attach initial tile layer
@@ -19,15 +19,15 @@
     cartoDark:   'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
     cartoLight:  'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
     satellite:   'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    hillshadeDark:  'https://tiles.chicagooffline.com/services/cook-hillshade-3dep-dark/tiles/{z}/{x}/{y}.png',
-    hillshadeLight: 'https://tiles.chicagooffline.com/services/cook-hillshade-3dep-light/tiles/{z}/{x}/{y}.png',
-    hillshadeFallbackDark:  'https://tiles.chicagooffline.com/services/cook-hillshade-dark-dsm/tiles/{z}/{x}/{y}.png',
+    hillshadeDark:  'https://tiles.chicagooffline.com/services/cook-hillshade-combined-dark-9x/tiles/{z}/{x}/{y}.png',
+    hillshadeLight: 'https://tiles.chicagooffline.com/services/cook-hillshade-combined-light-9x/tiles/{z}/{x}/{y}.png',
+    hillshadeFallbackDark:  'https://tiles.chicagooffline.com/services/cook-hillshade-3dep-dark/tiles/{z}/{x}/{y}.png',
   };
 
   var ATTR = {
     carto:     '\u00a9 <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> \u00a9 <a href="https://carto.com/">Carto</a>',
     satellite: 'Tiles \u00a9 Esri \u2014 Source: Esri, Maxar, Earthstar Geographics',
-    hillshade: '\u00a9 Chicago Offline \u2014 USGS 3DEP Hillshade',
+    hillshade: '\u00a9 Chicago Offline \u2014 3DEP+LiDAR Hillshade',
   };
 
   var HILLSHADE_OPACITY = 0.75;

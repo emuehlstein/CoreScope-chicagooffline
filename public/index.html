@@ -17,13 +17,18 @@
   <meta property="og:type" content="website">
   <meta name="theme-color" content="#0C0F1A">
 
-  <!-- Google Analytics -->
-  <script async src="https://www.googletagmanager.com/gtag/js?id=G-KX3PSRD0JT"></script>
+  <!-- Google Analytics (environment-specific) -->
   <script>
+    // Use dev GA4 property for dev-scope, prod for scope
+    const GA_ID = window.location.hostname.startsWith('dev-') ? 'G-WKMJ5XBF62' : 'G-KX3PSRD0JT';
+    const script = document.createElement('script');
+    script.async = true;
+    script.src = `https://www.googletagmanager.com/gtag/js?id=${GA_ID}`;
+    document.head.appendChild(script);
     window.dataLayer = window.dataLayer || [];
     function gtag(){dataLayer.push(arguments);}
     gtag('js', new Date());
-    gtag('config', 'G-KX3PSRD0JT');
+    gtag('config', GA_ID);
   </script>
 
   <!-- Twitter Card -->

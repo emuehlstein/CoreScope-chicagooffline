@@ -29,6 +29,29 @@
     return m + 'm';
   }
 
+
+  const MQTT_SOURCE_LABELS = {
+    'mosquitto-tcp': { label: '📡 Local', color: 'var(--text-muted)', bg: 'var(--border)' },
+    'wsmqtt-ws':     { label: '🔗 ChiOff', color: 'var(--accent,#00E5FF)', bg: 'rgba(0,229,255,0.12)' },
+    'chimesh-org':   { label: '🌐 chimesh', color: 'var(--status-green,#39FF14)', bg: 'rgba(57,255,20,0.12)' },
+  };
+
+  function renderBrokerCard(mqttSourcesJson) {
+    if (!mqttSourcesJson) return '<div class="stat-value"><span class="text-muted">—</span></div>';
+    let sources;
+    try { sources = JSON.parse(mqttSourcesJson); } catch { return '<div class="stat-value"><span class="text-muted">—</span></div>'; }
+    const now = Date.now();
+    const cutoff = 2 * 3600 * 1000;
+    const items = Object.entries(sources).map(([tag, ts]) => {
+      const age = now - new Date(ts).getTime();
+      const active = age < cutoff;
+      const s = MQTT_SOURCE_LABELS[tag] || { label: tag, color: 'var(--text-muted)', bg: 'var(--border)' };
+      const dot = active ? `<span class="health-dot health-green">●</span>` : `<span class="health-dot health-red">✕</span>`;
+      return `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">${dot} <span style="font-size:12px;color:${active ? s.color : 'var(--text-muted)'}">${s.label}</span> <span style="font-size:11px;color:var(--text-muted)">${timeAgo(ts)}</span></div>`;
+    });
+    return items.length ? items.join('') : '<div class="stat-value"><span class="text-muted">—</span></div>';
+  }
+
   function init(app, routeParam) {
     currentId = routeParam;
     if (!currentId) {
@@ -149,6 +172,10 @@
         <div class="stat-card">
           <div class="stat-label">First Seen</div>
           <div class="stat-value" style="font-size:0.85em">${obs.first_seen ? new Date(obs.first_seen).toLocaleDateString() : '—'}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Connected Brokers</div>
+          <div style="margin-top:4px">${renderBrokerCard(obs.mqtt_sources)}</div>
         </div>
       </div>
       <div class="mono" style="font-size:0.75em;color:var(--text-muted);margin-bottom:20px;word-break:break-all">

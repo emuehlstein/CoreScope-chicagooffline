@@ -95,7 +95,7 @@
   // Map MQTT source tag → {label, color}
   const MQTT_SOURCE_LABELS = {
     'mosquitto-tcp': { label: 'Legacy', color: 'var(--text-muted)', bg: 'var(--border)' },
-    'wsmqtt-ws':     { label: 'CO', color: 'var(--accent,#00E5FF)', bg: 'rgba(0,229,255,0.12)' },
+    'wsmqtt-ws':     { label: 'CO-DEV', color: 'var(--accent,#00E5FF)', bg: 'rgba(0,229,255,0.12)' },
     'chimesh-org':   { label: 'CM', color: 'var(--status-green,#39FF14)', bg: 'rgba(57,255,20,0.12)' },
   };
 

@@ -31,9 +31,9 @@
 
 
   const MQTT_SOURCE_LABELS = {
-    'mosquitto-tcp': { label: '📡 Local', color: 'var(--text-muted)', bg: 'var(--border)' },
-    'wsmqtt-ws':     { label: '🔗 ChiOff', color: 'var(--accent,#00E5FF)', bg: 'rgba(0,229,255,0.12)' },
-    'chimesh-org':   { label: '🌐 chimesh', color: 'var(--status-green,#39FF14)', bg: 'rgba(57,255,20,0.12)' },
+    'mosquitto-tcp': { label: 'Legacy', color: 'var(--text-muted)', bg: 'var(--border)' },
+    'wsmqtt-ws':     { label: 'CO', color: 'var(--accent,#00E5FF)', bg: 'rgba(0,229,255,0.12)' },
+    'chimesh-org':   { label: 'CM', color: 'var(--status-green,#39FF14)', bg: 'rgba(57,255,20,0.12)' },
   };
 
   function renderBrokerCard(mqttSourcesJson) {

@@ -170,6 +170,7 @@ type Observer struct {
 	BatteryMv     *int     `json:"battery_mv"`
 	UptimeSecs    *int64   `json:"uptime_secs"`
 	NoiseFloor    *float64 `json:"noise_floor"`
+	MqttSources   *string  `json:"mqtt_sources"`
 }
 
 // Transmission represents a row from the transmissions table.
@@ -972,7 +973,7 @@ func (db *DB) getObservationsForTransmissions(txIDs []int) map[int][]map[string]
 
 // GetObservers returns all observers sorted by last_seen DESC.
 func (db *DB) GetObservers() ([]Observer, error) {
-	rows, err := db.conn.Query("SELECT id, name, iata, last_seen, first_seen, packet_count, model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor FROM observers ORDER BY last_seen DESC")
+	rows, err := db.conn.Query("SELECT id, name, iata, last_seen, first_seen, packet_count, model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor, mqtt_sources FROM observers ORDER BY last_seen DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -983,7 +984,8 @@ func (db *DB) GetObservers() ([]Observer, error) {
 		var o Observer
 		var batteryMv, uptimeSecs sql.NullInt64
 		var noiseFloor sql.NullFloat64
-		if err := rows.Scan(&o.ID, &o.Name, &o.IATA, &o.LastSeen, &o.FirstSeen, &o.PacketCount, &o.Model, &o.Firmware, &o.ClientVersion, &o.Radio, &batteryMv, &uptimeSecs, &noiseFloor); err != nil {
+		var mqttSources sql.NullString
+		if err := rows.Scan(&o.ID, &o.Name, &o.IATA, &o.LastSeen, &o.FirstSeen, &o.PacketCount, &o.Model, &o.Firmware, &o.ClientVersion, &o.Radio, &batteryMv, &uptimeSecs, &noiseFloor, &mqttSources); err != nil {
 			continue
 		}
 		if batteryMv.Valid {
@@ -996,6 +998,9 @@ func (db *DB) GetObservers() ([]Observer, error) {
 		if noiseFloor.Valid {
 			o.NoiseFloor = &noiseFloor.Float64
 		}
+		if mqttSources.Valid {
+			o.MqttSources = &mqttSources.String
+		}
 		observers = append(observers, o)
 	}
 	return observers, nil
@@ -1006,8 +1011,9 @@ func (db *DB) GetObserverByID(id string) (*Observer, error) {
 	var o Observer
 	var batteryMv, uptimeSecs sql.NullInt64
 	var noiseFloor sql.NullFloat64
-	err := db.conn.QueryRow("SELECT id, name, iata, last_seen, first_seen, packet_count, model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor FROM observers WHERE id = ?", id).
-		Scan(&o.ID, &o.Name, &o.IATA, &o.LastSeen, &o.FirstSeen, &o.PacketCount, &o.Model, &o.Firmware, &o.ClientVersion, &o.Radio, &batteryMv, &uptimeSecs, &noiseFloor)
+	var mqttSources sql.NullString
+	err := db.conn.QueryRow("SELECT id, name, iata, last_seen, first_seen, packet_count, model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor, mqtt_sources FROM observers WHERE id = ?", id).
+		Scan(&o.ID, &o.Name, &o.IATA, &o.LastSeen, &o.FirstSeen, &o.PacketCount, &o.Model, &o.Firmware, &o.ClientVersion, &o.Radio, &batteryMv, &uptimeSecs, &noiseFloor, &mqttSources)
 	if err != nil {
 		return nil, err
 	}
@@ -1020,6 +1026,9 @@ func (db *DB) GetObserverByID(id string) (*Observer, error) {
 	}
 	if noiseFloor.Valid {
 		o.NoiseFloor = &noiseFloor.Float64
+	}
+	if mqttSources.Valid {
+		o.MqttSources = &mqttSources.String
 	}
 	return &o, nil
 }

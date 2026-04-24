@@ -418,6 +418,18 @@ func applySchema(db *sql.DB) error {
 		log.Println("[migration] observations.raw_hex column added")
 	}
 
+	// Migration: add mqtt_sources column to observers for broker tracking
+	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'observers_mqtt_sources_v1'")
+	if row.Scan(&migDone) != nil {
+		log.Println("[migration] Adding mqtt_sources column to observers...")
+		_, err := db.Exec(`ALTER TABLE observers ADD COLUMN mqtt_sources TEXT`)
+		if err != nil {
+			log.Printf("[migration] observers.mqtt_sources: %v (may already exist)", err)
+		}
+		db.Exec(`INSERT INTO _migrations (name) VALUES ('observers_mqtt_sources_v1')`)
+		log.Println("[migration] observers.mqtt_sources column added")
+	}
+
 	return nil
 }
 
@@ -664,7 +676,7 @@ type ObserverMeta struct {
 }
 
 // UpsertObserver inserts or updates an observer with optional hardware metadata.
-func (s *Store) UpsertObserver(id, name, iata string, meta *ObserverMeta) error {
+func (s *Store) UpsertObserver(id, name, iata, sourceTag string, meta *ObserverMeta) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	normalizedIATA := strings.TrimSpace(strings.ToUpper(iata))
 
@@ -706,6 +718,10 @@ func (s *Store) UpsertObserver(id, name, iata string, meta *ObserverMeta) error 
 
 	// Reactivate if this observer was previously marked inactive
 	s.db.Exec(`UPDATE observers SET inactive = 0 WHERE id = ? AND inactive = 1`, id)
+
+	// Track which MQTT source delivered this observer update
+	mergeSourceTag(s.db, id, sourceTag)
+
 	return nil
 }
 
@@ -988,4 +1004,38 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 	}
 
 	return pd
+}
+
+// mergeSourceTag reads the existing mqtt_sources JSON for an observer,
+// adds/updates the given source tag with the current UTC timestamp,
+// prunes entries older than 2 hours, and writes it back.
+func mergeSourceTag(db *sql.DB, observerID, sourceTag string) {
+	if sourceTag == "" {
+		return
+	}
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339)
+
+	// Read existing
+	var raw sql.NullString
+	db.QueryRow("SELECT mqtt_sources FROM observers WHERE id = ?", observerID).Scan(&raw)
+
+	sources := map[string]string{}
+	if raw.Valid && raw.String != "" {
+		json.Unmarshal([]byte(raw.String), &sources)
+	}
+
+	// Update this source
+	sources[sourceTag] = nowStr
+
+	// Prune stale entries (>2h)
+	cutoff := now.Add(-2 * time.Hour)
+	for k, v := range sources {
+		if t, err := time.Parse(time.RFC3339, v); err == nil && t.Before(cutoff) {
+			delete(sources, k)
+		}
+	}
+
+	b, _ := json.Marshal(sources)
+	db.Exec("UPDATE observers SET mqtt_sources = ? WHERE id = ?", string(b), observerID)
 }

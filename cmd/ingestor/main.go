@@ -226,7 +226,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		name, _ := msg["origin"].(string)
 		iata := parts[1]
 		meta := extractObserverMeta(msg)
-		if err := store.UpsertObserver(observerID, name, iata, meta); err != nil {
+		if err := store.UpsertObserver(observerID, name, iata, tag, meta); err != nil {
 			log.Printf("MQTT [%s] observer status error: %v", tag, err)
 		}
 		// Insert metrics sample from status message
@@ -383,7 +383,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		// Upsert observer
 		if observerID != "" {
 			origin, _ := msg["origin"].(string)
-			if err := store.UpsertObserver(observerID, origin, region, nil); err != nil {
+			if err := store.UpsertObserver(observerID, origin, region, tag, nil); err != nil {
 				log.Printf("MQTT [%s] observer upsert error: %v", tag, err)
 			}
 		}

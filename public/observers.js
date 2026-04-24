@@ -91,6 +91,29 @@
     return `<span style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap"><span style="display:inline-block;width:60px;height:12px;background:var(--border);border-radius:3px;overflow:hidden;vertical-align:middle"><span style="display:block;height:100%;width:${pct}%;background:linear-gradient(90deg,#3b82f6,#60a5fa);border-radius:3px"></span></span><span style="font-size:11px">${count}/hr</span></span>`;
   }
 
+
+  // Map MQTT source tag → {label, color}
+  const MQTT_SOURCE_LABELS = {
+    'mosquitto-tcp': { label: '📡 Local', color: 'var(--text-muted)', bg: 'var(--border)' },
+    'wsmqtt-ws':     { label: '🔗 ChiOff', color: 'var(--accent,#00E5FF)', bg: 'rgba(0,229,255,0.12)' },
+    'chimesh-org':   { label: '🌐 chimesh', color: 'var(--status-green,#39FF14)', bg: 'rgba(57,255,20,0.12)' },
+  };
+
+  function mqttSourceBadges(mqttSourcesJson) {
+    if (!mqttSourcesJson) return '<span class="text-muted">\u2014</span>';
+    let sources;
+    try { sources = JSON.parse(mqttSourcesJson); } catch { return '<span class="text-muted">\u2014</span>'; }
+    const now = Date.now();
+    const cutoff = 2 * 3600 * 1000; // 2h
+    const badges = Object.entries(sources)
+      .filter(([, ts]) => (now - new Date(ts).getTime()) < cutoff)
+      .map(([tag]) => {
+        const s = MQTT_SOURCE_LABELS[tag] || { label: tag, color: 'var(--text-muted)', bg: 'var(--border)' };
+        return `<span style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;white-space:nowrap;background:${s.bg};color:${s.color};border:1px solid ${s.color}">${s.label}</span>`;
+      });
+    return badges.length ? badges.join(' ') : '<span class="text-muted">\u2014</span>';
+  }
+
   function render() {
     const el = document.getElementById('obsContent');
     if (!el) return;
@@ -123,7 +146,7 @@
       <div class="obs-table-scroll"><table class="data-table obs-table" id="obsTable">
         <caption class="sr-only">Observer status and statistics</caption>
         <thead><tr>
-          <th scope="col">Status</th><th scope="col">Name</th><th scope="col">Region</th><th scope="col">Last Seen</th>
+          <th scope="col">Status</th><th scope="col">Name</th><th scope="col">Region</th><th scope="col">Brokers</th><th scope="col">Last Seen</th>
           <th scope="col">Packets</th><th scope="col">Packets/Hour</th><th scope="col">Uptime</th>
         </tr></thead>
         <tbody>${filtered.map(o => {
@@ -133,6 +156,7 @@
             <td><span class="health-dot ${h.cls}" title="${h.label}">${shape}</span> ${h.label}</td>
             <td class="mono">${o.name || o.id}</td>
             <td>${o.iata ? `<span class="badge-region">${o.iata}</span>` : '—'}</td>
+            <td>${mqttSourceBadges(o.mqtt_sources)}</td>
             <td>${timeAgo(o.last_seen)}</td>
             <td>${(o.packet_count || 0).toLocaleString()}</td>
             <td>${sparkBar(o.packetsLastHour || 0, maxPktsHr)}</td>

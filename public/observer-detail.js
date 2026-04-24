@@ -32,7 +32,7 @@
 
   // Default MQTT source label map — label/color overridden by mqttSources config via MeshConfigReady
   window.MQTT_SOURCE_LABELS = window.MQTT_SOURCE_LABELS || {
-    'mosquitto-tcp': { label: 'Legacy', color: 'var(--text-muted)', bg: 'var(--border)' },
+    'mosquitto-tcp': { label: 'Legacy', color: 'var(--status-yellow,#FFB300)', bg: 'rgba(255,179,0,0.12)' },
     'wsmqtt-ws':     { label: 'CO', color: 'var(--status-green,#39FF14)', bg: 'rgba(57,255,20,0.12)' },
     'chimesh-org':   { label: 'CM', color: 'var(--status-green,#39FF14)', bg: 'rgba(57,255,20,0.12)' },
   };

@@ -169,11 +169,24 @@
     if (cfg.mqttSources && Array.isArray(cfg.mqttSources)) {
       window.MQTT_SOURCE_LABELS = window.MQTT_SOURCE_LABELS || {};
       cfg.mqttSources.forEach(function (src) {
-        if (src.label) {
-          // Preserve existing color/bg from hardcoded defaults, only override label
-          var existing = window.MQTT_SOURCE_LABELS[src.name] || { color: 'var(--text-muted)', bg: 'var(--border)' };
-          window.MQTT_SOURCE_LABELS[src.name] = Object.assign({}, existing, { label: src.label });
+        var existing = window.MQTT_SOURCE_LABELS[src.name] || {};
+        var patch = {};
+        if (src.label) patch.label = src.label;
+        if (src.tier) {
+          // tier drives color: secure=green, local=gray, open=amber
+          if (src.tier === 'secure') {
+            patch.color = 'var(--status-green,#39FF14)';
+            patch.bg = 'rgba(57,255,20,0.12)';
+          } else if (src.tier === 'open') {
+            patch.color = 'var(--status-yellow,#FFB300)';
+            patch.bg = 'rgba(255,179,0,0.12)';
+          } else {
+            // local or unknown
+            patch.color = 'var(--text-muted)';
+            patch.bg = 'var(--border)';
+          }
         }
+        window.MQTT_SOURCE_LABELS[src.name] = Object.assign({}, existing, patch);
       });
     }
     // Sync ROLE_STYLE colors with ROLE_COLORS

@@ -81,6 +81,7 @@ type Config struct {
 type MQTTSourceConfig struct {
 	Name  string `json:"name"`
 	Label string `json:"label,omitempty"`
+	Tier  string `json:"tier,omitempty"`
 }
 
 // weakAPIKeys is the blocklist of known default/example API keys that must be rejected.

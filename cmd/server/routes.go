@@ -282,10 +282,11 @@ func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
 		type safeSource struct {
 			Name  string `json:"name"`
 			Label string `json:"label,omitempty"`
+			Tier  string `json:"tier,omitempty"`
 		}
 		safe := make([]safeSource, len(s.cfg.MQTTSources))
 		for i, src := range s.cfg.MQTTSources {
-			safe[i] = safeSource{Name: src.Name, Label: src.Label}
+			safe[i] = safeSource{Name: src.Name, Label: src.Label, Tier: src.Tier}
 		}
 		mqttSources = safe
 	}

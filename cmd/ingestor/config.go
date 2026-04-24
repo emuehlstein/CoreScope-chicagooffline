@@ -14,6 +14,7 @@ import (
 // MQTTSource represents a single MQTT broker connection.
 type MQTTSource struct {
 	Name               string   `json:"name"`
+	Label              string   `json:"label,omitempty"`
 	Broker             string   `json:"broker"`
 	Username           string   `json:"username,omitempty"`
 	Password           string   `json:"password,omitempty"`

@@ -72,6 +72,15 @@ type Config struct {
 
 	ResolvedPath  *ResolvedPathConfig  `json:"resolvedPath,omitempty"`
 	NeighborGraph *NeighborGraphConfig `json:"neighborGraph,omitempty"`
+
+	// MQTTSources is read from config for label metadata only (credentials stripped before serving).
+	MQTTSources []MQTTSourceConfig `json:"mqttSources,omitempty"`
+}
+
+// MQTTSourceConfig is the safe (credential-free) view of an MQTT source for client config.
+type MQTTSourceConfig struct {
+	Name  string `json:"name"`
+	Label string `json:"label,omitempty"`
 }
 
 // weakAPIKeys is the blocklist of known default/example API keys that must be rejected.

@@ -955,6 +955,7 @@ type ClientConfigResponse struct {
 	PropagationBufferMs float64         `json:"propagationBufferMs"`
 	Timestamps          TimestampConfig `json:"timestamps"`
 	DebugAffinity       bool            `json:"debugAffinity,omitempty"`
+	MqttSources         interface{}     `json:"mqttSources,omitempty"`
 }
 
 // ─── IATA Coords ───────────────────────────────────────────────────────────────

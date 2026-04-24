@@ -92,11 +92,11 @@
   }
 
 
-  // Map MQTT source tag → {label, color}
-  const MQTT_SOURCE_LABELS = {
-    'mosquitto-tcp': { label: '📡 Local', color: 'var(--text-muted)', bg: 'var(--border)' },
-    'wsmqtt-ws':     { label: '🔗 ChiOff', color: 'var(--accent,#00E5FF)', bg: 'rgba(0,229,255,0.12)' },
-    'chimesh-org':   { label: '🌐 chimesh', color: 'var(--status-green,#39FF14)', bg: 'rgba(57,255,20,0.12)' },
+  // Default MQTT source label map — overridden by mqttSources[].label in config via MeshConfigReady
+  window.MQTT_SOURCE_LABELS = window.MQTT_SOURCE_LABELS || {
+    'mosquitto-tcp': { label: 'Legacy', color: 'var(--text-muted)', bg: 'var(--border)' },
+    'wsmqtt-ws':     { label: 'CO-DEV', color: 'var(--accent,#00E5FF)', bg: 'rgba(0,229,255,0.12)' },
+    'chimesh-org':   { label: 'CM', color: 'var(--status-green,#39FF14)', bg: 'rgba(57,255,20,0.12)' },
   };
 
   function mqttSourceBadges(mqttSourcesJson) {
@@ -108,7 +108,7 @@
     const badges = Object.entries(sources)
       .filter(([, ts]) => (now - new Date(ts).getTime()) < cutoff)
       .map(([tag]) => {
-        const s = MQTT_SOURCE_LABELS[tag] || { label: tag, color: 'var(--text-muted)', bg: 'var(--border)' };
+        const s = (window.MQTT_SOURCE_LABELS || {})[tag] || { label: tag, color: 'var(--text-muted)', bg: 'var(--border)' };
         return `<span style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;white-space:nowrap;background:${s.bg};color:${s.color};border:1px solid ${s.color}">${s.label}</span>`;
       });
     return badges.length ? badges.join(' ') : '<span class="text-muted">\u2014</span>';

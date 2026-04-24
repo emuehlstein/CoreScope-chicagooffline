@@ -15,6 +15,7 @@ import (
 type MQTTSource struct {
 	Name               string   `json:"name"`
 	Label              string   `json:"label,omitempty"`
+	Tier               string   `json:"tier,omitempty"`
 	Broker             string   `json:"broker"`
 	Username           string   `json:"username,omitempty"`
 	Password           string   `json:"password,omitempty"`

@@ -165,6 +165,17 @@
     if (cfg.cacheInvalidateMs != null) window.CACHE_INVALIDATE_MS = cfg.cacheInvalidateMs;
     if (cfg.externalUrls) Object.assign(EXTERNAL_URLS, cfg.externalUrls);
     if (cfg.propagationBufferMs != null) window.PROPAGATION_BUFFER_MS = cfg.propagationBufferMs;
+    // Build MQTT source label map from config (falls back to hardcoded defaults in observers.js)
+    if (cfg.mqttSources && Array.isArray(cfg.mqttSources)) {
+      window.MQTT_SOURCE_LABELS = window.MQTT_SOURCE_LABELS || {};
+      cfg.mqttSources.forEach(function (src) {
+        if (src.label) {
+          // Preserve existing color/bg from hardcoded defaults, only override label
+          var existing = window.MQTT_SOURCE_LABELS[src.name] || { color: 'var(--text-muted)', bg: 'var(--border)' };
+          window.MQTT_SOURCE_LABELS[src.name] = Object.assign({}, existing, { label: src.label });
+        }
+      });
+    }
     // Sync ROLE_STYLE colors with ROLE_COLORS
     for (var role in ROLE_STYLE) {
       if (ROLE_COLORS[role]) ROLE_STYLE[role].color = ROLE_COLORS[role];

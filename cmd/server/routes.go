@@ -276,6 +276,19 @@ func (s *Server) handleConfigCache(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
+	// Build safe (credential-free) mqtt sources list for the client
+	var mqttSources interface{}
+	if len(s.cfg.MQTTSources) > 0 {
+		type safeSource struct {
+			Name  string `json:"name"`
+			Label string `json:"label,omitempty"`
+		}
+		safe := make([]safeSource, len(s.cfg.MQTTSources))
+		for i, src := range s.cfg.MQTTSources {
+			safe[i] = safeSource{Name: src.Name, Label: src.Label}
+		}
+		mqttSources = safe
+	}
 	writeJSON(w, ClientConfigResponse{
 		Roles:               s.cfg.Roles,
 		HealthThresholds:    s.cfg.GetHealthThresholds().ToClientMs(),
@@ -291,6 +304,7 @@ func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
 		PropagationBufferMs: float64(s.cfg.PropagationBufferMs()),
 		Timestamps:          s.cfg.GetTimestampConfig(),
 		DebugAffinity:       s.cfg.DebugAffinity,
+		MqttSources:         mqttSources,
 	})
 }
 

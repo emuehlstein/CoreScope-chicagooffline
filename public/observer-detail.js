@@ -30,7 +30,8 @@
   }
 
 
-  const MQTT_SOURCE_LABELS = {
+  // Default MQTT source label map — overridden by mqttSources[].label in config via MeshConfigReady
+  window.MQTT_SOURCE_LABELS = window.MQTT_SOURCE_LABELS || {
     'mosquitto-tcp': { label: 'Legacy', color: 'var(--text-muted)', bg: 'var(--border)' },
     'wsmqtt-ws':     { label: 'CO-DEV', color: 'var(--accent,#00E5FF)', bg: 'rgba(0,229,255,0.12)' },
     'chimesh-org':   { label: 'CM', color: 'var(--status-green,#39FF14)', bg: 'rgba(57,255,20,0.12)' },
@@ -45,7 +46,7 @@
     const items = Object.entries(sources).map(([tag, ts]) => {
       const age = now - new Date(ts).getTime();
       const active = age < cutoff;
-      const s = MQTT_SOURCE_LABELS[tag] || { label: tag, color: 'var(--text-muted)', bg: 'var(--border)' };
+      const s = (window.MQTT_SOURCE_LABELS || {})[tag] || { label: tag, color: 'var(--text-muted)', bg: 'var(--border)' };
       const dot = active ? `<span class="health-dot health-green">●</span>` : `<span class="health-dot health-red">✕</span>`;
       return `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">${dot} <span style="font-size:12px;color:${active ? s.color : 'var(--text-muted)'}">${s.label}</span> <span style="font-size:11px;color:var(--text-muted)">${timeAgo(ts)}</span></div>`;
     });

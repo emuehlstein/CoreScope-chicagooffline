@@ -1951,6 +1951,7 @@ func (s *Server) handleObservers(w http.ResponseWriter, r *http.Request) {
 			NoiseFloor: o.NoiseFloor,
 			PacketsLastHour: plh,
 			Lat: lat, Lon: lon, NodeRole: nodeRole,
+			MqttSources: o.MqttSources,
 		})
 	}
 	writeJSON(w, ObserverListResponse{
@@ -1984,6 +1985,7 @@ func (s *Server) handleObserverDetail(w http.ResponseWriter, r *http.Request) {
 		BatteryMv: obs.BatteryMv, UptimeSecs: obs.UptimeSecs,
 		NoiseFloor: obs.NoiseFloor,
 		PacketsLastHour: plh,
+		MqttSources: obs.MqttSources,
 	})
 }
 

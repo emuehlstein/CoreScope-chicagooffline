@@ -864,6 +864,7 @@ type ObserverResp struct {
 	Lat             interface{} `json:"lat"`
 	Lon             interface{} `json:"lon"`
 	NodeRole        interface{} `json:"nodeRole"`
+	MqttSources     interface{} `json:"mqtt_sources"`
 }
 
 type ObserverListResponse struct {

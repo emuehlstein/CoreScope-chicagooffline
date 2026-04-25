@@ -122,8 +122,12 @@
     // voiceModule must have: { name, play(audioCtx, masterGain, parsed, opts) → durationSec }
     if (!window._meshAudioVoices) window._meshAudioVoices = {};
     window._meshAudioVoices[name] = voiceModule;
-    // Auto-select first registered voice if none active
+    // Auto-select first registered voice if none active;
+    // prefer 'sonar' as default if no voice is set yet
     if (!currentVoice) currentVoice = voiceModule;
+    if (name === 'sonar' && !localStorage.getItem('live-audio-voice')) {
+      currentVoice = voiceModule;
+    }
   }
 
   function setVoice(name) {

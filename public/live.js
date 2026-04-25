@@ -825,19 +825,12 @@
             <span id="ghostDesc" class="sr-only">Show interpolated ghost markers for unknown hops</span>
             <label><input type="checkbox" id="liveRealisticToggle" aria-describedby="realisticDesc"> Realistic</label>
             <span id="realisticDesc" class="sr-only">Buffer packets by hash and animate all paths simultaneously</span>
-            <label><input type="checkbox" id="liveMatrixToggle" aria-describedby="matrixDesc"> Matrix</label>
-            <span id="matrixDesc" class="sr-only">Animate packet hex bytes flowing along paths like the Matrix</span>
-            <label><input type="checkbox" id="liveMatrixRainToggle" aria-describedby="rainDesc"> Rain</label>
-            <span id="rainDesc" class="sr-only">Matrix rain overlay — packets fall as hex columns</span>
             <label><input type="checkbox" id="liveAudioToggle" aria-describedby="audioDesc"> 🎵 Audio</label>
             <span id="audioDesc" class="sr-only">Sonify packets — turn raw bytes into generative music</span>
-            <label><input type="checkbox" id="liveFavoritesToggle" aria-describedby="favDesc"> ⭐ Favorites</label>
-            <span id="favDesc" class="sr-only">Show only favorited and claimed nodes</span>
             <label id="liveGeoFilterLabel" style="display:none"><input type="checkbox" id="liveGeoFilterToggle"> Mesh live area</label>
           </div>
           <div class="audio-controls hidden" id="audioControls">
             <label class="audio-slider-label">Voice <select id="audioVoiceSelect" class="audio-voice-select"></select></label>
-            <label class="audio-slider-label">BPM <input type="range" id="audioBpmSlider" min="40" max="300" value="120" class="audio-slider"><span id="audioBpmVal">120</span></label>
             <label class="audio-slider-label">Vol <input type="range" id="audioVolSlider" min="0" max="100" value="30" class="audio-slider"><span id="audioVolVal">30</span></label>
           </div>
         </div>
@@ -989,13 +982,7 @@
       localStorage.setItem('live-realistic-propagation', realisticPropagation);
     });
 
-    const favoritesToggle = document.getElementById('liveFavoritesToggle');
-    favoritesToggle.checked = showOnlyFavorites;
-    favoritesToggle.addEventListener('change', (e) => {
-      showOnlyFavorites = e.target.checked;
-      localStorage.setItem('live-favorites-only', showOnlyFavorites);
-      applyFavoritesFilter();
-    });
+    // Favorites filter removed from UI (still functional via applyFavoritesFilter internals)
 
     // Geo filter overlay
     (async function () {
@@ -1041,46 +1028,12 @@
       } catch (e) { /* no geo filter configured */ }
     })();
 
-    const matrixToggle = document.getElementById('liveMatrixToggle');
-    matrixToggle.checked = matrixMode;
-    matrixToggle.addEventListener('change', (e) => {
-      matrixMode = e.target.checked;
-      localStorage.setItem('live-matrix-mode', matrixMode);
-      applyMatrixTheme(matrixMode);
-      if (matrixMode) {
-        hideHeatMap();
-        const ht = document.getElementById('liveHeatToggle');
-        if (ht) { ht.checked = false; ht.disabled = true; }
-      } else {
-        const ht = document.getElementById('liveHeatToggle');
-        if (ht) { ht.disabled = false; }
-      }
-    });
-    applyMatrixTheme(matrixMode);
-    if (matrixMode) {
-      hideHeatMap();
-      const ht = document.getElementById('liveHeatToggle');
-      if (ht) { ht.checked = false; ht.disabled = true; }
-    } else {
-      // Ensure heat toggle is enabled if matrix mode is off (recover from stale state)
-      const ht = document.getElementById('liveHeatToggle');
-      if (ht) { ht.disabled = false; }
-    }
-
-    const rainToggle = document.getElementById('liveMatrixRainToggle');
-    rainToggle.checked = matrixRain;
-    rainToggle.addEventListener('change', (e) => {
-      matrixRain = e.target.checked;
-      localStorage.setItem('live-matrix-rain', matrixRain);
-      if (matrixRain) startMatrixRain(); else stopMatrixRain();
-    });
-    if (matrixRain) startMatrixRain();
+    // Matrix/Rain controls removed from UI (applyMatrixTheme still available)
+    applyMatrixTheme(false);
 
     // Audio toggle
     const audioToggle = document.getElementById('liveAudioToggle');
     const audioControls = document.getElementById('audioControls');
-    const bpmSlider = document.getElementById('audioBpmSlider');
-    const bpmVal = document.getElementById('audioBpmVal');
     const volSlider = document.getElementById('audioVolSlider');
     const volVal = document.getElementById('audioVolVal');
 
@@ -1088,8 +1041,6 @@
       MeshAudio.restore();
       audioToggle.checked = MeshAudio.isEnabled();
       if (MeshAudio.isEnabled()) audioControls.classList.remove('hidden');
-      bpmSlider.value = MeshAudio.getBPM();
-      bpmVal.textContent = MeshAudio.getBPM();
       volSlider.value = Math.round(MeshAudio.getVolume() * 100);
       volVal.textContent = Math.round(MeshAudio.getVolume() * 100);
 
@@ -1104,10 +1055,6 @@
       voiceSelect.value = MeshAudio.getVoiceName() || voices[0] || '';
       voiceSelect.addEventListener('change', (e) => {
         MeshAudio.setVoice(e.target.value);
-        // Sync BPM slider if the voice set a new default
-        const newBpm = MeshAudio.getBPM();
-        bpmSlider.value = newBpm;
-        bpmVal.textContent = newBpm;
       });
     }
 
@@ -1116,11 +1063,6 @@
         MeshAudio.setEnabled(e.target.checked);
         audioControls.classList.toggle('hidden', !e.target.checked);
       }
-    });
-    bpmSlider.addEventListener('input', (e) => {
-      const v = parseInt(e.target.value, 10);
-      bpmVal.textContent = v;
-      if (window.MeshAudio) MeshAudio.setBPM(v);
     });
     volSlider.addEventListener('input', (e) => {
       const v = parseInt(e.target.value, 10);

@@ -450,8 +450,12 @@
     let x = (cw - totalW) / 2;
     const y = 2;
     
-    // Draw ghost segments (dim background) — hardcoded to match LCD green
-    const ghostColor = 'rgba(74,222,128,0.07)';
+    // Draw ghost segments (dim background) — uses status-green at low opacity
+    const ghostColor = (function() {
+      var g = statusGreen();
+      if (g.startsWith('#') && g.length === 7) return g + '12';
+      return 'rgba(74,222,128,0.07)';
+    })();
     for (let i = 0; i < text.length; i++) {
       const ch2 = text[i];
       if (ch2 === ':') {

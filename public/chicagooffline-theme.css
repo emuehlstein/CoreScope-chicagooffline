@@ -69,6 +69,11 @@
     /* Status — keep upstream colours except green (use Mesh Green) */
     --status-green: var(--co-green);
 
+    /* VCR LCD clock */
+    --vcr-lcd-bg:     #1a1a0a;
+    --vcr-lcd-shadow: rgba(0,0,0,0.7);
+    --vcr-lcd-glow:   rgba(0,0,0,0.3);
+
     /* Misc */
     --theme-color:  var(--co-bg);
   }
@@ -104,6 +109,10 @@
   --geo-filter-color: var(--co-cyan);
 
   --status-green: var(--co-green);
+
+  --vcr-lcd-bg:     #1a1a0a;
+  --vcr-lcd-shadow: rgba(0,0,0,0.7);
+  --vcr-lcd-glow:   rgba(0,0,0,0.3);
 }
 
 /* ── Force dark as default (chicagooffline always dark) ── */
@@ -142,6 +151,11 @@
     --geo-filter-color: var(--co-light-cyan);
 
     --status-green: var(--co-light-green);
+
+    /* VCR LCD clock — light: subtle inset panel */
+    --vcr-lcd-bg:     #e8ecf2;
+    --vcr-lcd-shadow: rgba(0,0,0,0.08);
+    --vcr-lcd-glow:   rgba(0,0,0,0.04);
   }
 }
 
@@ -175,6 +189,10 @@
   --geo-filter-color: var(--co-light-cyan);
 
   --status-green: var(--co-light-green);
+
+  --vcr-lcd-bg:     #e8ecf2;
+  --vcr-lcd-shadow: rgba(0,0,0,0.08);
+  --vcr-lcd-glow:   rgba(0,0,0,0.04);
 }
 
 /* ── Nav — theme-aware (uses CSS variables, adapts to light/dark) ── */

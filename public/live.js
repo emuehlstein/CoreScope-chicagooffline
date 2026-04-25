@@ -808,10 +808,6 @@
       <div class="live-page">
         <div id="liveMap" style="width:100%;height:100%;position:absolute;top:0;left:0;z-index:1"></div>
         <div class="live-overlay live-header" id="liveHeader">
-          <div class="live-title">
-            <span class="live-beacon"></span>
-            MESH LIVE
-          </div>
           <div class="live-stats-row">
             <div class="live-stat-pill"><span id="livePktCount">0</span> pkts</div>
             <div class="live-stat-pill"><span id="liveNodeCount">0</span> nodes</div>

@@ -4911,15 +4911,47 @@ func (s *PacketStore) computeAnalyticsTopology(region string) map[string]interfa
 		}
 	}
 
-	// Top repeaters
+	// Top repeaters — deduplicate by resolved pubkey so that variable-length
+	// hop prefixes (e.g. "07" and "0735BC") that resolve to the same node are
+	// merged into a single entry with summed counts. Unresolved or ambiguous
+	// prefixes (pubkey == nil) are kept as separate entries because we cannot
+	// confidently attribute them to a specific node.
 	type freqEntry struct {
 		hop   string
 		count int
 	}
-	freqList := make([]freqEntry, 0, len(hopFreq))
-	for h, c := range hopFreq {
-		freqList = append(freqList, freqEntry{h, c})
+	// Phase 1: Resolve every hop prefix and group by pubkey.
+	type dedupEntry struct {
+		pubkey string
+		name   string
+		hop    string // longest hop prefix seen (most specific)
+		count  int    // sum of all counts for this pubkey
 	}
+	pkGroup := map[string]*dedupEntry{}           // pubkey → merged entry
+	var unresolvedEntries []freqEntry              // hops with no confident resolution
+	for h, c := range hopFreq {
+		r := resolveHop(h)
+		if r == nil || r.PublicKey == "" {
+			unresolvedEntries = append(unresolvedEntries, freqEntry{h, c})
+			continue
+		}
+		pk := strings.ToLower(r.PublicKey)
+		if existing, ok := pkGroup[pk]; ok {
+			existing.count += c
+			// Keep the longest hop prefix as the display identifier
+			if len(h) > len(existing.hop) {
+				existing.hop = h
+			}
+		} else {
+			pkGroup[pk] = &dedupEntry{pubkey: r.PublicKey, name: r.Name, hop: h, count: c}
+		}
+	}
+	// Phase 2: Build the final sorted list, mixing resolved + unresolved.
+	freqList := make([]freqEntry, 0, len(pkGroup)+len(unresolvedEntries))
+	for _, de := range pkGroup {
+		freqList = append(freqList, freqEntry{de.hop, de.count})
+	}
+	freqList = append(freqList, unresolvedEntries...)
 	sort.Slice(freqList, func(i, j int) bool { return freqList[i].count > freqList[j].count })
 	topRepeaters := make([]map[string]interface{}, 0)
 	for i, e := range freqList {
@@ -4935,11 +4967,44 @@ func (s *PacketStore) computeAnalyticsTopology(region string) map[string]interfa
 		topRepeaters = append(topRepeaters, entry)
 	}
 
-	// Top pairs
-	pairList := make([]freqEntry, 0, len(pairFreq))
-	for p, c := range pairFreq {
-		pairList = append(pairList, freqEntry{p, c})
+	// Top pairs — deduplicate by resolved pubkey pair, same rationale as
+	// topRepeaters above. Variable-length hop prefixes like "07|F8" and
+	// "0735BC|F8A831" that resolve to the same two nodes are merged.
+	type pairKey struct{ a, b string } // canonical (sorted) pubkey pair
+	type pairDedup struct {
+		hopA, hopB string
+		pkA, pkB   string
+		count      int
 	}
+	pairGroup := map[pairKey]*pairDedup{}
+	var unresolvedPairs []freqEntry
+	for p, c := range pairFreq {
+		parts := strings.SplitN(p, "|", 2)
+		rA := resolveHop(parts[0])
+		rB := resolveHop(parts[1])
+		pkA, pkB := "", ""
+		if rA != nil { pkA = strings.ToLower(rA.PublicKey) }
+		if rB != nil { pkB = strings.ToLower(rB.PublicKey) }
+		if pkA == "" || pkB == "" {
+			unresolvedPairs = append(unresolvedPairs, freqEntry{p, c})
+			continue
+		}
+		// Canonical key: sorted pubkeys
+		k := pairKey{pkA, pkB}
+		if k.a > k.b { k.a, k.b = k.b, k.a }
+		if existing, ok := pairGroup[k]; ok {
+			existing.count += c
+			if len(parts[0]) > len(existing.hopA) { existing.hopA = parts[0] }
+			if len(parts[1]) > len(existing.hopB) { existing.hopB = parts[1] }
+		} else {
+			pairGroup[k] = &pairDedup{hopA: parts[0], hopB: parts[1], pkA: rA.PublicKey, pkB: rB.PublicKey, count: c}
+		}
+	}
+	pairList := make([]freqEntry, 0, len(pairGroup)+len(unresolvedPairs))
+	for _, pd := range pairGroup {
+		pairList = append(pairList, freqEntry{pd.hopA + "|" + pd.hopB, pd.count})
+	}
+	pairList = append(pairList, unresolvedPairs...)
 	sort.Slice(pairList, func(i, j int) bool { return pairList[i].count > pairList[j].count })
 	topPairs := make([]map[string]interface{}, 0)
 	for i, e := range pairList {

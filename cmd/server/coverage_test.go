@@ -2453,6 +2453,155 @@ func TestStoreGetAnalyticsTopology(t *testing.T) {
 	})
 }
 
+func TestTopologyDeduplicatesRepeatersByPubkey(t *testing.T) {
+	// Regression test: variable-length hop prefixes for the same node must be
+	// merged into a single topRepeaters entry with summed counts.
+	// seedTestData provides nodes with pubkeys: aabbccdd11223344 (TestRepeater)
+	// and eeff00112233aabb (TestCompanion). Prefixes "AA","AABB","AABBCC" all
+	// resolve to TestRepeater; "EE" resolves to TestCompanion.
+	db := setupTestDB(t)
+	defer db.Close()
+
+	now := time.Now().UTC()
+	recent := now.Add(-1 * time.Hour).Format(time.RFC3339)
+	recentEpoch := now.Add(-1 * time.Hour).Unix()
+
+	seedTestData(t, db)
+
+	// Packets with varying-length hop prefixes for TestRepeater (pk=aabbccdd11223344):
+	// "AA" (1 byte), "AABB" (2 bytes), "AABBCC" (3 bytes) — all resolve to same pubkey
+	for i, hop := range []string{`["AA"]`, `["AA"]`, `["AA"]`, `["AABB"]`, `["AABB"]`, `["AABBCC"]`} {
+		txID := 100 + i
+		db.conn.Exec(`INSERT INTO transmissions (id, raw_hex, hash, first_seen, route_type, payload_type, decoded_json)
+			VALUES (?, '01', ?, ?, 1, 4, '{}')`, txID, fmt.Sprintf("dedup_hash_%d", i), recent)
+		db.conn.Exec(`INSERT INTO observations (transmission_id, observer_idx, snr, rssi, path_json, timestamp)
+			VALUES (?, 1, 10.0, -90, ?, ?)`, txID, hop, recentEpoch)
+	}
+
+	// One packet with TestCompanion prefix "EE" (pk=eeff00112233aabb)
+	db.conn.Exec(`INSERT INTO transmissions (id, raw_hex, hash, first_seen, route_type, payload_type, decoded_json)
+		VALUES (200, '01', 'dedup_hash_beta', ?, 1, 4, '{}')`, recent)
+	db.conn.Exec(`INSERT INTO observations (transmission_id, observer_idx, snr, rssi, path_json, timestamp)
+		VALUES (200, 1, 10.0, -90, '["EE"]', ?)`, recentEpoch)
+
+	store := NewPacketStore(db, nil)
+	store.Load()
+	result := store.GetAnalyticsTopology("")
+
+	repeatersRaw, ok := result["topRepeaters"]
+	if !ok {
+		t.Fatal("missing topRepeaters in result")
+	}
+	repeaters, ok := repeatersRaw.([]map[string]interface{})
+	if !ok {
+		t.Fatalf("topRepeaters wrong type: %T", repeatersRaw)
+	}
+
+	// Count entries that resolve to TestRepeater's pubkey
+	repeaterPK := "aabbccdd11223344"
+	var alphaEntries, alphaCount int
+	var alphaHop string
+	for _, r := range repeaters {
+		pk, _ := r["pubkey"].(string)
+		if strings.EqualFold(pk, repeaterPK) {
+			alphaEntries++
+			c, _ := r["count"].(int)
+			alphaCount += c
+			alphaHop, _ = r["hop"].(string)
+		}
+	}
+
+	if alphaEntries != 1 {
+		t.Errorf("TestRepeater should appear exactly once in topRepeaters (deduped), got %d entries", alphaEntries)
+		for _, r := range repeaters {
+			t.Logf("  entry: hop=%v name=%v pubkey=%v count=%v", r["hop"], r["name"], r["pubkey"], r["count"])
+		}
+	}
+	// 6 from our inserts + whatever seedTestData contributed (paths contain "aa" which also resolves)
+	if alphaCount < 6 {
+		t.Errorf("TestRepeater deduped count should be >= 6 (3×AA + 2×AABB + 1×AABBCC + seed data), got %d", alphaCount)
+	}
+	// Should keep the longest prefix as display hop
+	if alphaHop != "AABBCC" {
+		t.Errorf("TestRepeater should display longest hop prefix 'AABBCC', got '%s'", alphaHop)
+	}
+
+	// TestCompanion (pk=eeff00112233aabb) should appear with EE's count included
+	companionPK := "eeff00112233aabb"
+	companionFound := false
+	for _, r := range repeaters {
+		pk, _ := r["pubkey"].(string)
+		if strings.EqualFold(pk, companionPK) {
+			companionFound = true
+		}
+	}
+	if !companionFound {
+		t.Error("TestCompanion should appear in topRepeaters")
+	}
+}
+
+func TestTopologyDeduplicatesPairsByPubkey(t *testing.T) {
+	// Regression test: topPairs with varying-length prefixes for the same node pair
+	// must be merged into a single entry.
+	// seedTestData provides: aabbccdd11223344 (TestRepeater), eeff00112233aabb (TestCompanion)
+	db := setupTestDB(t)
+	defer db.Close()
+
+	now := time.Now().UTC()
+	recent := now.Add(-1 * time.Hour).Format(time.RFC3339)
+	recentEpoch := now.Add(-1 * time.Hour).Unix()
+
+	seedTestData(t, db)
+
+	// Paths with same pair at different prefix lengths: AA→EE, AABB→EEFF, AABBCC→EEFF00
+	for i, path := range []string{`["AA","EE"]`, `["AA","EE"]`, `["AABB","EEFF"]`, `["AABBCC","EEFF00"]`} {
+		txID := 300 + i
+		db.conn.Exec(`INSERT INTO transmissions (id, raw_hex, hash, first_seen, route_type, payload_type, decoded_json)
+			VALUES (?, '01', ?, ?, 1, 4, '{}')`, txID, fmt.Sprintf("pair_hash_%d", i), recent)
+		db.conn.Exec(`INSERT INTO observations (transmission_id, observer_idx, snr, rssi, path_json, timestamp)
+			VALUES (?, 1, 10.0, -90, ?, ?)`, txID, path, recentEpoch)
+	}
+
+	store := NewPacketStore(db, nil)
+	store.Load()
+	result := store.GetAnalyticsTopology("")
+
+	pairsRaw, ok := result["topPairs"]
+	if !ok {
+		t.Fatal("missing topPairs in result")
+	}
+	pairs, ok := pairsRaw.([]map[string]interface{})
+	if !ok {
+		t.Fatalf("topPairs wrong type: %T", pairsRaw)
+	}
+
+	// The TestRepeater ↔ TestCompanion pair should appear exactly once with summed count
+	repeaterPK := "aabbccdd11223344"
+	companionPK := "eeff00112233aabb"
+	var pairEntries, pairCount int
+	for _, p := range pairs {
+		pkA, _ := p["pubkeyA"].(string)
+		pkB, _ := p["pubkeyB"].(string)
+		if (strings.EqualFold(pkA, repeaterPK) && strings.EqualFold(pkB, companionPK)) ||
+			(strings.EqualFold(pkA, companionPK) && strings.EqualFold(pkB, repeaterPK)) {
+			pairEntries++
+			c, _ := p["count"].(int)
+			pairCount += c
+		}
+	}
+
+	if pairEntries != 1 {
+		t.Errorf("TestRepeater↔TestCompanion pair should appear exactly once (deduped), got %d entries", pairEntries)
+		for _, p := range pairs {
+			t.Logf("  pair: hopA=%v hopB=%v pkA=%v pkB=%v count=%v", p["hopA"], p["hopB"], p["pubkeyA"], p["pubkeyB"], p["count"])
+		}
+	}
+	// 4 from our inserts + any from seed data that has the same pair
+	if pairCount < 4 {
+		t.Errorf("TestRepeater↔TestCompanion deduped pair count should be >= 4, got %d", pairCount)
+	}
+}
+
 func TestStoreGetAnalyticsChannels(t *testing.T) {
 	db := setupRichTestDB(t)
 	defer db.Close()

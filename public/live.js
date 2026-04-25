@@ -653,18 +653,53 @@
 
     // Wardriving car markers — parse @[MapperBot] pings from #wardriving channel
     (function () {
-      const payload = pkt.decoded && pkt.decoded.payload;
+      // Handle both raw WS packet (decoded_json) and dbPacketToLive form (decoded.payload)
+      const payload = (pkt.decoded && pkt.decoded.payload) ||
+        (pkt.decoded_json && typeof pkt.decoded_json === 'object' ? pkt.decoded_json :
+          (typeof pkt.decoded_json === 'string' ? (() => { try { return JSON.parse(pkt.decoded_json); } catch(e) { return null; } })() : null));
       if (!payload || payload.channel !== '#wardriving') return;
-      const m = (payload.text || '').match(/@\[MapperBot\]\s*([\-\d.]+),\s*([\-\d.]+)/);
+      const text = payload.text || '';
+      const sender = payload.sender || 'unknown';
+
+      // /icon <name> command — sets custom icon for this sender
+      const iconCmd = text.match(/\/icon\s+(\S+)/i);
+      if (iconCmd) {
+        const ICON_MAP = {
+          car: '🚗', auto: '🚗', vehicle: '🚗',
+          dog: '🐕', walk: '🐕', walking: '🐕',
+          bike: '🚲', bicycle: '🚲', cycle: '🚲',
+          foot: '🚶', hike: '🚶', hiking: '🚶',
+          moto: '🏍️', motorcycle: '🏍️', mc: '🏍️',
+          truck: '🚐', van: '🚐',
+          boat: '⛵', kayak: '🚣', canoe: '🚣',
+          bus: '🚌', transit: '🚌',
+          train: '🚆', rail: '🚆',
+          scooter: '🛥️', kick: '🛥️',
+        };
+        const chosen = ICON_MAP[iconCmd[1].toLowerCase()];
+        if (chosen) {
+          if (!window._wardrivingIcons) window._wardrivingIcons = {};
+          window._wardrivingIcons[sender] = chosen;
+          // Update existing marker if present
+          if (_wardriveCars[sender]) {
+            _wardriveCars[sender].marker.setIcon(
+              L.divIcon({ className: '', html: '<div style="font-size:20px;line-height:1;filter:drop-shadow(0 0 3px #39FF14);" title="' + sender + '">' + chosen + '</div>', iconSize: [24,24], iconAnchor: [12,12] })
+            );
+          }
+        }
+        return; // /icon messages don't have coords
+      }
+
+      const m = text.match(/@\[MapperBot\]\s*([\-\d.]+),\s*([\-\d.]+)/);
       if (!m) return;
       const lat = parseFloat(m[1]), lon = parseFloat(m[2]);
       if (isNaN(lat) || isNaN(lon)) return;
-      const sender = payload.sender || 'unknown';
 
       function carIcon(color) {
+        const emoji = (window._wardrivingIcons && window._wardrivingIcons[sender]) || '🚗';
         return L.divIcon({
           className: '',
-          html: '<div style="font-size:20px;line-height:1;filter:drop-shadow(0 0 3px ' + color + ');" title="' + sender + '">🚗</div>',
+          html: '<div style="font-size:20px;line-height:1;filter:drop-shadow(0 0 3px ' + color + ');" title="' + sender + '">' + emoji + '</div>',
           iconSize: [24, 24],
           iconAnchor: [12, 12],
         });

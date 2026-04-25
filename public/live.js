@@ -1339,47 +1339,10 @@
       });
     }, 10000);
 
-    // Auto-hide nav with pin toggle (#62)
+    // Nav is fixed over the map but otherwise behaves like all other pages
     const topNav = document.querySelector('.top-nav');
     if (topNav) { topNav.style.position = 'fixed'; topNav.style.width = '100%'; topNav.style.zIndex = '1100'; }
-    _navCleanup = { timeout: null, fn: null, pinned: false };
-    // Add pin button to nav (guard against duplicate)
-    if (topNav && !document.getElementById('navPinBtn')) {
-      const pinBtn = document.createElement('button');
-      pinBtn.id = 'navPinBtn';
-      pinBtn.className = 'nav-pin-btn';
-      pinBtn.setAttribute('aria-label', 'Pin navigation open');
-      pinBtn.setAttribute('title', 'Pin navigation open');
-      pinBtn.textContent = '📌';
-      pinBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        _navCleanup.pinned = !_navCleanup.pinned;
-        pinBtn.classList.toggle('pinned', _navCleanup.pinned);
-        pinBtn.setAttribute('aria-pressed', _navCleanup.pinned);
-        if (_navCleanup.pinned) {
-          clearTimeout(_navCleanup.timeout);
-          topNav.classList.remove('nav-autohide');
-        } else {
-          _navCleanup.timeout = setTimeout(() => { topNav.classList.add('nav-autohide'); }, 4000);
-        }
-      });
-      topNav.appendChild(pinBtn);
-    }
-    function showNav() {
-      if (topNav) topNav.classList.remove('nav-autohide');
-      clearTimeout(_navCleanup.timeout);
-      if (!_navCleanup.pinned) {
-        _navCleanup.timeout = setTimeout(() => { if (topNav) topNav.classList.add('nav-autohide'); }, 4000);
-      }
-    }
-    _navCleanup.fn = showNav;
-    const livePage = document.querySelector('.live-page');
-    if (livePage) {
-      livePage.addEventListener('mousemove', showNav);
-      livePage.addEventListener('touchstart', showNav);
-      livePage.addEventListener('click', showNav);
-    }
-    showNav();
+    _navCleanup = {};
   }
 
   function injectSVGFilters() {
@@ -2876,19 +2839,8 @@
     const appEl = document.getElementById('app');
     if (appEl) appEl.style.height = '';
     const topNav = document.querySelector('.top-nav');
-    if (topNav) { topNav.classList.remove('nav-autohide'); topNav.style.position = ''; topNav.style.width = ''; topNav.style.zIndex = ''; }
-    const existingPin = document.getElementById('navPinBtn');
-    if (existingPin) existingPin.remove();
-    if (_navCleanup) {
-      clearTimeout(_navCleanup.timeout);
-      const livePage = document.querySelector('.live-page');
-      if (livePage && _navCleanup.fn) {
-        livePage.removeEventListener('mousemove', _navCleanup.fn);
-        livePage.removeEventListener('touchstart', _navCleanup.fn);
-        livePage.removeEventListener('click', _navCleanup.fn);
-      }
-      _navCleanup = null;
-    }
+    if (topNav) { topNav.style.position = ''; topNav.style.width = ''; topNav.style.zIndex = ''; }
+    _navCleanup = null;
     nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = null;
     stopMatrixRain();
     nodeMarkers = {}; nodeData = {};

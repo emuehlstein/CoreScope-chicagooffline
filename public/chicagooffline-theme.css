@@ -115,9 +115,17 @@
   --vcr-lcd-glow:   rgba(0,0,0,0.3);
 }
 
-/* ── Force dark as default (chicagooffline always dark) ── */
+/* ── Default to dark color-scheme (adapts native form controls) ── */
 :root {
   color-scheme: dark;
+}
+[data-theme="light"] {
+  color-scheme: light;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+  }
 }
 
 /* ── Light mode (OS-level) ── */

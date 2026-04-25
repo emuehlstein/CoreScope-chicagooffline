@@ -46,6 +46,7 @@
     timelineTimestamps: [], // historical timestamps from DB for sparkline
     timelineFetchedScope: 0, // last fetched scope to avoid redundant fetches
     replayGen: 0,            // generation counter — incremented on each replay/rewind to discard stale async results
+    currentTs: 0,            // current playback timestamp (ms) — updated by updateVCRClock
   };
 
   // ROLE_COLORS loaded from shared roles.js (includes 'unknown')
@@ -486,7 +487,9 @@
   }
 
   function updateVCRClock(tsMs) {
+    VCR.currentTs = tsMs;
     drawLcdText(vcrFormatTime(tsMs), statusGreen());
+    _wdSyncMarkers();
   }
 
   function updateVCRLcd() {
@@ -650,9 +653,6 @@
         VCR.playhead = Math.max(0, VCR.playhead - trimCount);
       }
     }
-
-    // Wardriving car markers — parse @[MapperBot] pings from #wardriving channel
-    handleWardrivingPacket(pkt, 0);
 
     if (VCR.mode === 'LIVE') {
       // Skip animations when tab is backgrounded — just buffer for VCR timeline
@@ -1550,6 +1550,12 @@
   function clearNodeMarkers() {
     if (nodesLayer) nodesLayer.clearLayers();
     if (animLayer) animLayer.clearLayers();
+    // Clear wardriving markers on rewind/reset
+    if (wardrivingLayer) wardrivingLayer.clearLayers();
+    Object.keys(_wardriveCars).forEach(function(k) {
+      clearTimeout(_wardriveCars[k].ageTimer); clearTimeout(_wardriveCars[k].expireTimer);
+      delete _wardriveCars[k];
+    });
     nodeMarkers = {};
     nodeData = {};
     nodeActivity = {};
@@ -1935,7 +1941,7 @@
       if (t) {
         if (!window._wardrivingIcons) window._wardrivingIcons = {};
         window._wardrivingIcons[sender] = t;
-        if (_wardriveCars[sender]) _wardriveCars[sender].marker.setIcon(_wdIcon(sender, '#39FF14'));
+        if (_wardriveCars[sender]) _wardriveCars[sender].marker.setIcon(_wdIcon(sender, _wardriveCars[sender]._orange ? '#FFB300' : '#39FF14'));
       }
       return;
     }
@@ -1944,33 +1950,70 @@
     const lat = parseFloat(m[1]), lon = parseFloat(m[2]);
     if (isNaN(lat) || isNaN(lon)) return;
     const elapsed = ageMs || 0;
-    if (elapsed >= 300000) return;
+    if (elapsed >= 300000) {
+      // Already expired — remove if present
+      if (_wardriveCars[sender]) {
+        wardrivingLayer.removeLayer(_wardriveCars[sender].marker);
+        delete _wardriveCars[sender];
+      }
+      return;
+    }
     const initColor = elapsed >= 60000 ? '#FFB300' : '#39FF14';
+    const pktTs = (pkt._ts || 0) || (VCR.currentTs > 0 ? VCR.currentTs - elapsed : Date.now() - elapsed);
     if (_wardriveCars[sender]) {
       clearTimeout(_wardriveCars[sender].ageTimer);
       clearTimeout(_wardriveCars[sender].expireTimer);
       _wardriveCars[sender].marker.setLatLng([lat, lon]);
       _wardriveCars[sender].marker.setIcon(_wdIcon(sender, initColor));
+      _wardriveCars[sender]._orange = elapsed >= 60000;
+      _wardriveCars[sender]._ts = pktTs;
     } else {
-      _wardriveCars[sender] = { marker: L.marker([lat, lon], { icon: _wdIcon(sender, initColor), zIndexOffset: 500 }).addTo(wardrivingLayer) };
+      _wardriveCars[sender] = {
+        marker: L.marker([lat, lon], { icon: _wdIcon(sender, initColor), zIndexOffset: 500 }).addTo(wardrivingLayer),
+        _orange: elapsed >= 60000,
+        _ts: pktTs,
+      };
     }
-    if (elapsed < 60000) {
-      _wardriveCars[sender].ageTimer = setTimeout(function() {
-        if (_wardriveCars[sender]) {
-          _wardriveCars[sender]._orange = true;
-          _wardriveCars[sender].marker.setIcon(_wdIcon(sender, '#FFB300'));
-        }
-      }, 60000 - elapsed);
-    } else {
-      _wardriveCars[sender]._orange = true;
-    }
-    _wardriveCars[sender].expireTimer = setTimeout(function() {
-      if (_wardriveCars[sender]) {
-        if (wardrivingLayer) wardrivingLayer.removeLayer(_wardriveCars[sender].marker);
-        delete _wardriveCars[sender];
+    // In LIVE mode: use setTimeout for color/expiry transitions
+    // In REPLAY mode: _wdSyncMarkers handles it via VCR clock ticks
+    if (VCR.mode === 'LIVE') {
+      if (elapsed < 60000) {
+        _wardriveCars[sender].ageTimer = setTimeout(function() {
+          if (_wardriveCars[sender]) {
+            _wardriveCars[sender]._orange = true;
+            _wardriveCars[sender].marker.setIcon(_wdIcon(sender, '#FFB300'));
+          }
+        }, 60000 - elapsed);
       }
-    }, 300000 - elapsed);
+      _wardriveCars[sender].expireTimer = setTimeout(function() {
+        if (_wardriveCars[sender]) {
+          if (wardrivingLayer) wardrivingLayer.removeLayer(_wardriveCars[sender].marker);
+          delete _wardriveCars[sender];
+        }
+      }, 300000 - elapsed);
+    }
   }
+
+  // Sync wardriving marker colors/visibility to VCR.currentTs (called on every clock tick)
+  function _wdSyncMarkers() {
+    const now = VCR.currentTs || Date.now();
+    Object.keys(_wardriveCars).forEach(function(sender) {
+      const car = _wardriveCars[sender];
+      if (!car || !car._ts) return;
+      const age = now - car._ts;
+      if (age >= 300000) {
+        if (wardrivingLayer) wardrivingLayer.removeLayer(car.marker);
+        delete _wardriveCars[sender];
+      } else if (age >= 60000 && !car._orange) {
+        car._orange = true;
+        car.marker.setIcon(_wdIcon(sender, '#FFB300'));
+      } else if (age < 60000 && car._orange) {
+        car._orange = false;
+        car.marker.setIcon(_wdIcon(sender, '#39FF14'));
+      }
+    });
+  }
+
 
   async function seedWardrivingMarkers() {
     try {
@@ -2006,6 +2049,12 @@
   // Takes an array of observations (same hash) and renders the complete path tree.
   function renderPacketTree(packets, isReplay) {
     if (!packets || !packets.length) return;
+    // Wardriving: process first packet (CHAN type) — pass VCR age for replay
+    const _wdPkt = packets[0];
+    if (_wdPkt) {
+      const _wdAge = VCR.currentTs > 0 ? Math.max(0, VCR.currentTs - (_wdPkt._ts || 0)) : 0;
+      handleWardrivingPacket(_wdPkt, _wdAge);
+    }
     const first = packets[0];
     const decoded = first.decoded || {};
     const header = decoded.header || {};

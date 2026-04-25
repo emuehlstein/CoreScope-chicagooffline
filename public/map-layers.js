@@ -2,7 +2,7 @@
  * map-layers.js — Chicago Offline basemap helper
  *
  * Provides window.CO_BASEMAP with three modes:
- *   'carto'      — Carto dark/light (default, theme-aware)
+ *   'carto'      — Carto dark/light (theme-aware)
  *   'satellite'  — Esri World Imagery
  *   'hillshade'  — Chicago Offline combined 3DEP+LiDAR 9x hillshade (theme-aware overlay on Carto)
  *
@@ -34,7 +34,7 @@
 
   var _map       = null;
   var _isDark    = true;
-  var _mode      = 'carto';  // 'carto' | 'satellite' | 'hillshade'
+  var _mode      = 'hillshade';  // 'carto' | 'satellite' | 'hillshade'
   var _baseLayer = null;     // the active base tile layer
   var _hillLayer = null;     // hillshade overlay (only when mode=hillshade)
 
@@ -83,7 +83,7 @@
   function init(map, isDark, savedMode) {
     _map    = map;
     _isDark = !!isDark;
-    _mode   = savedMode || localStorage.getItem('co-basemap-mode') || 'carto';
+    _mode   = savedMode || localStorage.getItem('co-basemap-mode') || 'hillshade';
     _applyMode();
   }
 

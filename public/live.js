@@ -652,90 +652,7 @@
     }
 
     // Wardriving car markers — parse @[MapperBot] pings from #wardriving channel
-    (function () {
-      // Resolve decoded payload from any packet shape:
-      //   WS live: pkt.decoded = parsed decoded_json object (with .channel, .text, .sender)
-      //   dbPacketToLive: pkt.decoded.payload = same shape
-      //   fallback: parse pkt.decoded_json string
-      let payload = null;
-      if (pkt.decoded) {
-        // WS shape: pkt.decoded has .channel/.text/.sender directly
-        // dbPacketToLive shape: pkt.decoded.payload has them
-        payload = (pkt.decoded.channel !== undefined) ? pkt.decoded : (pkt.decoded.payload || null);
-      }
-      if (!payload && pkt.decoded_json) {
-        try { payload = typeof pkt.decoded_json === 'string' ? JSON.parse(pkt.decoded_json) : pkt.decoded_json; } catch(e) {}
-      }
-      if (!payload || payload.channel !== '#wardriving') return;
-      const text = payload.text || '';
-      const sender = payload.sender || 'unknown';
-
-      // /icon <name> command — sets custom icon for this sender
-      const iconCmd = text.match(/\/icon\s+(\S+)/i);
-      if (iconCmd) {
-        const ICON_MAP = {
-          car: '🚗', auto: '🚗', vehicle: '🚗',
-          dog: '🐕', walk: '🐕', walking: '🐕',
-          bike: '🚲', bicycle: '🚲', cycle: '🚲',
-          foot: '🚶', hike: '🚶', hiking: '🚶',
-          moto: '🏍️', motorcycle: '🏍️', mc: '🏍️',
-          truck: '🚐', van: '🚐',
-          boat: '⛵', kayak: '🚣', canoe: '🚣',
-          bus: '🚌', transit: '🚌',
-          train: '🚆', rail: '🚆',
-          scooter: '🛥️', kick: '🛥️',
-        };
-        const chosen = ICON_MAP[iconCmd[1].toLowerCase()];
-        if (chosen) {
-          if (!window._wardrivingIcons) window._wardrivingIcons = {};
-          window._wardrivingIcons[sender] = chosen;
-          // Update existing marker if present
-          if (_wardriveCars[sender]) {
-            _wardriveCars[sender].marker.setIcon(
-              L.divIcon({ className: '', html: '<div style="font-size:20px;line-height:1;filter:drop-shadow(0 0 3px #39FF14);" title="' + sender + '">' + chosen + '</div>', iconSize: [24,24], iconAnchor: [12,12] })
-            );
-          }
-        }
-        return; // /icon messages don't have coords
-      }
-
-      const m = text.match(/@\[MapperBot\]\s*([\-\d.]+),\s*([\-\d.]+)/);
-      if (!m) return;
-      const lat = parseFloat(m[1]), lon = parseFloat(m[2]);
-      if (isNaN(lat) || isNaN(lon)) return;
-
-      function carIcon(color) {
-        const emoji = (window._wardrivingIcons && window._wardrivingIcons[sender]) || '🚗';
-        return L.divIcon({
-          className: '',
-          html: '<div style="font-size:32px;line-height:1;filter:drop-shadow(0 0 4px ' + color + ');">' + emoji + '</div>',
-          iconSize: [36, 36],
-          iconAnchor: [18, 18],
-        });
-      }
-
-      if (_wardriveCars[sender]) {
-        clearTimeout(_wardriveCars[sender].ageTimer);
-        clearTimeout(_wardriveCars[sender].expireTimer);
-        _wardriveCars[sender].marker.setLatLng([lat, lon]);
-        _wardriveCars[sender].marker.setIcon(carIcon('#39FF14'));
-      } else {
-        const marker = L.marker([lat, lon], { icon: carIcon('#39FF14'), zIndexOffset: 500 })
-          .addTo(wardrivingLayer);
-        _wardriveCars[sender] = { marker };
-      }
-
-      _wardriveCars[sender].ageTimer = setTimeout(function() {
-        if (_wardriveCars[sender]) _wardriveCars[sender].marker.setIcon(carIcon('#FFB300'));
-      }, 60000);
-
-      _wardriveCars[sender].expireTimer = setTimeout(function() {
-        if (_wardriveCars[sender]) {
-          if (wardrivingLayer) wardrivingLayer.removeLayer(_wardriveCars[sender].marker);
-          delete _wardriveCars[sender];
-        }
-      }, 300000);
-    })();
+    handleWardrivingPacket(pkt, 0);
 
     if (VCR.mode === 'LIVE') {
       // Skip animations when tab is backgrounded — just buffer for VCR timeline
@@ -1023,6 +940,7 @@
     injectSVGFilters();
     await loadNodes();
     showHeatMap();
+    seedWardrivingMarkers();
     connectWS();
     initResizeHandler();
     startRateCounter();
@@ -1914,6 +1832,109 @@
       }
       updateTimeline();
     } catch {}
+  }
+
+  // ── Wardriving helpers ─────────────────────────────────────────────────────
+  const _WD_SVGS = {
+    car:    '<path d="M4 11 L6 5 L18 5 L20 11" stroke="currentColor" stroke-width="1.5" fill="none"/><rect x="3" y="11" width="18" height="7" rx="2" fill="currentColor"/><circle cx="7.5" cy="19" r="2" fill="#111"/><circle cx="16.5" cy="19" r="2" fill="#111"/><rect x="7" y="7" width="4" height="3" rx="0.5" fill="#111" opacity="0.5"/><rect x="13" y="7" width="4" height="3" rx="0.5" fill="#111" opacity="0.5"/>',
+    dog:    '<ellipse cx="12" cy="14" rx="6" ry="5" fill="currentColor"/><circle cx="12" cy="8" r="4" fill="currentColor"/><ellipse cx="8.5" cy="6" rx="2" ry="3" fill="currentColor"/><ellipse cx="15.5" cy="6" rx="2" ry="3" fill="currentColor"/><circle cx="10.5" cy="8.5" r="0.8" fill="#111"/><circle cx="13.5" cy="8.5" r="0.8" fill="#111"/><path d="M10 10.5 Q12 12 14 10.5" stroke="#111" stroke-width="0.8" fill="none"/>',
+    bike:   '<circle cx="7" cy="16" r="4" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="17" cy="16" r="4" stroke="currentColor" stroke-width="2" fill="none"/><path d="M7 16 L12 7 L17 16" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 7 L14 4 L17 4" stroke="currentColor" stroke-width="2" fill="none"/>',
+    foot:   '<circle cx="12" cy="5" r="2.5" fill="currentColor"/><path d="M12 7.5 L10 13 L8 19" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M12 7.5 L14 13 L16 19" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M10 13 L14 13" stroke="currentColor" stroke-width="1.5" fill="none"/>',
+    moto:   '<circle cx="6" cy="16" r="3.5" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="18" cy="16" r="3.5" stroke="currentColor" stroke-width="2" fill="none"/><path d="M6 16 L9 10 L15 10 L18 16" stroke="currentColor" stroke-width="2" fill="none"/><rect x="10" y="8" width="4" height="3" rx="1" fill="currentColor"/>',
+    truck:  '<rect x="2" y="8" width="14" height="10" rx="1.5" fill="currentColor"/><path d="M16 10 L22 13 L22 18 L16 18 Z" fill="currentColor"/><circle cx="6" cy="19.5" r="2" fill="#111"/><circle cx="13" cy="19.5" r="2" fill="#111"/><circle cx="19" cy="19.5" r="2" fill="#111"/><rect x="4" y="10" width="5" height="4" rx="0.5" fill="#111" opacity="0.4"/>',
+    boat:   '<path d="M4 16 Q12 10 20 16" stroke="currentColor" stroke-width="2" fill="currentColor" opacity="0.8"/><path d="M12 16 L12 6 L18 12" stroke="currentColor" stroke-width="1.5" fill="none"/>',
+    bus:    '<rect x="3" y="5" width="18" height="14" rx="2" fill="currentColor"/><rect x="5" y="7" width="5" height="4" rx="0.5" fill="#111" opacity="0.5"/><rect x="14" y="7" width="5" height="4" rx="0.5" fill="#111" opacity="0.5"/><circle cx="7" cy="20" r="2" fill="#111"/><circle cx="17" cy="20" r="2" fill="#111"/>',
+    train:  '<rect x="5" y="4" width="14" height="14" rx="3" fill="currentColor"/><rect x="8" y="6" width="8" height="4" rx="0.5" fill="#111" opacity="0.5"/><rect x="8" y="12" width="8" height="2" rx="0.5" fill="#111" opacity="0.3"/><circle cx="8.5" cy="20" r="2" fill="#111"/><circle cx="15.5" cy="20" r="2" fill="#111"/>',
+    scooter:'<circle cx="6" cy="17" r="3" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="18" cy="17" r="3" stroke="currentColor" stroke-width="2" fill="none"/><path d="M6 17 L11 9 L15 9 L18 17" stroke="currentColor" stroke-width="2" fill="none"/><path d="M13 9 L13 6 L16 6" stroke="currentColor" stroke-width="1.5" fill="none"/>',
+  };
+  const _WD_ALIASES = {
+    car:'car', auto:'car', vehicle:'car',
+    dog:'dog', walk:'dog', walking:'dog',
+    bike:'bike', bicycle:'bike', cycle:'bike',
+    foot:'foot', hike:'foot', hiking:'foot',
+    moto:'moto', motorcycle:'moto', mc:'moto',
+    truck:'truck', van:'truck',
+    boat:'boat', kayak:'boat', canoe:'boat',
+    bus:'bus', transit:'bus',
+    train:'train', rail:'train',
+    scooter:'scooter', kick:'scooter',
+  };
+
+  function _wdIcon(sender, color) {
+    const type = (window._wardrivingIcons && window._wardrivingIcons[sender]) || 'car';
+    const shape = _WD_SVGS[type] || _WD_SVGS.car;
+    return L.divIcon({
+      className: '',
+      html: '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24" style="color:' + color + ';filter:drop-shadow(0 0 4px ' + color + ');display:block">' + shape + '</svg>',
+      iconSize: [36, 36], iconAnchor: [18, 18],
+    });
+  }
+
+  function handleWardrivingPacket(pkt, ageMs) {
+    if (!wardrivingLayer) return;
+    let payload = null;
+    if (pkt.decoded) {
+      payload = (pkt.decoded.channel !== undefined) ? pkt.decoded : (pkt.decoded.payload || null);
+    }
+    if (!payload && pkt.decoded_json) {
+      try { payload = typeof pkt.decoded_json === 'string' ? JSON.parse(pkt.decoded_json) : pkt.decoded_json; } catch(e) {}
+    }
+    if (!payload || payload.channel !== '#wardriving') return;
+    const text = payload.text || '';
+    const sender = payload.sender || 'unknown';
+    // /icon command
+    const iconCmd = text.match(/\/icon\s+(\S+)/i);
+    if (iconCmd) {
+      const t = _WD_ALIASES[iconCmd[1].toLowerCase()];
+      if (t) {
+        if (!window._wardrivingIcons) window._wardrivingIcons = {};
+        window._wardrivingIcons[sender] = t;
+        if (_wardriveCars[sender]) _wardriveCars[sender].marker.setIcon(_wdIcon(sender, '#39FF14'));
+      }
+      return;
+    }
+    const m = text.match(/@\[MapperBot\]\s*([\-\d.]+),\s*([\-\d.]+)/);
+    if (!m) return;
+    const lat = parseFloat(m[1]), lon = parseFloat(m[2]);
+    if (isNaN(lat) || isNaN(lon)) return;
+    const elapsed = ageMs || 0;
+    if (elapsed >= 300000) return;
+    const initColor = elapsed >= 60000 ? '#FFB300' : '#39FF14';
+    if (_wardriveCars[sender]) {
+      clearTimeout(_wardriveCars[sender].ageTimer);
+      clearTimeout(_wardriveCars[sender].expireTimer);
+      _wardriveCars[sender].marker.setLatLng([lat, lon]);
+      _wardriveCars[sender].marker.setIcon(_wdIcon(sender, initColor));
+    } else {
+      _wardriveCars[sender] = { marker: L.marker([lat, lon], { icon: _wdIcon(sender, initColor), zIndexOffset: 500 }).addTo(wardrivingLayer) };
+    }
+    if (elapsed < 60000) {
+      _wardriveCars[sender].ageTimer = setTimeout(function() {
+        if (_wardriveCars[sender]) _wardriveCars[sender].marker.setIcon(_wdIcon(sender, '#FFB300'));
+      }, 60000 - elapsed);
+    }
+    _wardriveCars[sender].expireTimer = setTimeout(function() {
+      if (_wardriveCars[sender]) {
+        if (wardrivingLayer) wardrivingLayer.removeLayer(_wardriveCars[sender].marker);
+        delete _wardriveCars[sender];
+      }
+    }, 300000 - elapsed);
+  }
+
+  async function seedWardrivingMarkers() {
+    try {
+      const resp = await api('/channels/%23wardriving/messages?limit=50', { ttl: 0 });
+      const messages = (resp && resp.messages) || [];
+      const now = Date.now();
+      messages.slice().sort(function(a,b){ return new Date(a.first_seen)-new Date(b.first_seen); })
+        .forEach(function(msg) {
+          const dj = msg.decoded_json;
+          const payload = typeof dj === 'string' ? (function(){ try{ return JSON.parse(dj); }catch(e){ return null; } })() : dj;
+          if (!payload) return;
+          const ageMs = now - (msg.first_seen ? new Date(msg.first_seen).getTime() : 0);
+          handleWardrivingPacket({ decoded: payload }, ageMs);
+        });
+    } catch(e) { /* best effort */ }
   }
 
   function connectWS() {

@@ -151,5 +151,5 @@
     return totalDuration;
   }
 
-  MeshAudio.registerVoice('notify', { name: 'notify', play });
+  MeshAudio.registerVoice('notify', { name: 'notify', defaultBpm: 150, play });
 })();

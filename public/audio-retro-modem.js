@@ -196,7 +196,7 @@
 
   MeshAudio.registerVoice('squeaker', {
     name: 'squeaker',
-    defaultBpm: 80,
+    defaultBpm: 120,
     play
   });
 })();

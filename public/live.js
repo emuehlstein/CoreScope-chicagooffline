@@ -946,6 +946,7 @@
     nodesLayer = L.layerGroup().addTo(map);
     pathsLayer = L.layerGroup().addTo(map);
     wardrivingLayer = L.layerGroup().addTo(map);
+    map.on('zoomend', _wdResizeAll);
     animLayer = L.layerGroup().addTo(map);
 
     injectSVGFilters();
@@ -1880,13 +1881,35 @@
     scooter:'scooter', kick:'scooter',
   };
 
-  function _wdIcon(sender, color) {
+  function _wdIconSize() {
+    if (!map) return 36;
+    const z = map.getZoom();
+    if (z >= 16) return 44;
+    if (z >= 14) return 36;
+    if (z >= 12) return 28;
+    if (z >= 10) return 20;
+    return 14;
+  }
+
+  function _wdIcon(sender, color, size) {
     const type = (window._wardrivingIcons && window._wardrivingIcons[sender]) || 'car';
     const shape = _WD_SVGS[type] || _WD_SVGS.car;
+    const sz = size || _wdIconSize();
+    const half = Math.round(sz / 2);
     return L.divIcon({
       className: '',
-      html: '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24" style="color:' + color + ';filter:drop-shadow(0 0 4px ' + color + ');display:block">' + shape + '</svg>',
-      iconSize: [36, 36], iconAnchor: [18, 18],
+      html: '<svg xmlns="http://www.w3.org/2000/svg" width="' + sz + '" height="' + sz + '" viewBox="0 0 24 24" style="color:' + color + ';filter:drop-shadow(0 0 3px ' + color + ');display:block">' + shape + '</svg>',
+      iconSize: [sz, sz], iconAnchor: [half, half],
+    });
+  }
+
+  function _wdResizeAll() {
+    Object.keys(_wardriveCars).forEach(function(sender) {
+      const car = _wardriveCars[sender];
+      if (!car || !car.marker) return;
+      // Determine current color from stored state
+      const color = car._orange ? '#FFB300' : '#39FF14';
+      car.marker.setIcon(_wdIcon(sender, color));
     });
   }
 
@@ -1930,8 +1953,13 @@
     }
     if (elapsed < 60000) {
       _wardriveCars[sender].ageTimer = setTimeout(function() {
-        if (_wardriveCars[sender]) _wardriveCars[sender].marker.setIcon(_wdIcon(sender, '#FFB300'));
+        if (_wardriveCars[sender]) {
+          _wardriveCars[sender]._orange = true;
+          _wardriveCars[sender].marker.setIcon(_wdIcon(sender, '#FFB300'));
+        }
       }, 60000 - elapsed);
+    } else {
+      _wardriveCars[sender]._orange = true;
     }
     _wardriveCars[sender].expireTimer = setTimeout(function() {
       if (_wardriveCars[sender]) {
@@ -2970,6 +2998,7 @@
     const topNav = document.querySelector('.top-nav');
     if (topNav) { topNav.style.position = ''; topNav.style.width = ''; topNav.style.zIndex = ''; }
     _navCleanup = null;
+    if (map) map.off('zoomend', _wdResizeAll);
     nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = wardrivingLayer = null;
     Object.keys(_wardriveCars).forEach(function(k) {
       clearTimeout(_wardriveCars[k].ageTimer);

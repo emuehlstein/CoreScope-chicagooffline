@@ -866,6 +866,17 @@
           </ul>
           <h3 class="legend-title" style="margin-top:8px">NODE ROLES</h3>
           <ul class="legend-list" id="roleLegendList"></ul>
+          <h3 class="legend-title" style="margin-top:8px">WARDRIVERS</h3>
+          <ul class="legend-list" id="wardriverLegendList">
+            <li id="wdLegendGreen" style="display:flex;align-items:center;gap:4px">
+              <span class="wd-legend-icon wd-green" data-type="car"></span>
+              <span>Active (&lt;60s)</span>
+            </li>
+            <li id="wdLegendOrange" style="display:flex;align-items:center;gap:4px">
+              <span class="wd-legend-icon wd-orange" data-type="car"></span>
+              <span>Aging (60s–5min)</span>
+            </li>
+          </ul>
           </div>
         </div>
 
@@ -941,6 +952,15 @@
     await loadNodes();
     showHeatMap();
     seedWardrivingMarkers();
+    // Populate wardriver legend icons
+    (function() {
+      document.querySelectorAll('.wd-legend-icon').forEach(function(el) {
+        const type = el.getAttribute('data-type') || 'car';
+        const color = el.classList.contains('wd-orange') ? '#FFB300' : '#39FF14';
+        const shape = _WD_SVGS[type] || _WD_SVGS.car;
+        el.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" style="color:' + color + ';display:block">' + shape + '</svg>';
+      });
+    })();
     connectWS();
     initResizeHandler();
     startRateCounter();
@@ -1836,16 +1856,16 @@
 
   // ── Wardriving helpers ─────────────────────────────────────────────────────
   const _WD_SVGS = {
-    car:    '<path d="M4 11 L6 5 L18 5 L20 11" stroke="currentColor" stroke-width="1.5" fill="none"/><rect x="3" y="11" width="18" height="7" rx="2" fill="currentColor"/><circle cx="7.5" cy="19" r="2" fill="#111"/><circle cx="16.5" cy="19" r="2" fill="#111"/><rect x="7" y="7" width="4" height="3" rx="0.5" fill="#111" opacity="0.5"/><rect x="13" y="7" width="4" height="3" rx="0.5" fill="#111" opacity="0.5"/>',
-    dog:    '<ellipse cx="12" cy="14" rx="6" ry="5" fill="currentColor"/><circle cx="12" cy="8" r="4" fill="currentColor"/><ellipse cx="8.5" cy="6" rx="2" ry="3" fill="currentColor"/><ellipse cx="15.5" cy="6" rx="2" ry="3" fill="currentColor"/><circle cx="10.5" cy="8.5" r="0.8" fill="#111"/><circle cx="13.5" cy="8.5" r="0.8" fill="#111"/><path d="M10 10.5 Q12 12 14 10.5" stroke="#111" stroke-width="0.8" fill="none"/>',
-    bike:   '<circle cx="7" cy="16" r="4" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="17" cy="16" r="4" stroke="currentColor" stroke-width="2" fill="none"/><path d="M7 16 L12 7 L17 16" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 7 L14 4 L17 4" stroke="currentColor" stroke-width="2" fill="none"/>',
-    foot:   '<circle cx="12" cy="5" r="2.5" fill="currentColor"/><path d="M12 7.5 L10 13 L8 19" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M12 7.5 L14 13 L16 19" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M10 13 L14 13" stroke="currentColor" stroke-width="1.5" fill="none"/>',
-    moto:   '<circle cx="6" cy="16" r="3.5" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="18" cy="16" r="3.5" stroke="currentColor" stroke-width="2" fill="none"/><path d="M6 16 L9 10 L15 10 L18 16" stroke="currentColor" stroke-width="2" fill="none"/><rect x="10" y="8" width="4" height="3" rx="1" fill="currentColor"/>',
-    truck:  '<rect x="2" y="8" width="14" height="10" rx="1.5" fill="currentColor"/><path d="M16 10 L22 13 L22 18 L16 18 Z" fill="currentColor"/><circle cx="6" cy="19.5" r="2" fill="#111"/><circle cx="13" cy="19.5" r="2" fill="#111"/><circle cx="19" cy="19.5" r="2" fill="#111"/><rect x="4" y="10" width="5" height="4" rx="0.5" fill="#111" opacity="0.4"/>',
-    boat:   '<path d="M4 16 Q12 10 20 16" stroke="currentColor" stroke-width="2" fill="currentColor" opacity="0.8"/><path d="M12 16 L12 6 L18 12" stroke="currentColor" stroke-width="1.5" fill="none"/>',
-    bus:    '<rect x="3" y="5" width="18" height="14" rx="2" fill="currentColor"/><rect x="5" y="7" width="5" height="4" rx="0.5" fill="#111" opacity="0.5"/><rect x="14" y="7" width="5" height="4" rx="0.5" fill="#111" opacity="0.5"/><circle cx="7" cy="20" r="2" fill="#111"/><circle cx="17" cy="20" r="2" fill="#111"/>',
-    train:  '<rect x="5" y="4" width="14" height="14" rx="3" fill="currentColor"/><rect x="8" y="6" width="8" height="4" rx="0.5" fill="#111" opacity="0.5"/><rect x="8" y="12" width="8" height="2" rx="0.5" fill="#111" opacity="0.3"/><circle cx="8.5" cy="20" r="2" fill="#111"/><circle cx="15.5" cy="20" r="2" fill="#111"/>',
-    scooter:'<circle cx="6" cy="17" r="3" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="18" cy="17" r="3" stroke="currentColor" stroke-width="2" fill="none"/><path d="M6 17 L11 9 L15 9 L18 17" stroke="currentColor" stroke-width="2" fill="none"/><path d="M13 9 L13 6 L16 6" stroke="currentColor" stroke-width="1.5" fill="none"/>',
+    car:    '<path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" d="M7 17a2 2 0 1 0 4 0 2 2 0 0 0-4 0m6 0a2 2 0 1 0 4 0 2 2 0 0 0-4 0M3 17V9l3-5h12l3 5v8M3 12h18M8 8l1 4M14 8l1 4"/>',
+    dog:    '<path stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none" d="M9 14c0 3 1.5 5 3 5s3-2 3-5c0-2-1-3-3-3s-3 1-3 3z"/><circle cx="7.5" cy="9" r="1.5" fill="currentColor"/><circle cx="16.5" cy="9" r="1.5" fill="currentColor"/><circle cx="10" cy="7" r="1.5" fill="currentColor"/><circle cx="14" cy="7" r="1.5" fill="currentColor"/>',
+    bike:   '<circle cx="6" cy="15" r="3" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="18" cy="15" r="3" stroke="currentColor" stroke-width="2" fill="none"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" d="M6 15l4-8h4l3 8M10 7l2 5 3 3"/><circle cx="15" cy="5" r="1" fill="currentColor"/>',
+    foot:   '<circle cx="12" cy="4" r="2" fill="currentColor"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" d="M9 20l1.5-5 2 2 3-7M8 10l4-2 3 3-3 1"/>',
+    moto:   '<circle cx="5" cy="16" r="3" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="19" cy="16" r="3" stroke="currentColor" stroke-width="2" fill="none"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" d="M5 16h4l3-6h4l3 6M12 10V7l3-1"/>',
+    truck:  '<path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" d="M1 3h15v13H1zM16 8h4l3 5v5h-7V8zM5.5 21a1.5 1.5 0 1 0 3 0 1.5 1.5 0 0 0-3 0m10 0a1.5 1.5 0 1 0 3 0 1.5 1.5 0 0 0-3 0"/>',
+    boat:   '<path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" d="M12 3v13M12 3l-7 10h14L12 3z"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none" d="M2 19c2 2 5 3 10 3s8-1 10-3"/>',
+    bus:    '<rect x="3" y="4" width="18" height="15" rx="2" stroke="currentColor" stroke-width="2" fill="none"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none" d="M3 11h18M8 4v7m8-7v7M7 19v2m10-2v2"/><circle cx="8" cy="15.5" r="1" fill="currentColor"/><circle cx="16" cy="15.5" r="1" fill="currentColor"/>',
+    train:  '<rect x="5" y="3" width="14" height="14" rx="3" stroke="currentColor" stroke-width="2" fill="none"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none" d="M5 10h14M9 3v7m6-7v7M8 21l4-4 4 4"/><circle cx="9" cy="15" r="1" fill="currentColor"/><circle cx="15" cy="15" r="1" fill="currentColor"/>',
+    scooter:'<circle cx="5" cy="18" r="3" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="19" cy="18" r="3" stroke="currentColor" stroke-width="2" fill="none"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" d="M5 18h6l4-12h4M11 18V9"/><circle cx="19" cy="6" r="2" stroke="currentColor" stroke-width="2" fill="none"/>',
   };
   const _WD_ALIASES = {
     car:'car', auto:'car', vehicle:'car',

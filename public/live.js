@@ -653,10 +653,19 @@
 
     // Wardriving car markers — parse @[MapperBot] pings from #wardriving channel
     (function () {
-      // Handle both raw WS packet (decoded_json) and dbPacketToLive form (decoded.payload)
-      const payload = (pkt.decoded && pkt.decoded.payload) ||
-        (pkt.decoded_json && typeof pkt.decoded_json === 'object' ? pkt.decoded_json :
-          (typeof pkt.decoded_json === 'string' ? (() => { try { return JSON.parse(pkt.decoded_json); } catch(e) { return null; } })() : null));
+      // Resolve decoded payload from any packet shape:
+      //   WS live: pkt.decoded = parsed decoded_json object (with .channel, .text, .sender)
+      //   dbPacketToLive: pkt.decoded.payload = same shape
+      //   fallback: parse pkt.decoded_json string
+      let payload = null;
+      if (pkt.decoded) {
+        // WS shape: pkt.decoded has .channel/.text/.sender directly
+        // dbPacketToLive shape: pkt.decoded.payload has them
+        payload = (pkt.decoded.channel !== undefined) ? pkt.decoded : (pkt.decoded.payload || null);
+      }
+      if (!payload && pkt.decoded_json) {
+        try { payload = typeof pkt.decoded_json === 'string' ? JSON.parse(pkt.decoded_json) : pkt.decoded_json; } catch(e) {}
+      }
       if (!payload || payload.channel !== '#wardriving') return;
       const text = payload.text || '';
       const sender = payload.sender || 'unknown';

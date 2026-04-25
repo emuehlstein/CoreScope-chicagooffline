@@ -9,7 +9,8 @@
   function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
   function statusGreen() { return cssVar('--status-green') || '#22c55e'; }
 
-  let map, ws, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer;
+  let map, ws, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer, wardrivingLayer;
+  const _wardriveCars = {}; // sender → { marker, ageTimer, expireTimer }
   let nodeMarkers = {};
   let nodeData = {};
   let packetCount = 0;
@@ -650,6 +651,51 @@
       }
     }
 
+    // Wardriving car markers — parse @[MapperBot] pings from #wardriving channel
+    (function () {
+      const payload = pkt.decoded && pkt.decoded.payload;
+      if (!payload || payload.channel !== '#wardriving') return;
+      const m = (payload.text || '').match(/@\[MapperBot\]\s*([\-\d.]+),\s*([\-\d.]+)/);
+      if (!m) return;
+      const lat = parseFloat(m[1]), lon = parseFloat(m[2]);
+      if (isNaN(lat) || isNaN(lon)) return;
+      const sender = payload.sender || 'unknown';
+
+      function carIcon(color) {
+        return L.divIcon({
+          className: '',
+          html: '<div style="font-size:20px;line-height:1;filter:drop-shadow(0 0 3px ' + color + ');" title="' + sender + '">🚗</div>',
+          iconSize: [24, 24],
+          iconAnchor: [12, 12],
+        });
+      }
+
+      if (_wardriveCars[sender]) {
+        clearTimeout(_wardriveCars[sender].ageTimer);
+        clearTimeout(_wardriveCars[sender].expireTimer);
+        _wardriveCars[sender].marker.setLatLng([lat, lon]);
+        _wardriveCars[sender].marker.setIcon(carIcon('#39FF14'));
+      } else {
+        const marker = L.marker([lat, lon], { icon: carIcon('#39FF14'), zIndexOffset: 500 })
+          .bindTooltip(sender, { permanent: false, direction: 'top' })
+          .addTo(wardrivingLayer);
+        _wardriveCars[sender] = { marker };
+      }
+
+      // After 60s → orange
+      _wardriveCars[sender].ageTimer = setTimeout(function() {
+        if (_wardriveCars[sender]) _wardriveCars[sender].marker.setIcon(carIcon('#FFB300'));
+      }, 60000);
+
+      // After 5min → remove
+      _wardriveCars[sender].expireTimer = setTimeout(function() {
+        if (_wardriveCars[sender]) {
+          if (wardrivingLayer) wardrivingLayer.removeLayer(_wardriveCars[sender].marker);
+          delete _wardriveCars[sender];
+        }
+      }, 300000);
+    })();
+
     if (VCR.mode === 'LIVE') {
       // Skip animations when tab is backgrounded — just buffer for VCR timeline
       if (_tabHidden) {
@@ -942,6 +988,7 @@
     nodesLayer = L.layerGroup().addTo(map);
     pathsLayer = L.layerGroup().addTo(map);
     animLayer = L.layerGroup().addTo(map);
+    wardrivingLayer = L.layerGroup().addTo(map);
 
     injectSVGFilters();
     await loadNodes();
@@ -2951,7 +2998,13 @@
       }
       _navCleanup = null;
     }
-    nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = null;
+    nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = wardrivingLayer = null;
+    // Clear wardriving car timers
+    Object.keys(_wardriveCars).forEach(function(k) {
+      clearTimeout(_wardriveCars[k].ageTimer);
+      clearTimeout(_wardriveCars[k].expireTimer);
+      delete _wardriveCars[k];
+    });
     stopMatrixRain();
     nodeMarkers = {}; nodeData = {};
     activeNodeDetailKey = null;

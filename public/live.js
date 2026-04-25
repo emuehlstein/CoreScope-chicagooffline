@@ -869,11 +869,11 @@
           <h3 class="legend-title" style="margin-top:8px">WARDRIVERS</h3>
           <ul class="legend-list" id="wardriverLegendList">
             <li id="wdLegendGreen" style="display:flex;align-items:center;gap:4px">
-              <span class="wd-legend-icon wd-green" data-type="car"></span>
+              <span class="wd-legend-icon wd-green" data-type="ghost"></span>
               <span>Active (&lt;60s)</span>
             </li>
             <li id="wdLegendOrange" style="display:flex;align-items:center;gap:4px">
-              <span class="wd-legend-icon wd-orange" data-type="car"></span>
+              <span class="wd-legend-icon wd-orange" data-type="ghost"></span>
               <span>Aging (60s–5min)</span>
             </li>
           </ul>
@@ -1857,6 +1857,7 @@
 
   // ── Wardriving helpers ─────────────────────────────────────────────────────
   const _WD_SVGS = {
+    ghost:  '<path fill="currentColor" fill-rule="evenodd" clip-rule="evenodd" d="M22 19.206V12c0-5.523-4.477-10-10-10S2 6.477 2 12v7.206a1.727 1.727 0 0 0 2.5 1.544 2.891 2.891 0 0 1 2.896.18 2.892 2.892 0 0 0 3.208 0l.353-.234a1.881 1.881 0 0 1 2.086 0l.353.235a2.892 2.892 0 0 0 3.208 0 2.891 2.891 0 0 1 2.897-.18c1.148.573 2.499-.261 2.499-1.545ZM16 10.5c0 .828-.448 1.5-1 1.5s-1-.672-1-1.5.448-1.5 1-1.5 1 .672 1 1.5ZM9 12c.552 0 1-.672 1-1.5S9.552 9 9 9s-1 .672-1 1.5.448 1.5 1 1.5Z"/>',
     // Solar Bold collection (filled) + hand-crafted car in same style
     car:    '<path fill="currentColor" fill-rule="evenodd" clip-rule="evenodd" d="M3.38 8.5C3.86 6.84 5.4 5.75 7.12 5.75h9.76c1.72 0 3.26 1.09 3.74 2.75l.9 3.08A2.75 2.75 0 0 1 23 14v3a2 2 0 0 1-2 2v1a1 1 0 1 1-2 0v-1H5v1a1 1 0 1 1-2 0v-1a2 2 0 0 1-2-2v-3a2.75 2.75 0 0 1 1.48-2.42l.9-3.08zM7 14.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zm11.5-1.5a1.5 1.5 0 1 0-3 0 1.5 1.5 0 0 0 3 0zM7.12 7.25a2.25 2.25 0 0 0-2.17 1.67L4.26 11h15.48l-.69-2.08a2.25 2.25 0 0 0-2.17-1.67H7.12z"/>',
     bike:   '<path fill="currentColor" d="M16 4a2 2 0 1 1-4 0 2 2 0 0 1 4 0z"/><path fill="currentColor" fill-rule="evenodd" clip-rule="evenodd" d="M9 15a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm10 0a2 2 0 1 1-4 0 2 2 0 0 1 4 0z"/><path fill="currentColor" d="M10.919 8.506a1.888 1.888 0 1 0-1.93 3.207l3.09 1.349a2.64 2.64 0 0 1 1.37 3.46l-.76 1.773a.75.75 0 0 1-1.378-.59l.76-1.775a1.14 1.14 0 0 0-.592-1.494l-3.09-1.348a3.388 3.388 0 1 1 3.464-5.756l2.159 1.255 2.178-1.635a.75.75 0 0 1 .9 1.198l-2.348 1.762.523.877 1.817-.454a.75.75 0 0 1 .362 1.454L15.68 12.5a.75.75 0 0 1-.822-.32l-.993-1.664-2.946-1.01z"/>',
@@ -1870,6 +1871,7 @@
     boat:   '<path fill="currentColor" d="M13.25 3a.75.75 0 0 0-1.5 0v8.19l-6.996 1.556A.75.75 0 0 0 4.25 14c0 3.728 2.942 6.75 6.558 6.75h2.384c3.616 0 6.558-3.022 6.558-6.75a.75.75 0 0 0-.504-.712L13.25 11.19V3z"/><path fill="currentColor" d="M3.5 16.5a.75.75 0 0 0 0 1.5c1.232 0 2.35.376 3.063.873.717.498 1.312 1.35 1.312 2.377a.75.75 0 0 0 1.5 0c0-1.573-.845-2.879-1.938-3.627A6.848 6.848 0 0 0 3.5 16.5z"/>',
   };
   const _WD_ALIASES = {
+    ghost:'ghost',
     car:'car', auto:'car', vehicle:'car',
     dog:'dog', walk:'dog', walking:'dog',
     bike:'bike', bicycle:'bike', cycle:'bike',
@@ -1893,7 +1895,7 @@
   }
 
   function _wdIcon(sender, color, size) {
-    const type = (window._wardrivingIcons && window._wardrivingIcons[sender]) || 'car';
+    const type = (window._wardrivingIcons && window._wardrivingIcons[sender]) || 'ghost';
     const shape = _WD_SVGS[type] || _WD_SVGS.car;
     const sz = size || _wdIconSize();
     const half = Math.round(sz / 2);

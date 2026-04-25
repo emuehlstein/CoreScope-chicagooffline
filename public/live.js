@@ -666,11 +666,9 @@
       if (!payload && pkt.decoded_json) {
         try { payload = typeof pkt.decoded_json === 'string' ? JSON.parse(pkt.decoded_json) : pkt.decoded_json; } catch(e) {}
       }
-      if (!payload) { if(pkt.decoded) console.debug('[wd] no payload, decoded keys:', Object.keys(pkt.decoded)); return; }
-      if (payload.channel !== '#wardriving') return;
+      if (!payload || payload.channel !== '#wardriving') return;
       const text = payload.text || '';
       const sender = payload.sender || 'unknown';
-      console.debug('[wd] got ping from', sender, text.slice(0,60));
 
       // /icon <name> command — sets custom icon for this sender
       const iconCmd = text.match(/\/icon\s+(\S+)/i);
@@ -702,18 +700,17 @@
       }
 
       const m = text.match(/@\[MapperBot\]\s*([\-\d.]+),\s*([\-\d.]+)/);
-      if (!m) { console.debug('[wd] no coords match in:', text.slice(0,80)); return; }
+      if (!m) return;
       const lat = parseFloat(m[1]), lon = parseFloat(m[2]);
-      if (isNaN(lat) || isNaN(lon)) { console.debug('[wd] NaN coords'); return; }
-      console.debug('[wd] placing marker for', sender, 'at', lat, lon);
+      if (isNaN(lat) || isNaN(lon)) return;
 
       function carIcon(color) {
         const emoji = (window._wardrivingIcons && window._wardrivingIcons[sender]) || '🚗';
         return L.divIcon({
           className: '',
-          html: '<div style="font-size:20px;line-height:1;filter:drop-shadow(0 0 3px ' + color + ');" title="' + sender + '">' + emoji + '</div>',
-          iconSize: [24, 24],
-          iconAnchor: [12, 12],
+          html: '<div style="font-size:32px;line-height:1;filter:drop-shadow(0 0 4px ' + color + ');">' + emoji + '</div>',
+          iconSize: [36, 36],
+          iconAnchor: [18, 18],
         });
       }
 
@@ -724,7 +721,6 @@
         _wardriveCars[sender].marker.setIcon(carIcon('#39FF14'));
       } else {
         const marker = L.marker([lat, lon], { icon: carIcon('#39FF14'), zIndexOffset: 500 })
-          .bindTooltip(sender, { permanent: false, direction: 'top' })
           .addTo(wardrivingLayer);
         _wardriveCars[sender] = { marker };
       }

@@ -973,11 +973,9 @@ func (s *Server) handlePacketDetail(w http.ResponseWriter, r *http.Request) {
 		pathHops = []interface{}{}
 	}
 
-	rawHex, _ := packet["raw_hex"].(string)
 	writeJSON(w, PacketDetailResponse{
 		Packet:           packet,
 		Path:             pathHops,
-		Breakdown:        BuildBreakdown(rawHex),
 		ObservationCount: observationCount,
 		Observations:     mapSliceToObservations(observations),
 	})

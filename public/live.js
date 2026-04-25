@@ -1893,11 +1893,11 @@
   function _wdIconSize() {
     if (!map) return 36;
     const z = map.getZoom();
-    if (z >= 16) return 44;
-    if (z >= 14) return 36;
-    if (z >= 12) return 28;
-    if (z >= 10) return 20;
-    return 14;
+    if (z >= 16) return 32;
+    if (z >= 14) return 26;
+    if (z >= 12) return 20;
+    if (z >= 10) return 16;
+    return 10;
   }
 
   function _wdIcon(sender, color, size) {

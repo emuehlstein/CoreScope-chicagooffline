@@ -162,7 +162,7 @@
             </div>
             <div id="mcHillshadeOpacity" class="mc-hillshade-opacity" style="display:none; margin-top:6px;">
               <label for="hillshadeSlider" style="font-size:11px; opacity:0.7;">Opacity</label>
-              <input type="range" id="hillshadeSlider" min="0" max="1" step="0.05" value="0.75"
+              <input type="range" id="hillshadeSlider" min="0" max="1" step="0.05" value="0.60"
                      style="width:100%; accent-color:var(--co-cyan,#00E5FF);">
             </div>
           </fieldset>

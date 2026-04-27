@@ -30,7 +30,7 @@
     hillshade: '\u00a9 Chicago Offline \u2014 3DEP+LiDAR Hillshade',
   };
 
-  var HILLSHADE_OPACITY = 0.75;
+  var HILLSHADE_OPACITY = 0.60;
 
   var _map       = null;
   var _isDark    = true;

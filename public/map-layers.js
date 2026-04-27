@@ -109,7 +109,24 @@
 
   function getMode() { return _mode; }
 
-  window.CO_BASEMAP = { init: init, setMode: setMode, onThemeChange: onThemeChange, getMode: getMode };
+  function setHillshadeOpacity(val) {
+    HILLSHADE_OPACITY = parseFloat(val) || 0.75;
+    if (_hillLayer) _hillLayer.setOpacity(HILLSHADE_OPACITY);
+    try { localStorage.setItem('co-hillshade-opacity', HILLSHADE_OPACITY); } catch (_) {}
+  }
+
+  function getHillshadeOpacity() { return HILLSHADE_OPACITY; }
+
+  // Restore saved opacity
+  try {
+    var saved = parseFloat(localStorage.getItem('co-hillshade-opacity'));
+    if (!isNaN(saved) && saved >= 0 && saved <= 1) HILLSHADE_OPACITY = saved;
+  } catch (_) {}
+
+  window.CO_BASEMAP = {
+    init: init, setMode: setMode, onThemeChange: onThemeChange, getMode: getMode,
+    setHillshadeOpacity: setHillshadeOpacity, getHillshadeOpacity: getHillshadeOpacity
+  };
 
   // Keep TILE_DARK / TILE_LIGHT globals in sync for any code that still reads them
   window.TILE_DARK  = URLS.cartoDark;

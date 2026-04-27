@@ -160,6 +160,11 @@
               <button class="btn" data-basemap="satellite">Satellite</button>
               <button class="btn" data-basemap="hillshade">Hillshade</button>
             </div>
+            <div id="mcHillshadeOpacity" class="mc-hillshade-opacity" style="display:none; margin-top:6px;">
+              <label for="hillshadeSlider" style="font-size:11px; opacity:0.7;">Opacity</label>
+              <input type="range" id="hillshadeSlider" min="0" max="1" step="0.05" value="0.75"
+                     style="width:100%; accent-color:var(--co-cyan,#00E5FF);">
+            </div>
           </fieldset>
           <fieldset class="mc-section">
             <legend class="mc-label">Quick Jump</legend>
@@ -307,17 +312,31 @@
       });
     });
 
-    // Basemap selector buttons
+    // Basemap selector buttons + hillshade opacity slider
     (function () {
       const btns = document.querySelectorAll('#mcBasemap .btn');
+      const opacityWrap = document.getElementById('mcHillshadeOpacity');
+      const slider = document.getElementById('hillshadeSlider');
       const activeMode = window.CO_BASEMAP ? window.CO_BASEMAP.getMode() : 'carto';
+
+      // Restore saved opacity & show slider if hillshade is active
+      if (window.CO_BASEMAP) {
+        slider.value = window.CO_BASEMAP.getHillshadeOpacity();
+      }
+      opacityWrap.style.display = activeMode === 'hillshade' ? '' : 'none';
+
       btns.forEach(btn => btn.classList.toggle('active', btn.dataset.basemap === activeMode));
       btns.forEach(btn => {
         btn.addEventListener('click', () => {
           if (!window.CO_BASEMAP) return;
           window.CO_BASEMAP.setMode(btn.dataset.basemap);
           btns.forEach(b => b.classList.toggle('active', b.dataset.basemap === btn.dataset.basemap));
+          opacityWrap.style.display = btn.dataset.basemap === 'hillshade' ? '' : 'none';
         });
+      });
+
+      slider.addEventListener('input', () => {
+        if (window.CO_BASEMAP) window.CO_BASEMAP.setHillshadeOpacity(slider.value);
       });
     })();
 

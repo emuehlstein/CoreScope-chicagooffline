@@ -13,6 +13,9 @@
   let selectedReferenceNode = null;  // pubkey of the reference node for neighbor filtering
   let neighborPubkeys = null;        // Set of pubkeys that are direct neighbors of selected node
   let wsHandler = null;
+  let lxmfLayer = null;
+  let lxmfNodes = {};   // dest_hash → LXMFNode
+  let lxmfMarkers = {}; // dest_hash → Leaflet marker
   let heatLayer = null;
   let geoFilterLayer = null;
   let affinityLayer = null;
@@ -126,6 +129,7 @@
             <label for="mcHeatmap"><input type="checkbox" id="mcHeatmap"> Heat map</label>
             <label for="mcHashLabels"><input type="checkbox" id="mcHashLabels"> Hash prefix labels</label>
             <label id="mcGeoFilterLabel" for="mcGeoFilter" style="display:none"><input type="checkbox" id="mcGeoFilter"> Mesh live area</label>
+            <label for="mcLXMF"><input type="checkbox" id="mcLXMF" checked> Sideband/LXMF</label>
           </fieldset>
           <fieldset class="mc-section">
             <legend class="mc-label">Status</legend>
@@ -239,6 +243,7 @@
     });
 
     markerLayer = L.layerGroup().addTo(map);
+    lxmfLayer = L.layerGroup().addTo(map);
     routeLayer = L.layerGroup().addTo(map);
 
     // Fix map size on SPA load
@@ -395,13 +400,30 @@
       } catch (e) { /* no geo filter configured */ }
     })();
 
-    // WS for live advert updates
+    // Sideband/LXMF layer toggle
+    (function () {
+      var el = document.getElementById('mcLXMF');
+      if (!el) return;
+      var saved = localStorage.getItem('meshcore-map-lxmf');
+      if (saved === 'false') { el.checked = false; }
+      el.addEventListener('change', function (e) {
+        localStorage.setItem('meshcore-map-lxmf', e.target.checked);
+        if (e.target.checked) { lxmfLayer.addTo(map); } else { map.removeLayer(lxmfLayer); }
+      });
+      if (!el.checked) map.removeLayer(lxmfLayer);
+    })();
+
+    // WS for live advert updates + LXMF node updates
     wsHandler = debouncedOnWS(function (msgs) {
       if (msgs.some(function (m) { return m.type === 'packet' && m.data?.decoded?.header?.payloadTypeName === 'ADVERT'; })) {
         loadNodes();
       }
+      msgs.forEach(function (m) {
+        if (m.type === 'lxmf_node' && m.data) upsertLXMFMarker(m.data);
+      });
     });
 
+    loadLXMFNodes();
     loadNodes().then(() => {
       // Check for route from packet detail (via sessionStorage)
       const routeHopsJson = sessionStorage.getItem('map-route-hops');
@@ -1027,6 +1049,82 @@
     map.fitBounds(bounds, { padding: [50, 50], maxZoom: 14 });
   }
 
+  // ─── Sideband/LXMF ────────────────────────────────────────────────────────
+
+  function makeLXMFIcon(isStale) {
+    var color = isStale ? '#a855f7' : '#9333ea'; // purple, dimmer when stale
+    var size = 22;
+    var c = size / 2;
+    // Antenna-style SVG: circle body + vertical line + two diagonal arms
+    var svg = '<svg width="' + size + '" height="' + size + '" viewBox="0 0 ' + size + ' ' + size + '" xmlns="http://www.w3.org/2000/svg">' +
+      '<circle cx="' + c + '" cy="' + (c + 3) + '" r="6" fill="' + color + '" stroke="#fff" stroke-width="1.5"/>' +
+      '<line x1="' + c + '" y1="' + (c - 3) + '" x2="' + c + '" y2="2" stroke="' + color + '" stroke-width="2" stroke-linecap="round"/>' +
+      '<line x1="' + c + '" y1="5" x2="' + (c - 5) + '" y2="1" stroke="' + color + '" stroke-width="1.5" stroke-linecap="round"/>' +
+      '<line x1="' + c + '" y1="5" x2="' + (c + 5) + '" y2="1" stroke="' + color + '" stroke-width="1.5" stroke-linecap="round"/>' +
+      '</svg>';
+    return L.divIcon({
+      html: svg,
+      className: 'lxmf-marker' + (isStale ? ' marker-stale' : ''),
+      iconSize: [size, size],
+      iconAnchor: [c, c + 3],
+      popupAnchor: [0, -(c + 3)],
+    });
+  }
+
+  function lxmfLabel(node) {
+    if (node.display_name) return node.display_name;
+    var h = node.dest_hash || '';
+    return h.slice(0, 12) + (h.length > 12 ? '…' : '');
+  }
+
+  function buildLXMFPopup(node) {
+    var now = Math.floor(Date.now() / 1000);
+    var ageSec = now - node.last_seen;
+    var ageStr = ageSec < 60 ? ageSec + 's ago' : ageSec < 3600 ? Math.floor(ageSec / 60) + 'm ago' : Math.floor(ageSec / 3600) + 'h ago';
+    var rows = '';
+    if (node.display_name) rows += '<dt>Name</dt><dd>' + safeEsc(node.display_name) + '</dd>';
+    rows += '<dt>Hash</dt><dd style="font-family:var(--mono,monospace);font-size:10px">' + safeEsc(node.dest_hash) + '</dd>';
+    if (node.lat != null) rows += '<dt>Lat/Lon</dt><dd>' + node.lat.toFixed(5) + ', ' + node.lon.toFixed(5) + '</dd>';
+    if (node.altitude != null) rows += '<dt>Altitude</dt><dd>' + node.altitude.toFixed(1) + ' m</dd>';
+    if (node.speed != null) rows += '<dt>Speed</dt><dd>' + node.speed.toFixed(1) + ' m/s</dd>';
+    if (node.heading != null) rows += '<dt>Heading</dt><dd>' + node.heading.toFixed(0) + '°</dd>';
+    if (node.battery_pct != null) rows += '<dt>Battery</dt><dd>' + node.battery_pct.toFixed(0) + '%</dd>';
+    rows += '<dt>Last seen</dt><dd>' + ageStr + '</dd>';
+    return '<div style="min-width:200px"><b style="color:#9333ea">📡 ' + safeEsc(lxmfLabel(node)) + '</b>' +
+      '<dl style="margin-top:6px;font-size:12px">' + rows + '</dl></div>';
+  }
+
+  function upsertLXMFMarker(node) {
+    if (node.lat == null || node.lon == null) return;
+    var key = node.dest_hash;
+    lxmfNodes[key] = node;
+    var now = Math.floor(Date.now() / 1000);
+    var isStale = (now - node.last_seen) > 1800; // >30 min
+    var icon = makeLXMFIcon(isStale);
+    if (lxmfMarkers[key]) {
+      lxmfMarkers[key].setLatLng([node.lat, node.lon]);
+      lxmfMarkers[key].setIcon(icon);
+      lxmfMarkers[key].setPopupContent(buildLXMFPopup(node));
+    } else {
+      var marker = L.marker([node.lat, node.lon], { icon: icon, alt: lxmfLabel(node) + ' (Sideband)' });
+      marker.bindPopup(buildLXMFPopup(node), { maxWidth: 280 });
+      if (lxmfLayer) lxmfLayer.addLayer(marker);
+      lxmfMarkers[key] = marker;
+    }
+  }
+
+  function loadLXMFNodes() {
+    fetch('/api/lxmf/nodes')
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (nodes) {
+        if (!Array.isArray(nodes)) return;
+        nodes.forEach(function (n) { upsertLXMFMarker(n); });
+      })
+      .catch(function () {});
+  }
+
+  // ─── End Sideband/LXMF ────────────────────────────────────────────────────
+
   function destroy() {
     if (wsHandler) offWS(wsHandler);
     wsHandler = null;
@@ -1035,6 +1133,9 @@
       map = null;
     }
     markerLayer = null;
+    lxmfLayer = null;
+    lxmfNodes = {};
+    lxmfMarkers = {};
     _currentMarkerData = [];
     routeLayer = null;
     if (heatLayer) { heatLayer = null; }

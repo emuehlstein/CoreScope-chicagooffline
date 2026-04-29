@@ -9,10 +9,12 @@
   function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
   function statusGreen() { return cssVar('--status-green') || '#22c55e'; }
 
-  let map, ws, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer, wardrivingLayer;
+  let map, ws, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer, wardrivingLayer, lxmfLayer;
   const _wardriveCars = {}; // sender → { marker, ageTimer, expireTimer }
   let nodeMarkers = {};
   let nodeData = {};
+  const lxmfLiveNodes = {};   // dest_hash → LXMFNode data
+  const lxmfLiveMarkers = {}; // dest_hash → Leaflet circleMarker
   let packetCount = 0;
   let activeAnims = 0;
   const MAX_CONCURRENT_ANIMS = 20;
@@ -948,6 +950,7 @@
     L.control.zoom({ position: 'topright' }).addTo(map);
 
     nodesLayer = L.layerGroup().addTo(map);
+    lxmfLayer = L.layerGroup().addTo(map);
     pathsLayer = L.layerGroup().addTo(map);
     wardrivingLayer = L.layerGroup().addTo(map);
     map.on('zoomend', _wdResizeAll);
@@ -2035,6 +2038,81 @@
     } catch(e) { /* best effort */ }
   }
 
+  // ─── Sideband/LXMF live handling ─────────────────────────────────────────
+
+  function lxmfNodeLabel(node) {
+    if (node.display_name) return node.display_name;
+    var h = node.dest_hash || '';
+    return h.slice(0, 12) + (h.length > 12 ? '…' : '');
+  }
+
+  function handleLXMFNodeLive(node) {
+    if (node.lat == null || node.lon == null) return;
+    var key = node.dest_hash;
+    var isNew = !lxmfLiveNodes[key];
+    lxmfLiveNodes[key] = node;
+
+    var now = Math.floor(Date.now() / 1000);
+    var isStale = (now - node.last_seen) > 1800;
+    var color = isStale ? '#a855f7' : '#9333ea';
+
+    if (lxmfLiveMarkers[key]) {
+      lxmfLiveMarkers[key].setLatLng([node.lat, node.lon]);
+      lxmfLiveMarkers[key].setStyle({ fillColor: color });
+    } else if (lxmfLayer) {
+      var marker = L.circleMarker([node.lat, node.lon], {
+        radius: 7, fillColor: color, fillOpacity: 0.85,
+        color: '#fff', weight: 1.5, opacity: 0.8
+      }).addTo(lxmfLayer);
+      var label = lxmfNodeLabel(node);
+      marker.bindTooltip(label, { permanent: false, direction: 'top', offset: [0, -10], className: 'live-tooltip' });
+      lxmfLiveMarkers[key] = marker;
+    }
+
+    // Pulse animation on update (uses animLayer if available)
+    if (!isNew && animLayer && lxmfLiveMarkers[key]) {
+      var pos = [node.lat, node.lon];
+      var ring = L.circleMarker(pos, {
+        radius: 2, fillColor: 'transparent', fillOpacity: 0, color: '#9333ea', weight: 3, opacity: 0.9
+      }).addTo(animLayer);
+      var r = 2, op = 0.9;
+      var pulseStart = performance.now();
+      var lastPulse = pulseStart;
+      (function animatePulse(ts) {
+        if (!animLayer) return;
+        if (ts - pulseStart > 2000) { try { animLayer.removeLayer(ring); } catch {} return; }
+        var elapsed = ts - lastPulse;
+        if (elapsed >= 26) {
+          var ticks = Math.min(Math.floor(elapsed / 26), 4);
+          r += 1.5 * ticks; op -= 0.03 * ticks; lastPulse = ts;
+          if (op <= 0) { try { animLayer.removeLayer(ring); } catch {} return; }
+          try { ring.setRadius(r); ring.setStyle({ opacity: op, weight: Math.max(0.3, 3 - r * 0.04) }); } catch { return; }
+        }
+        requestAnimationFrame(animatePulse);
+      })(pulseStart);
+    }
+
+    // Live feed entry
+    var feedEl = document.getElementById('liveFeed');
+    if (feedEl && VCR.mode === 'LIVE') {
+      var ageSec = now - node.last_seen;
+      var ageStr = ageSec < 60 ? ageSec + 's ago' : Math.floor(ageSec / 60) + 'm ago';
+      var battStr = node.battery_pct != null ? ' · 🔋 ' + Math.round(node.battery_pct) + '%' : '';
+      var label2 = lxmfNodeLabel(node);
+      var row = document.createElement('div');
+      row.className = 'feed-item';
+      row.style.cssText = 'border-left:3px solid #9333ea;padding:4px 8px;margin-bottom:2px;font-size:12px;';
+      row.innerHTML = '📡 <b style="color:#9333ea">' + label2 + '</b> ' +
+        (node.lat != null ? node.lat.toFixed(4) + ',' + node.lon.toFixed(4) : '') +
+        battStr + ' <span style="opacity:0.5">' + ageStr + '</span>';
+      feedEl.insertBefore(row, feedEl.firstChild);
+      // Trim feed to 200 items
+      while (feedEl.children.length > 200) feedEl.removeChild(feedEl.lastChild);
+    }
+  }
+
+  // ─── End Sideband/LXMF ───────────────────────────────────────────────────
+
   function connectWS() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${proto}://${location.host}`);
@@ -2042,6 +2120,7 @@
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'packet') bufferPacket(msg.data);
+        else if (msg.type === 'lxmf_node' && msg.data) handleLXMFNodeLive(msg.data);
       } catch {}
     };
     ws.onclose = () => setTimeout(connectWS, WS_RECONNECT_MS);
@@ -3055,7 +3134,7 @@
     if (topNav) { topNav.style.position = ''; topNav.style.width = ''; topNav.style.zIndex = ''; }
     _navCleanup = null;
     if (map) map.off('zoomend', _wdResizeAll);
-    nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = wardrivingLayer = null;
+    nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = wardrivingLayer = lxmfLayer = null;
     Object.keys(_wardriveCars).forEach(function(k) {
       clearTimeout(_wardriveCars[k].ageTimer);
       clearTimeout(_wardriveCars[k].expireTimer);

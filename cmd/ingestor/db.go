@@ -149,6 +149,22 @@ func applySchema(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_transmissions_hash ON transmissions(hash);
 		CREATE INDEX IF NOT EXISTS idx_transmissions_first_seen ON transmissions(first_seen);
 		CREATE INDEX IF NOT EXISTS idx_transmissions_payload_type ON transmissions(payload_type);
+
+		CREATE TABLE IF NOT EXISTS lxmf_nodes (
+			dest_hash        TEXT PRIMARY KEY,
+			display_name     TEXT,
+			lat              REAL,
+			lon              REAL,
+			altitude         REAL,
+			speed            REAL,
+			heading          REAL,
+			accuracy         REAL,
+			battery_pct      REAL,
+			last_seen        INTEGER NOT NULL,
+			location_updated INTEGER,
+			source           TEXT DEFAULT 'sideband'
+		);
+		CREATE INDEX IF NOT EXISTS idx_lxmf_nodes_last_seen ON lxmf_nodes(last_seen);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("base schema: %w", err)
@@ -1004,6 +1020,57 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 	}
 
 	return pd
+}
+
+// LXMFUpsertFields carries the field(s) to write for one LXMF telemetry message.
+// Nil pointers mean "leave existing value untouched".
+type LXMFUpsertFields struct {
+	DestHash        string
+	DisplayName     *string
+	Lat             *float64
+	Lon             *float64
+	Altitude        *float64
+	Speed           *float64
+	Heading         *float64
+	Accuracy        *float64
+	BatteryPct      *float64
+	LastSeen        int64
+	LocationUpdated *int64
+}
+
+// UpsertLXMFNode inserts or updates one lxmf_nodes row.  Only non-nil pointer
+// fields overwrite the stored value; last_seen is always updated.
+func (s *Store) UpsertLXMFNode(f *LXMFUpsertFields) error {
+	_, err := s.db.Exec(`
+		INSERT INTO lxmf_nodes
+			(dest_hash, display_name, lat, lon, altitude, speed, heading, accuracy, battery_pct, last_seen, location_updated, source)
+		VALUES
+			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sideband')
+		ON CONFLICT(dest_hash) DO UPDATE SET
+			display_name     = COALESCE(excluded.display_name,     display_name),
+			lat              = COALESCE(excluded.lat,              lat),
+			lon              = COALESCE(excluded.lon,              lon),
+			altitude         = COALESCE(excluded.altitude,         altitude),
+			speed            = COALESCE(excluded.speed,            speed),
+			heading          = COALESCE(excluded.heading,          heading),
+			accuracy         = COALESCE(excluded.accuracy,         accuracy),
+			battery_pct      = COALESCE(excluded.battery_pct,      battery_pct),
+			last_seen        = excluded.last_seen,
+			location_updated = COALESCE(excluded.location_updated, location_updated)
+	`,
+		f.DestHash,
+		f.DisplayName,
+		f.Lat,
+		f.Lon,
+		f.Altitude,
+		f.Speed,
+		f.Heading,
+		f.Accuracy,
+		f.BatteryPct,
+		f.LastSeen,
+		f.LocationUpdated,
+	)
+	return err
 }
 
 // mergeSourceTag reads the existing mqtt_sources JSON for an observer,

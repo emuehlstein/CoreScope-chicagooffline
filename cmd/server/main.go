@@ -261,6 +261,10 @@ func main() {
 	poller.store = store
 	go poller.Start()
 
+	// Start LXMF node poller for Sideband/Reticulum telemetry
+	lxmfPoller := NewLXMFPoller(database, hub, time.Duration(pollMs)*time.Millisecond)
+	go lxmfPoller.Start()
+
 	// Start periodic eviction
 	stopEviction := store.StartEvictionTicker()
 	defer stopEviction()
@@ -420,6 +424,7 @@ func main() {
 
 		// 1. Stop accepting new WebSocket/poll data
 		poller.Stop()
+		lxmfPoller.Stop()
 
 		// 1b. Stop auto-prune ticker
 		if stopPrune != nil {

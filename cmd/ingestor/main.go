@@ -142,7 +142,7 @@ func main() {
 			log.Printf("MQTT [%s] connected to %s", tag, source.Broker)
 			topics := source.Topics
 			if len(topics) == 0 {
-				topics = []string{"meshcore/#"}
+				topics = []string{"meshcore/#", "lxmf/telemetry/#"}
 			}
 			for _, t := range topics {
 				token := c.Subscribe(t, 0, nil)
@@ -206,6 +206,13 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 
 	topic := m.Topic()
 	parts := strings.Split(topic, "/")
+
+	// LXMF telemetry: lxmf/telemetry/{dest_hash}/{sensor}/{field}
+	// Payload is a raw scalar value (not JSON) — handle before JSON unmarshal.
+	if strings.HasPrefix(topic, "lxmf/telemetry/") {
+		handleLXMFTelemetry(store, parts, m.Payload())
+		return
+	}
 
 	var msg map[string]interface{}
 	if err := json.Unmarshal(m.Payload(), &msg); err != nil {

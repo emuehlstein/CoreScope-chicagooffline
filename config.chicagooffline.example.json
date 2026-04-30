@@ -8,7 +8,7 @@
       "label": "CO",
       "broker": "mqtt://mosquitto:1883",
       "topics": ["meshcore/ORD/#", "meshcore/MDW/#"],
-      "iataFilter": ["ORD", "MDW"],
+      "iataFilter": ["ORD", "MDW", "RFD"],
       "tier": "open"
     },
     {
@@ -18,7 +18,7 @@
       "username": "corescope",
       "password": "your-subscriber-password",
       "topics": ["meshcore/#"],
-      "iataFilter": ["ORD", "MDW"],
+      "iataFilter": ["ORD", "MDW", "RFD"],
       "tier": "secure"
     },
     {
@@ -28,7 +28,7 @@
       "username": "viewer",
       "password": "your-chimesh-password",
       "topics": ["meshcore/#"],
-      "iataFilter": ["ORD"],
+      "iataFilter": ["ORD", "MDW", "RFD"],
       "tier": "secure"
     }
   ],

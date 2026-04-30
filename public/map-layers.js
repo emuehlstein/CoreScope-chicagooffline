@@ -1,10 +1,10 @@
 /**
- * map-layers.js — Chicago Offline basemap helper
+ * map-layers.js — Salt Lake Offline basemap helper
  *
  * Provides window.CO_BASEMAP with three modes:
  *   'carto'      — Carto dark/light (theme-aware)
  *   'satellite'  — Esri World Imagery
- *   'hillshade'  — Chicago Offline combined 3DEP+LiDAR 9x hillshade (theme-aware overlay on Carto)
+ *   'hillshade'  — Salt Lake Offline combined 3DEP+LiDAR 9x hillshade (theme-aware overlay on Carto)
  *
  * Usage (called from map.js after Leaflet map is created):
  *   window.CO_BASEMAP.init(map, isDark);      // attach initial tile layer
@@ -27,7 +27,7 @@
   var ATTR = {
     carto:     '\u00a9 <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> \u00a9 <a href="https://carto.com/">Carto</a>',
     satellite: 'Tiles \u00a9 Esri \u2014 Source: Esri, Maxar, Earthstar Geographics',
-    hillshade: '\u00a9 Chicago Offline \u2014 3DEP+LiDAR Hillshade',
+    hillshade: '\u00a9 Salt Lake Offline \u2014 3DEP+LiDAR Hillshade',
   };
 
   var HILLSHADE_OPACITY = 0.60;

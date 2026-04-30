@@ -740,43 +740,39 @@ func TestToFloat64WithUnits(t *testing.T) {
 	}
 }
 
-// TestIATAFilterDoesNotDropStatusMessages verifies that status messages from
-// out-of-region observers are still processed (noise_floor, battery, etc.)
-// even when an IATA filter is configured for packet data.
-func TestIATAFilterDoesNotDropStatusMessages(t *testing.T) {
+// TestIATAFilterDropsStatusMessages verifies that status messages from
+// out-of-region observers are dropped when an IATA filter is configured,
+// preventing foreign observers from registering.
+func TestIATAFilterDropsStatusMessages(t *testing.T) {
 	store := newTestStore(t)
 	source := MQTTSource{Name: "test", IATAFilter: []string{"SJC"}}
 
-	// BFL observer sends a status message with noise_floor — outside the IATA filter.
+	// BFL observer sends a status message — outside the IATA filter → should be dropped.
 	msg := &mockMessage{
 		topic:   "meshcore/BFL/bfl-obs1/status",
 		payload: []byte(`{"origin":"BFLObserver","stats":{"noise_floor":-105.0}}`),
 	}
 	handleMessage(store, "test", source, msg, nil, &Config{})
 
-	var name string
-	var noiseFloor *float64
-	err := store.db.QueryRow("SELECT name, noise_floor FROM observers WHERE id = 'bfl-obs1'").Scan(&name, &noiseFloor)
-	if err != nil {
-		t.Fatalf("observer not found after status from out-of-region observer: %v", err)
-	}
-	if name != "BFLObserver" {
-		t.Errorf("name=%q, want BFLObserver", name)
-	}
-	if noiseFloor == nil || *noiseFloor != -105.0 {
-		t.Errorf("noise_floor=%v, want -105.0 — status message was dropped by IATA filter when it should not be", noiseFloor)
+	var count int
+	store.db.QueryRow("SELECT COUNT(*) FROM observers WHERE id = 'bfl-obs1'").Scan(&count)
+	if count != 0 {
+		t.Error("out-of-region observer should be dropped by IATA filter")
 	}
 
-	// Verify that a packet from BFL is still filtered.
-	rawHex := "0A00D69FD7A5A7475DB07337749AE61FA53A4788E976"
-	pktMsg := &mockMessage{
-		topic:   "meshcore/BFL/bfl-obs1/packets",
-		payload: []byte(`{"raw":"` + rawHex + `"}`),
+	// SJC observer sends a status message — inside the IATA filter → should be accepted.
+	sjcMsg := &mockMessage{
+		topic:   "meshcore/SJC/sjc-obs1/status",
+		payload: []byte(`{"origin":"SJCObserver","stats":{"noise_floor":-100.0}}`),
 	}
-	handleMessage(store, "test", source, pktMsg, nil, &Config{})
-	var count int
-	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
-	if count != 0 {
-		t.Error("packet from out-of-region BFL should still be filtered by IATA")
+	handleMessage(store, "test", source, sjcMsg, nil, &Config{})
+
+	var name string
+	err := store.db.QueryRow("SELECT name FROM observers WHERE id = 'sjc-obs1'").Scan(&name)
+	if err != nil {
+		t.Fatalf("in-region observer not found: %v", err)
+	}
+	if name != "SJCObserver" {
+		t.Errorf("name=%q, want SJCObserver", name)
 	}
 }

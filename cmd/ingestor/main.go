@@ -225,10 +225,22 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 	}
 
 	// Status topic: meshcore/<region>/<observer_id>/status
-	// IATA filter does NOT apply here — observer metadata (noise_floor, battery, etc.)
-	// is region-independent and should be accepted from all observers regardless of
-	// which IATA regions are configured for packet ingestion.
+	// Apply IATA filter to status messages too — prevents foreign observers from
+	// registering when a regional filter is active.
 	if len(parts) >= 4 && parts[3] == "status" {
+		if len(source.IATAFilter) > 0 {
+			statusRegion := parts[1]
+			statusMatched := false
+			for _, f := range source.IATAFilter {
+				if f == statusRegion {
+					statusMatched = true
+					break
+				}
+			}
+			if !statusMatched {
+				return
+			}
+		}
 		observerID := parts[2]
 		name, _ := msg["origin"].(string)
 		iata := parts[1]

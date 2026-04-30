@@ -1,0 +1,50 @@
+{
+  "_comment": "Chicago Offline CoreScope config example — source-level IATA filtering",
+  "_comment_iataFilter": "iataFilter restricts which IATA regions are ingested from each source. Packets from other regions are silently dropped at the ingestor level.",
+
+  "mqttSources": [
+    {
+      "name": "chicagooffline",
+      "label": "CO",
+      "broker": "mqtt://mosquitto:1883",
+      "topics": ["meshcore/ORD/#", "meshcore/MDW/#"],
+      "iataFilter": ["ORD", "MDW"],
+      "tier": "open"
+    },
+    {
+      "name": "chicagooffline-ws",
+      "label": "CO-WS",
+      "broker": "ws://meshcore-mqtt-broker:8883",
+      "username": "corescope",
+      "password": "your-subscriber-password",
+      "topics": ["meshcore/#"],
+      "iataFilter": ["ORD", "MDW"],
+      "tier": "secure"
+    },
+    {
+      "name": "chimesh",
+      "label": "CM",
+      "broker": "wss://mqtt.chimesh.org",
+      "username": "viewer",
+      "password": "your-chimesh-password",
+      "topics": ["meshcore/#"],
+      "iataFilter": ["ORD"],
+      "tier": "secure"
+    }
+  ],
+
+  "channelKeys": {
+    "Public": "8b3387e9c5cdea6ac9e5edbaa115cd72"
+  },
+
+  "defaultRegion": "ORD",
+  "regions": {
+    "ORD": "Chicago O'Hare",
+    "MDW": "Chicago Midway"
+  },
+
+  "mapDefaults": {
+    "center": [41.8781, -87.6298],
+    "zoom": 10
+  }
+}

@@ -10,6 +10,33 @@ This is the [chicagooffline.com](https://chicagooffline.com) fork of [CoreScope]
   - Promoted to `scope.chicagooffline.com` for production
   - Submitted as PRs upstream to `Kpa-clawbot/CoreScope` if useful to the broader community
 
+## Source-Level IATA Filtering
+
+CoreScope supports per-source `iataFilter` in `mqttSources[]`. This lets you ingest traffic from brokers that carry multiple regions (e.g. ChiMesh) while only storing packets from Chicagoland regions.
+
+```json
+{
+  "mqttSources": [
+    {
+      "name": "chicagooffline",
+      "url": "mqtt://mqtt.chicagooffline.com:1883",
+      "topics": ["meshcore/ORD/#"],
+      "iataFilter": ["ORD"]
+    },
+    {
+      "name": "chimesh",
+      "url": "mqtt://mqtt.chimesh.org:1883",
+      "topics": ["meshcore/#"],
+      "iataFilter": ["ORD"]
+    }
+  ]
+}
+```
+
+Packets from any IATA code not in `iataFilter` are silently dropped by the ingestor before storage. If `iataFilter` is omitted, all regions are accepted. See `config.chicagooffline.example.json` for a full Chicago-specific config example.
+
+**Status messages** are never dropped by the IATA filter (needed for node heartbeat/offline detection).
+
 ## Branch Strategy
 
 | Branch | Purpose |

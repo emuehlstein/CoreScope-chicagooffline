@@ -19,9 +19,9 @@
     cartoDark:   'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
     cartoLight:  'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
     satellite:   'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    hillshadeDark:  'https://tiles.chicagooffline.com/services/cook-hillshade-combined-dark-9x/tiles/{z}/{x}/{y}.png',
-    hillshadeLight: 'https://tiles.chicagooffline.com/services/cook-hillshade-combined-light-9x/tiles/{z}/{x}/{y}.png',
-    hillshadeFallbackDark:  'https://tiles.chicagooffline.com/services/cook-hillshade-3dep-dark/tiles/{z}/{x}/{y}.png',
+    hillshadeDark:  'https://tiles.chicagooffline.com/services/slc-200mi-dark-9x/tiles/{z}/{x}/{y}.png',
+    hillshadeLight: 'https://tiles.chicagooffline.com/services/slc-200mi-light-9x/tiles/{z}/{x}/{y}.png',
+    hillshadeFallbackDark:  'https://tiles.chicagooffline.com/services/slc-200mi-dark-9x/tiles/{z}/{x}/{y}.png',
   };
 
   var ATTR = {

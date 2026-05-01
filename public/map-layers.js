@@ -67,7 +67,7 @@
       _hillLayer = L.tileLayer(_hillshadeUrl(), {
         attribution: ATTR.hillshade,
         maxZoom: 17,
-        minZoom: 9,
+        minZoom: 1,
         opacity: HILLSHADE_OPACITY,
       }).addTo(_map);
 

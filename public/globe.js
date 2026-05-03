@@ -17,6 +17,7 @@
     Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI5N2UyMjcwOS00MDY1LTQxYjEtYjZjMy00YTU0ZTg1YmZhMzMiLCJpZCI6ODE5MDUsImlhdCI6MTYyNzY0NjAwNH0.qwnBTVHaIUPiLaSMHMM0XT6V31tO-xH9qCqz7KOjRgU';
 
     viewer = new Cesium.Viewer(container, {
+      imageryProvider: new Cesium.IonImageryProvider({ assetId: 2 }),
       terrain: Cesium.Terrain.fromWorldTerrain(),
       baseLayerPicker: false,
       geocoder: false,
@@ -30,16 +31,31 @@
       selectionIndicator: true,
     });
 
-    // Set initial camera position (Chicago)
-    viewer.camera.flyTo({
-      destination: Cesium.Cartesian3.fromDegrees(-87.6298, 41.8781, 50000),
+    // Ensure we start in 3D mode
+    viewer.scene.mode = Cesium.SceneMode.SCENE3D;
+
+    // Set initial camera position (Chicago) - use setView for immediate positioning
+    viewer.camera.setView({
+      destination: Cesium.Cartesian3.fromDegrees(-87.6298, 41.8781, 500000),
       orientation: {
         heading: Cesium.Math.toRadians(0),
-        pitch: Cesium.Math.toRadians(-45),
+        pitch: Cesium.Math.toRadians(-90),
         roll: 0.0
-      },
-      duration: 2
+      }
     });
+
+    // Then fly to closer view
+    setTimeout(() => {
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(-87.6298, 41.8781, 50000),
+        orientation: {
+          heading: Cesium.Math.toRadians(0),
+          pitch: Cesium.Math.toRadians(-45),
+          roll: 0.0
+        },
+        duration: 2
+      });
+    }, 100);
 
     // Enable depth testing for better 3D visualization
     viewer.scene.globe.depthTestAgainstTerrain = true;

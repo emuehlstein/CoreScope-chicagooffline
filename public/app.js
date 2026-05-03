@@ -733,15 +733,17 @@ window.addEventListener('DOMContentLoaded', () => {
   }
   // Listen to checkbox change event (more reliable than label click)
   if (darkCheckbox) {
-    darkCheckbox.addEventListener('change', () => {
-      applyTheme(darkCheckbox.checked ? 'dark' : 'light');
+    darkCheckbox.addEventListener('change', function() {
+      console.log('[theme] Toggle clicked');
+      applyTheme(this.checked ? 'dark' : 'light');
     });
   }
-  // Fallback: also listen to label click for accessibility
-  darkToggle.addEventListener('click', () => {
-    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
-    applyTheme(isDark ? 'light' : 'dark');
-  });
+  // Fallback: label click
+  if (darkToggle) {
+    darkToggle.addEventListener('click', function(e) {
+      console.log('[theme] Label clicked');
+    });
+  }
 
   // --- Hamburger Menu ---
   const hamburger = document.getElementById('hamburger');

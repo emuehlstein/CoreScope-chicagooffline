@@ -901,3 +901,13 @@
     transition: none;
   }
 }
+
+/* Hide Ghosts, Matrix, and Rain toggles (chicagooffline) */
+label:has(#liveGhostToggle),
+label:has(#liveMatrixToggle),
+label:has(#liveMatrixRainToggle),
+#ghostDesc,
+#matrixDesc,
+#rainDesc {
+  display: none !important;
+}

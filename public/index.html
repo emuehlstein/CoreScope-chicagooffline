@@ -5,7 +5,7 @@
   <link rel="icon" href="favicon.ico" type="image/x-icon">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>CoreScope</title>
+  <title>Chicago Offline — Network Scope</title>
 
   <!-- Open Graph / Discord embed -->
   <meta property="og:title" content="CoreScope">
@@ -15,7 +15,21 @@
   <meta property="og:image:height" content="630">
   <meta property="og:url" content="https://analyzer.00id.net">
   <meta property="og:type" content="website">
-  <meta name="theme-color" content="#0a0a0a">
+  <meta name="theme-color" content="#0C0F1A">
+
+  <!-- Google Analytics (environment-specific) -->
+  <script>
+    // Use dev GA4 property for dev-scope, prod for scope
+    const GA_ID = window.location.hostname.startsWith('dev-') ? 'G-WKMJ5XBF62' : 'G-KX3PSRD0JT';
+    const script = document.createElement('script');
+    script.async = true;
+    script.src = `https://www.googletagmanager.com/gtag/js?id=${GA_ID}`;
+    document.head.appendChild(script);
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', GA_ID);
+  </script>
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image">
@@ -25,6 +39,10 @@
   <link rel="stylesheet" href="style.css?v=__BUST__">
   <link rel="stylesheet" href="home.css?v=__BUST__">
   <link rel="stylesheet" href="live.css?v=__BUST__">
+  <!-- Chicago Offline brand theme — overrides upstream palette vars -->
+  <link rel="stylesheet" href="chicagooffline-theme.css?v=__BUST__">
+  <!-- Chicago Offline map layer catalog — must load before map.js / live.js -->
+  <script src="map-layers.js?v=__BUST__"></script>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
     integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
     crossorigin="anonymous">
@@ -45,16 +63,16 @@
       </a>
       <div class="nav-links">
         <a href="#/home" class="nav-link" data-route="home" data-priority="high">Home</a>
-        <a href="#/packets" class="nav-link" data-route="packets" data-priority="high">Packets</a>
         <a href="#/map" class="nav-link" data-route="map" data-priority="high">Map</a>
-        <a href="#/live" class="nav-link" data-route="live" data-priority="high">🔴 Live</a>
-        <a href="#/channels" class="nav-link" data-route="channels">Channels</a>
+        <a href="#/live" class="nav-link" data-route="live" data-priority="high">Live</a>
+        <a href="#/channels" class="nav-link" data-route="channels" data-priority="high">Channels</a>
         <a href="#/nodes" class="nav-link" data-route="nodes" data-priority="high">Nodes</a>
-        <a href="#/tools" class="nav-link" data-route="tools">Tools</a>
+        <a href="#/packets" class="nav-link" data-route="packets" data-priority="high">Packets</a>
+        <a href="#/traces" class="nav-link" data-route="traces">Traces</a>
         <a href="#/observers" class="nav-link" data-route="observers">Observers</a>
         <a href="#/analytics" class="nav-link" data-route="analytics">Analytics</a>
-        <a href="#/perf" class="nav-link" data-route="perf">⚡ Perf</a>
-        <a href="#/audio-lab" class="nav-link" data-route="audio-lab">🎵 Lab</a>
+        <a href="#/perf" class="nav-link" data-route="perf">Perf</a>
+        <a href="#/audio-lab" class="nav-link" data-route="audio-lab">Lab</a>
       </div>
       <div class="nav-more-wrap">
         <button class="nav-btn nav-more-btn" id="navMoreBtn" aria-haspopup="true" aria-expanded="false" aria-controls="navMoreMenu" title="More pages">More ▾</button>
@@ -69,7 +87,14 @@
       </div>
       <button class="nav-btn" id="searchToggle" title="Search (Ctrl+K)">🔍</button>
       <button class="nav-btn" id="customizeToggle" title="Customize theme & branding">🎨</button>
-      <button class="nav-btn" id="darkModeToggle" title="Toggle dark mode">☀️</button>
+      <label class="theme-toggle" id="darkModeToggle" title="Toggle dark mode" aria-label="Toggle dark mode">
+        <input type="checkbox" id="darkModeCheckbox" aria-hidden="true">
+        <span class="theme-toggle-track">
+          <span class="theme-toggle-thumb"></span>
+          <span class="theme-toggle-icon theme-toggle-sun">☀️</span>
+          <span class="theme-toggle-icon theme-toggle-moon">🌙</span>
+        </span>
+      </label>
       <button class="nav-btn hamburger" id="hamburger" title="Menu" aria-label="Toggle navigation menu">☰</button>
     </div>
   </nav>

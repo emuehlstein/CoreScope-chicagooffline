@@ -1,0 +1,219 @@
+/* ============================================================
+   Chicago Offline — Brand Theme Override for CoreScope
+   Official palette confirmed 2026-04-22 (Jourdan + Eric)
+   Overrides style.css variables for dark AND light modes.
+   ============================================================ */
+
+/* ── Palette tokens (dark) ── */
+:root {
+  --co-bg:        #0C0F1A;  /* Background — cooler/deeper, reduces halos around accents */
+  --co-surface1:  #141829;  /* Cards / panels */
+  --co-surface2:  #1a1f30;  /* Nested surfaces */
+  --co-surface3:  #1f2438;  /* Deep nesting */
+  --co-border:    #242840;  /* Borders */
+  --co-cyan:      #00E5FF;  /* Signal Cyan — primary accent / links / brand */
+  --co-amber:     #FFB300;  /* Beacon Amber — alerts / CTA / emphasis */
+  --co-green:     #39FF14;  /* Mesh Green — status / nodes / online */
+  --co-text:      #EDF2FF;  /* Text primary */
+  --co-muted:     #A0AABF;  /* Text secondary */
+
+  /* ── Light palette tokens ── */
+  --co-light-bg:       #f0f4f8;
+  --co-light-surface1: #ffffff;
+  --co-light-surface2: #f8faff;
+  --co-light-surface3: #f0f2f7;
+  --co-light-border:   #d0d7e8;
+  --co-light-cyan:     #0077cc;  /* Accessible Signal Cyan for light bg */
+  --co-light-amber:    #b87000;
+  --co-light-green:    #1a7a00;
+  --co-light-text:     #0f1117;
+  --co-light-muted:    #4a5070;
+  --co-light-nav-bg:   #ffffff;
+  --co-light-nav-bg2:  #f0f4f8;
+}
+
+/* ── Apply to dark mode (OS-level) — this is our default ── */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    /* Backgrounds */
+    --surface-0:    var(--co-bg);
+    --surface-1:    var(--co-surface1);
+    --surface-2:    var(--co-surface2);
+    --surface-3:    var(--co-surface3);
+    --content-bg:   var(--co-bg);
+    --card-bg:      var(--co-surface1);
+    --nav-bg:       var(--co-bg);
+    --nav-bg2:      var(--co-surface1);
+    --detail-bg:    var(--co-surface2);
+    --input-bg:     var(--co-surface2);
+    --section-bg:   var(--co-surface2);
+
+    /* Text */
+    --text:         var(--co-text);
+    --text-muted:   var(--co-muted);
+    --nav-text:     var(--co-text);
+    --nav-text-muted: var(--co-muted);
+
+    /* Borders / rows */
+    --border:       var(--co-border);
+    --row-stripe:   #141829;
+    --row-hover:    #1f2438;
+    --hover-bg:     rgba(255,255,255,0.04);
+    --selected-bg:  rgba(0,229,255,0.12);
+
+    /* Accent — Signal Cyan replaces the upstream blue */
+    --accent:       var(--co-cyan);
+    --accent-hover: color-mix(in srgb, var(--co-cyan) 80%, #fff);
+    --geo-filter-color: var(--co-cyan);
+
+    /* Status — keep upstream colours except green (use Mesh Green) */
+    --status-green: var(--co-green);
+
+    /* VCR LCD clock */
+    --vcr-lcd-bg:     #1a1a0a;
+    --vcr-lcd-shadow: rgba(0,0,0,0.7);
+    --vcr-lcd-glow:   rgba(0,0,0,0.3);
+
+    /* Misc */
+    --theme-color:  var(--co-bg);
+  }
+}
+
+/* ── Manual dark toggle ([data-theme="dark"]) — keep in sync ── */
+[data-theme="dark"] {
+  --surface-0:    var(--co-bg);
+  --surface-1:    var(--co-surface1);
+  --surface-2:    var(--co-surface2);
+  --surface-3:    var(--co-surface3);
+  --content-bg:   var(--co-bg);
+  --card-bg:      var(--co-surface1);
+  --nav-bg:       var(--co-bg);
+  --nav-bg2:      var(--co-surface1);
+  --detail-bg:    var(--co-surface2);
+  --input-bg:     var(--co-surface2);
+  --section-bg:   var(--co-surface2);
+
+  --text:         var(--co-text);
+  --text-muted:   var(--co-muted);
+  --nav-text:     var(--co-text);
+  --nav-text-muted: var(--co-muted);
+
+  --border:       var(--co-border);
+  --row-stripe:   #141829;
+  --row-hover:    #1f2438;
+  --hover-bg:     rgba(255,255,255,0.04);
+  --selected-bg:  rgba(0,229,255,0.12);
+
+  --accent:       var(--co-cyan);
+  --accent-hover: color-mix(in srgb, var(--co-cyan) 80%, #fff);
+  --geo-filter-color: var(--co-cyan);
+
+  --status-green: var(--co-green);
+
+  --vcr-lcd-bg:     #1a1a0a;
+  --vcr-lcd-shadow: rgba(0,0,0,0.7);
+  --vcr-lcd-glow:   rgba(0,0,0,0.3);
+}
+
+/* ── Default to dark color-scheme (adapts native form controls) ── */
+:root {
+  color-scheme: dark;
+}
+[data-theme="light"] {
+  color-scheme: light;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+  }
+}
+
+/* ── Light mode (OS-level) ── */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --surface-0:    var(--co-light-bg);
+    --surface-1:    var(--co-light-surface1);
+    --surface-2:    var(--co-light-surface2);
+    --surface-3:    var(--co-light-surface3);
+    --content-bg:   var(--co-light-bg);
+    --card-bg:      var(--co-light-surface1);
+    --nav-bg:       var(--co-light-nav-bg);
+    --nav-bg2:      var(--co-light-nav-bg2);
+    --detail-bg:    var(--co-light-surface2);
+    --input-bg:     var(--co-light-surface1);
+    --section-bg:   var(--co-light-surface2);
+
+    --text:         var(--co-light-text);
+    --text-muted:   var(--co-light-muted);
+    --nav-text:     var(--co-light-text);
+    --nav-text-muted: var(--co-light-muted);
+
+    --border:       var(--co-light-border);
+    --row-stripe:   #f9fafb;
+    --row-hover:    #eef2ff;
+    --hover-bg:     rgba(0,0,0,0.04);
+    --selected-bg:  rgba(0,119,204,0.12);
+
+    --accent:       var(--co-light-cyan);
+    --accent-hover: color-mix(in srgb, var(--co-light-cyan) 80%, #000);
+    --geo-filter-color: var(--co-light-cyan);
+
+    --status-green: var(--co-light-green);
+
+    /* VCR LCD clock — light: subtle inset panel */
+    --vcr-lcd-bg:     #e8ecf2;
+    --vcr-lcd-shadow: rgba(0,0,0,0.08);
+    --vcr-lcd-glow:   rgba(0,0,0,0.04);
+  }
+}
+
+/* ── Manual light toggle ([data-theme="light"]) — keep in sync with @media block ── */
+[data-theme="light"] {
+  --surface-0:    var(--co-light-bg);
+  --surface-1:    var(--co-light-surface1);
+  --surface-2:    var(--co-light-surface2);
+  --surface-3:    var(--co-light-surface3);
+  --content-bg:   var(--co-light-bg);
+  --card-bg:      var(--co-light-surface1);
+  --nav-bg:       var(--co-light-nav-bg);
+  --nav-bg2:      var(--co-light-nav-bg2);
+  --detail-bg:    var(--co-light-surface2);
+  --input-bg:     var(--co-light-surface1);
+  --section-bg:   var(--co-light-surface2);
+
+  --text:         var(--co-light-text);
+  --text-muted:   var(--co-light-muted);
+  --nav-text:     var(--co-light-text);
+  --nav-text-muted: var(--co-light-muted);
+
+  --border:       var(--co-light-border);
+  --row-stripe:   #f9fafb;
+  --row-hover:    #eef2ff;
+  --hover-bg:     rgba(0,0,0,0.04);
+  --selected-bg:  rgba(0,119,204,0.12);
+
+  --accent:       var(--co-light-cyan);
+  --accent-hover: color-mix(in srgb, var(--co-light-cyan) 80%, #000);
+  --geo-filter-color: var(--co-light-cyan);
+
+  --status-green: var(--co-light-green);
+
+  --vcr-lcd-bg:     #e8ecf2;
+  --vcr-lcd-shadow: rgba(0,0,0,0.08);
+  --vcr-lcd-glow:   rgba(0,0,0,0.04);
+}
+
+/* ── Nav — theme-aware (uses CSS variables, adapts to light/dark) ── */
+.top-nav {
+  background: linear-gradient(135deg, var(--nav-bg) 0%, var(--nav-bg2) 100%) !important;
+  border-bottom: 1px solid var(--border) !important;
+}
+
+/* ── Accent glow on active nav items (adapts via --accent) ── */
+.nav-active-bg,
+.top-nav a.active,
+.top-nav .nav-item.active {
+  background: color-mix(in srgb, var(--accent) 12%, transparent) !important;
+}
+
+/* ── meta theme-color (dynamic, for mobile chrome chrome) ── */

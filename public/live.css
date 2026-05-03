@@ -911,3 +911,11 @@ label:has(#liveMatrixRainToggle),
 #rainDesc {
   display: none !important;
 }
+
+/* Hide "Filter by node" input (chicagooffline) */
+#liveNodeFilterInput,
+#liveNodeFilterList,
+#liveNodeFilterClear,
+#liveNodeFilterCount {
+  display: none !important;
+}

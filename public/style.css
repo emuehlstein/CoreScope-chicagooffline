@@ -2439,3 +2439,8 @@ th.sort-active { color: var(--accent, #60a5fa); }
 .nav-links a:not([data-priority="high"]) {
   display: none !important;
 }
+
+/* Ensure More button text stays inline (chicagooffline) */
+.nav-more-btn {
+  white-space: nowrap;
+}

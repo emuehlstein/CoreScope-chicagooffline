@@ -72,29 +72,64 @@
   // Fetch and display nodes
   async function loadNodes() {
     try {
+      console.log('[globe] Fetching nodes from /api/nodes...');
       const response = await fetch('/api/nodes');
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
       const data = await response.json();
+      console.log('[globe] Raw API response:', data);
       
       // Handle both array and object responses
       const nodes = Array.isArray(data) ? data : (data.nodes || []);
       
-      console.log(`[globe] Loaded ${nodes.length} nodes`);
+      console.log(`[globe] Parsed ${nodes.length} nodes`);
       
+      let plotted = 0;
       nodes.forEach(node => {
         if (node.lat && node.lon) {
+          console.log(`[globe] Plotting node: ${node.id || node.name} at ${node.lat}, ${node.lon}`);
           addNodeToGlobe(node);
+          plotted++;
+        } else {
+          console.warn('[globe] Node missing coordinates:', node);
         }
       });
-
+      
+      console.log(`[globe] Plotted ${plotted}/${nodes.length} nodes`);
       updateStats();
+      
+      // If no nodes, add a test marker at Chicago
+      if (plotted === 0) {
+        console.warn('[globe] No nodes plotted - adding test marker');
+        addTestMarker();
+      }
     } catch (err) {
       console.error('[globe] Failed to load nodes:', err);
+      // Add test marker on error
+      addTestMarker();
     }
+  }
+  
+  // Add a test marker to verify the globe is working
+  function addTestMarker() {
+    const testNode = {
+      id: 'test-marker',
+      name: 'Test Node (Chicago)',
+      lat: 41.8781,
+      lon: -87.6298,
+      lastSeenAt: new Date().toISOString()
+    };
+    addNodeToGlobe(testNode);
+    updateStats();
+    console.log('[globe] Added test marker at Chicago');
   }
 
   // Add a node marker to the globe
   function addNodeToGlobe(node) {
-    const position = Cesium.Cartesian3.fromDegrees(node.lon, node.lat, 0);
+    const position = Cesium.Cartesian3.fromDegrees(node.lon, node.lat, 100); // 100m above ground for visibility
     
     // Color based on activity (green = recent, amber = old, grey = inactive)
     const lastSeen = node.lastSeenAt ? new Date(node.lastSeenAt) : null;
@@ -112,24 +147,32 @@
     const entity = viewer.entities.add({
       id: `node-${node.id}`,
       position: position,
+      billboard: {
+        image: createNodeMarker(color),
+        width: 32,
+        height: 32,
+        heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND,
+        verticalOrigin: Cesium.VerticalOrigin.BOTTOM
+      },
       point: {
-        pixelSize: 12,
+        pixelSize: 16,
         color: color,
         outlineColor: Cesium.Color.WHITE,
-        outlineWidth: 2,
-        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND
+        outlineWidth: 3,
+        heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND
       },
       label: {
         text: node.name || node.id,
-        font: '14px sans-serif',
+        font: 'bold 16px sans-serif',
         fillColor: Cesium.Color.WHITE,
         outlineColor: Cesium.Color.BLACK,
-        outlineWidth: 2,
+        outlineWidth: 3,
         style: Cesium.LabelStyle.FILL_AND_OUTLINE,
         verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-        pixelOffset: new Cesium.Cartesian2(0, -15),
-        show: false, // Only show on hover/click
-        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND
+        pixelOffset: new Cesium.Cartesian2(0, -20),
+        show: true, // Always show labels
+        heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND,
+        distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 500000) // Hide when too far
       },
       description: `
         <div style="font-family: sans-serif;">
@@ -138,11 +181,31 @@
           <p style="margin: 5px 0;"><strong>Location:</strong> ${node.lat.toFixed(6)}, ${node.lon.toFixed(6)}</p>
           <p style="margin: 5px 0;"><strong>Last Seen:</strong> ${lastSeen ? lastSeen.toLocaleString() : 'Never'}</p>
           ${node.hardwareModel ? `<p style="margin: 5px 0;"><strong>Hardware:</strong> ${node.hardwareModel}</p>` : ''}
+          ${node.role ? `<p style="margin: 5px 0;"><strong>Role:</strong> ${node.role}</p>` : ''}
         </div>
       `
     });
 
     nodeEntities.set(node.id, entity);
+  }
+
+  // Create a colored marker canvas for billboards
+  function createNodeMarker(color) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 32;
+    canvas.height = 32;
+    const ctx = canvas.getContext('2d');
+    
+    // Draw circle
+    ctx.beginPath();
+    ctx.arc(16, 16, 12, 0, 2 * Math.PI);
+    ctx.fillStyle = color.toCssColorString();
+    ctx.fill();
+    ctx.strokeStyle = 'white';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    
+    return canvas;
   }
 
   // Update node stats display

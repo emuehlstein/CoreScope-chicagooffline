@@ -10,6 +10,7 @@
   let nodeEntities = new Map();
   let wsHandler;
   let statsDiv;
+  let pulseInterval;
 
   // Initialize Cesium viewer
   function initViewer(container) {
@@ -217,12 +218,16 @@
       const color = e.point.color.getValue();
       return color.equals(Cesium.Color.fromCssColorString('#39FF14'));
     }).length;
+    
+    const paths = packetPaths.size;
 
     statsDiv.innerHTML = `
       <span class="globe-stats-label">Nodes:</span>
       <span class="globe-stats-value">${total}</span>
       <span class="globe-stats-label" style="margin-left: 12px;">Active:</span>
       <span class="globe-stats-value">${active}</span>
+      <span class="globe-stats-label" style="margin-left: 12px;">Paths:</span>
+      <span class="globe-stats-value">${paths}</span>
     `;
   }
 
@@ -278,10 +283,36 @@
     if (window.registerWSHandler) {
       registerWSHandler(wsHandler);
     }
+    
+    // Periodic pulse animation on recent paths (visual heartbeat)
+    pulseInterval = setInterval(() => {
+      // Find paths from last 2 minutes and randomly pulse one
+      const recentPaths = Array.from(packetPaths.entries())
+        .filter(([id, entity]) => {
+          // Check if path has description with timestamp
+          return entity.description; // Simple check
+        })
+        .slice(0, 5); // Take up to 5 most recent
+      
+      if (recentPaths.length > 0) {
+        const randomPath = recentPaths[Math.floor(Math.random() * recentPaths.length)][1];
+        if (randomPath.polyline && randomPath.polyline.positions) {
+          const positions = randomPath.polyline.positions.getValue(Cesium.JulianDate.now());
+          if (positions && positions.length >= 2) {
+            const pulseColor = Cesium.Color.fromCssColorString('#00E5FF').withAlpha(0.8);
+            addPulseAlongPath(positions, pulseColor);
+          }
+        }
+      }
+    }, 5000); // Every 5 seconds
   }
 
   // Cleanup when leaving the page
   function destroy() {
+    if (pulseInterval) {
+      clearInterval(pulseInterval);
+      pulseInterval = null;
+    }
     if (viewer) {
       viewer.destroy();
       viewer = null;
@@ -397,6 +428,13 @@
     
     packetPaths.set(pathId, entity);
     
+    // Trigger animated pulse for fresh packets (< 30 seconds old)
+    if (age < 30) {
+      const pulseColor = Cesium.Color.fromCssColorString('#00E5FF'); // Signal Cyan
+      addPulseAlongPath(positions, pulseColor);
+      console.log(`[globe] Animating pulse for fresh packet ${packet.id}`);
+    }
+    
     // Auto-fade after 10 minutes
     setTimeout(() => {
       if (packetPaths.has(pathId)) {
@@ -406,31 +444,53 @@
     }, 600000);
   }
 
-  // Add animated pulse effect for recent packets
-  function addPulseEffect(fromPos, toPos, color) {
-    const startTime = Cesium.JulianDate.now();
-    const stopTime = Cesium.JulianDate.addSeconds(startTime, 2, new Cesium.JulianDate());
+  // Add animated pulse along a path (hop by hop)
+  function addPulseAlongPath(positions, color, delayMs = 0) {
+    if (positions.length < 2) return;
     
-    // Create moving point along path
+    // Animate pulse for each hop in sequence
+    positions.forEach((pos, i) => {
+      if (i === positions.length - 1) return; // Skip last (no next hop)
+      
+      const fromPos = positions[i];
+      const toPos = positions[i + 1];
+      const hopDelay = delayMs + (i * 800); // Stagger hops by 800ms
+      
+      setTimeout(() => {
+        animatePulse(fromPos, toPos, color);
+      }, hopDelay);
+    });
+  }
+  
+  // Animate a single pulse between two positions
+  function animatePulse(fromPos, toPos, color) {
+    const startTime = Cesium.JulianDate.now();
+    const stopTime = Cesium.JulianDate.addSeconds(startTime, 0.8, new Cesium.JulianDate());
+    
+    // Create moving point
     const pulse = viewer.entities.add({
       availability: new Cesium.TimeIntervalCollection([
         new Cesium.TimeInterval({ start: startTime, stop: stopTime })
       ]),
       position: new Cesium.SampledPositionProperty(),
       point: {
-        pixelSize: 8,
+        pixelSize: 12,
         color: color,
         outlineColor: Cesium.Color.WHITE,
-        outlineWidth: 2
+        outlineWidth: 3
+      },
+      ellipsoid: {
+        radii: new Cesium.Cartesian3(50, 50, 50),
+        material: color.withAlpha(0.5)
       }
     });
     
-    // Animate position from source to destination
+    // Animate from source to destination
     pulse.position.addSample(startTime, fromPos);
     pulse.position.addSample(stopTime, toPos);
     
-    // Remove after animation
+    // Auto-remove after animation
     setTimeout(() => {
       viewer.entities.remove(pulse);
-    }, 2500);
+    }, 1000);
   }

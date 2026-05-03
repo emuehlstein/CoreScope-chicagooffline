@@ -731,6 +731,13 @@ window.addEventListener('DOMContentLoaded', () => {
   } else {
     applyTheme('light');
   }
+  // Listen to checkbox change event (more reliable than label click)
+  if (darkCheckbox) {
+    darkCheckbox.addEventListener('change', () => {
+      applyTheme(darkCheckbox.checked ? 'dark' : 'light');
+    });
+  }
+  // Fallback: also listen to label click for accessibility
   darkToggle.addEventListener('click', () => {
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
     applyTheme(isDark ? 'light' : 'dark');

@@ -2429,3 +2429,8 @@ th.sort-active { color: var(--accent, #60a5fa); }
   opacity: 0.7;
   margin: 0 2px;
 }
+
+/* Hide favorites button for consistent navbar (chicagooffline) */
+.nav-fav-wrap {
+  display: none !important;
+}

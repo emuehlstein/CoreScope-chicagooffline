@@ -13,12 +13,13 @@
 
   // Initialize Cesium viewer
   function initViewer(container) {
-    // Cesium Ion token (default demo token - replace with your own for production)
-    Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI5N2UyMjcwOS00MDY1LTQxYjEtYjZjMy00YTU0ZTg1YmZhMzMiLCJpZCI6ODE5MDUsImlhdCI6MTYyNzY0NjAwNH0.qwnBTVHaIUPiLaSMHMM0XT6V31tO-xH9qCqz7KOjRgU';
+    // TODO: Replace with your Cesium Ion access token from https://cesium.com/ion/tokens
+    // Get your token: Login to Cesium Ion → Access Tokens → Create Token (or use default)
+    Cesium.Ion.defaultAccessToken = 'YOUR_CESIUM_ION_TOKEN_HERE';
 
-    // Create viewer with minimal config to ensure globe renders
+    // Create viewer with Cesium Ion imagery (Bing Maps satellite)
     viewer = new Cesium.Viewer(container, {
-      baseLayerPicker: true,  // Re-enable to ensure imagery loads
+      baseLayerPicker: false,
       geocoder: false,
       homeButton: true,
       sceneModePicker: true,
@@ -73,7 +74,10 @@
   async function loadNodes() {
     try {
       const response = await fetch('/api/nodes');
-      const nodes = await response.json();
+      const data = await response.json();
+      
+      // Handle both array and object responses
+      const nodes = Array.isArray(data) ? data : (data.nodes || []);
       
       console.log(`[globe] Loaded ${nodes.length} nodes`);
       

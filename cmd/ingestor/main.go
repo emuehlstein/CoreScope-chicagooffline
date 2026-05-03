@@ -57,6 +57,9 @@ func main() {
 	defer store.Close()
 	log.Printf("SQLite opened: %s", cfg.DBPath)
 
+	// Async backfill: path_json from raw_hex (#888) — must not block MQTT startup
+	store.BackfillPathJSONAsync()
+
 	// Check auto_vacuum mode and optionally migrate (#919)
 	store.CheckAutoVacuum(cfg)
 
@@ -274,8 +277,14 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		return
 	}
 
+	// Global observer IATA whitelist: if configured, drop messages from observers
+	// in non-whitelisted IATA regions. Applies to ALL message types (status + packets).
+	if len(parts) > 1 && !cfg.IsObserverIATAAllowed(parts[1]) {
+		return
+	}
+
 	// Status topic: meshcore/<region>/<observer_id>/status
-	// IATA filter does NOT apply here — observer metadata (noise_floor, battery, etc.)
+	// Per-source IATA filter does NOT apply here — observer metadata (noise_floor, battery, etc.)
 	// is region-independent and should be accepted from all observers regardless of
 	// which IATA regions are configured for packet ingestion.
 	if len(parts) >= 4 && parts[3] == "status" {
@@ -339,8 +348,16 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		if len(parts) > 1 {
 			region = parts[1]
 		}
+		// Fallback to source-level region config when topic has no region (#788)
+		if region == "" && source.Region != "" {
+			region = source.Region
+		}
 
 		mqttMsg := &MQTTPacketMessage{Raw: rawHex}
+		// Parse optional region from JSON payload (#788)
+		if v, ok := msg["region"].(string); ok && v != "" {
+			mqttMsg.Region = v
+		}
 		if v, ok := msg["SNR"]; ok {
 			if f, ok := toFloat64(v); ok {
 				mqttMsg.SNR = &f
@@ -440,7 +457,12 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		// Upsert observer
 		if observerID != "" {
 			origin, _ := msg["origin"].(string)
-			if err := store.UpsertObserver(observerID, origin, region, nil); err != nil {
+			// Use effective region: payload > topic > source config (#788)
+			effectiveRegion := region
+			if mqttMsg.Region != "" {
+				effectiveRegion = mqttMsg.Region
+			}
+			if err := store.UpsertObserver(observerID, origin, effectiveRegion, nil); err != nil {
 				log.Printf("MQTT [%s] observer upsert error: %v", tag, err)
 			}
 		}

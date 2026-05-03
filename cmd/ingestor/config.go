@@ -23,6 +23,7 @@ type MQTTSource struct {
 	Topics             []string `json:"topics"`
 	IATAFilter         []string `json:"iataFilter,omitempty"`
 	ConnectTimeoutSec  int      `json:"connectTimeoutSec,omitempty"`
+	Region             string   `json:"region,omitempty"`
 }
 
 // ConnectTimeoutOrDefault returns the per-source connect timeout in seconds,
@@ -54,6 +55,16 @@ type Config struct {
 	GeoFilter            *GeoFilterConfig  `json:"geo_filter,omitempty"`
 	ValidateSignatures   *bool             `json:"validateSignatures,omitempty"`
 	DB                   *DBConfig         `json:"db,omitempty"`
+
+	// ObserverIATAWhitelist restricts which observer IATA regions are processed.
+	// When non-empty, only observers whose IATA code (from the MQTT topic) matches
+	// one of these entries are accepted. Case-insensitive. An empty list means all
+	// IATA codes are allowed. This applies globally, unlike the per-source iataFilter.
+	ObserverIATAWhitelist []string `json:"observerIATAWhitelist,omitempty"`
+
+	// obsIATAWhitelistCached is the lazily-built uppercase set for O(1) lookups.
+	obsIATAWhitelistCached map[string]bool
+	obsIATAWhitelistOnce   sync.Once
 
 	// ObserverBlacklist is a list of observer public keys to drop at ingest.
 	// Messages from blacklisted observers are silently discarded — no DB writes,
@@ -148,6 +159,25 @@ func (c *Config) IsObserverBlacklisted(id string) bool {
 		c.obsBlacklistSetCached = m
 	})
 	return c.obsBlacklistSetCached[strings.ToLower(strings.TrimSpace(id))]
+}
+
+// IsObserverIATAAllowed returns true if the given IATA code is permitted.
+// When ObserverIATAWhitelist is empty, all codes are allowed.
+func (c *Config) IsObserverIATAAllowed(iata string) bool {
+	if c == nil || len(c.ObserverIATAWhitelist) == 0 {
+		return true
+	}
+	c.obsIATAWhitelistOnce.Do(func() {
+		m := make(map[string]bool, len(c.ObserverIATAWhitelist))
+		for _, code := range c.ObserverIATAWhitelist {
+			trimmed := strings.ToUpper(strings.TrimSpace(code))
+			if trimmed != "" {
+				m[trimmed] = true
+			}
+		}
+		c.obsIATAWhitelistCached = m
+	})
+	return c.obsIATAWhitelistCached[strings.ToUpper(strings.TrimSpace(iata))]
 }
 
 // LoadConfig reads configuration from a JSON file, with env var overrides.

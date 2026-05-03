@@ -317,3 +317,80 @@ func TestConnectTimeoutFromJSON(t *testing.T) {
 		t.Errorf("from JSON: got %d, want 5", got)
 	}
 }
+
+func TestObserverIATAWhitelist(t *testing.T) {
+	// Config with whitelist set
+	cfg := Config{
+		ObserverIATAWhitelist: []string{"ARN", "got"},
+	}
+
+	// Matching (case-insensitive)
+	if !cfg.IsObserverIATAAllowed("ARN") {
+		t.Error("ARN should be allowed")
+	}
+	if !cfg.IsObserverIATAAllowed("arn") {
+		t.Error("arn (lowercase) should be allowed")
+	}
+	if !cfg.IsObserverIATAAllowed("GOT") {
+		t.Error("GOT should be allowed")
+	}
+
+	// Non-matching
+	if cfg.IsObserverIATAAllowed("SJC") {
+		t.Error("SJC should NOT be allowed")
+	}
+
+	// Empty string not allowed
+	if cfg.IsObserverIATAAllowed("") {
+		t.Error("empty IATA should NOT be allowed")
+	}
+}
+
+func TestObserverIATAWhitelistEmpty(t *testing.T) {
+	// No whitelist = allow all
+	cfg := Config{}
+	if !cfg.IsObserverIATAAllowed("SJC") {
+		t.Error("with no whitelist, all IATAs should be allowed")
+	}
+	if !cfg.IsObserverIATAAllowed("") {
+		t.Error("with no whitelist, even empty IATA should be allowed")
+	}
+}
+
+func TestObserverIATAWhitelistJSON(t *testing.T) {
+	json := `{
+		"dbPath": "test.db",
+		"observerIATAWhitelist": ["ARN", "GOT"]
+	}`
+	tmp := t.TempDir() + "/config.json"
+	os.WriteFile(tmp, []byte(json), 0644)
+	cfg, err := LoadConfig(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ObserverIATAWhitelist) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(cfg.ObserverIATAWhitelist))
+	}
+	if !cfg.IsObserverIATAAllowed("ARN") {
+		t.Error("ARN should be allowed after loading from JSON")
+	}
+}
+
+func TestMQTTSourceRegionField(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	os.WriteFile(cfgPath, []byte(`{
+		"dbPath": "/tmp/test.db",
+		"mqttSources": [
+			{"name": "cascadia", "broker": "tcp://localhost:1883", "topics": ["meshcore/#"], "region": "PDX"}
+		]
+	}`), 0o644)
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MQTTSources[0].Region != "PDX" {
+		t.Fatalf("expected region PDX, got %q", cfg.MQTTSources[0].Region)
+	}
+}

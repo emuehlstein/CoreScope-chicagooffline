@@ -149,7 +149,21 @@
             </div>
           </fieldset>
           <fieldset class="mc-section">
+            <legend class="mc-label">Basemap</legend>
+            <div id="mcBasemap" style="display:flex; gap:6px; flex-wrap:wrap;">
+              <button class="btn" data-basemap="carto">Carto</button>
+              <button class="btn" data-basemap="satellite">Satellite</button>
+              <button class="btn" data-basemap="hillshade">Hillshade</button>
+            </div>
+            <div id="mcHillshadeOpacity" class="mc-hillshade-opacity" style="display:none; margin-top:6px;">
+              <label for="hillshadeSlider" style="font-size:11px; opacity:0.7;">Opacity</label>
+              <input type="range" id="hillshadeSlider" min="0" max="1" step="0.05" value="0.60"
+                     style="width:100%; accent-color:var(--co-cyan,#00E5FF);">
+            </div>
+          </fieldset>
+          <fieldset class="mc-section">
             <legend class="mc-label">Filters</legend>
+
             <label for="mcNeighbors"><input type="checkbox" id="mcNeighbors"> Show direct neighbors</label>
             <div id="mcNeighborRef" style="display:none;font-size:11px;color:var(--text-muted);margin-top:2px;padding-left:20px;">Ref: <span id="mcNeighborRefName">—</span></div>
             <div id="mcNeighborHint" style="display:none;font-size:11px;color:var(--text-muted);margin-top:2px;padding-left:20px;">Click a node marker to set the reference node</div>
@@ -201,16 +215,22 @@
 
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    const tileLayer = L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, {
-      attribution: '© OpenStreetMap © CartoDB',
-      maxZoom: 19,
-    }).addTo(map);
-    const _mapThemeObs = new MutationObserver(function () {
-      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-      tileLayer.setUrl(dark ? TILE_DARK : TILE_LIGHT);
-    });
-    _mapThemeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    
+    // Use CO_BASEMAP if available, else fallback to simple tile layer
+    if (window.CO_BASEMAP) {
+      window.CO_BASEMAP.init(map, isDark);
+    } else {
+      const tileLayer = L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, {
+        attribution: '© OpenStreetMap © CartoDB',
+        maxZoom: 19,
+      }).addTo(map);
+      const _mapThemeObs = new MutationObserver(function () {
+        const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+          (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        tileLayer.setUrl(dark ? TILE_DARK : TILE_LIGHT);
+      });
+      _mapThemeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
 
     // Save position on move
     map.on('moveend', () => {
@@ -234,6 +254,47 @@
     });
 
     markerLayer = L.layerGroup().addTo(map);
+
+
+    // ─── Basemap Selector + Hillshade Opacity ───
+    (function () {
+      const btns = document.querySelectorAll('#mcBasemap .btn');
+      const opacityWrap = document.getElementById('mcHillshadeOpacity');
+      const slider = document.getElementById('hillshadeSlider');
+      
+      // Restore saved opacity & show slider if hillshade is active
+      if (window.CO_BASEMAP) {
+        slider.value = window.CO_BASEMAP.getHillshadeOpacity();
+      }
+      
+      // Mark active basemap
+      const activeMode = localStorage.getItem('co-basemap-mode') || 'carto';
+      btns.forEach(btn => {
+        if (btn.dataset.basemap === activeMode) btn.classList.add('active');
+      });
+      if (activeMode === 'hillshade') opacityWrap.style.display = '';
+      
+      // Handle basemap buttons
+      btns.forEach(btn => {
+        btn.addEventListener('click', () => {
+          btns.forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          const mode = btn.dataset.basemap;
+          localStorage.setItem('co-basemap-mode', mode);
+          if (window.CO_BASEMAP) window.CO_BASEMAP.setBasemap(map, mode);
+          opacityWrap.style.display = mode === 'hillshade' ? '' : 'none';
+        });
+      });
+      
+      // Hillshade opacity slider
+      if (slider) {
+        slider.addEventListener('input', () => {
+          if (window.CO_BASEMAP) window.CO_BASEMAP.setHillshadeOpacity(slider.value);
+          localStorage.setItem('co-hillshade-opacity', slider.value);
+        });
+      }
+    })();
+
     routeLayer = L.layerGroup().addTo(map);
 
     // Fix map size on SPA load

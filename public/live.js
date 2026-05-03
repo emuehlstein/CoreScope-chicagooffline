@@ -1471,7 +1471,7 @@
     // Auto-hide nav with pin toggle (#62)
     const topNav = document.querySelector('.top-nav');
     if (topNav) { topNav.style.position = 'fixed'; topNav.style.width = '100%'; topNav.style.zIndex = '1100'; }
-    _navCleanup = { timeout: null, fn: null, pinned: false };
+    _navCleanup = { timeout: null, fn: null, pinned: true };
     // Add pin button to nav (guard against duplicate)
     if (topNav && !document.getElementById('navPinBtn')) {
       const pinBtn = document.createElement('button');
@@ -1493,6 +1493,9 @@
         }
       });
       topNav.appendChild(pinBtn);
+      // Start pinned by default
+      pinBtn.classList.add('pinned');
+      pinBtn.setAttribute('aria-pressed', 'true');
     }
     function showNav() {
       if (topNav) topNav.classList.remove('nav-autohide');

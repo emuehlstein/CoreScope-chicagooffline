@@ -260,11 +260,19 @@
 
     initViewer(container);
     loadNodes();
+    
+    // Load packet paths after nodes (so we have node positions)
+    setTimeout(() => {
+      loadPacketPaths();
+    }, 1000);
 
-    // Set up WebSocket handler
+    // Set up WebSocket handler for real-time updates
     wsHandler = function (msg) {
       if (msg.type === 'node' && msg.node) {
         updateNode(msg.node);
+      } else if (msg.type === 'packet' && msg.packet) {
+        // Add new packet path in real-time
+        addPacketPath(msg.packet);
       }
     };
     if (window.registerWSHandler) {
@@ -279,6 +287,7 @@
       viewer = null;
     }
     nodeEntities.clear();
+    packetPaths.clear();
     if (wsHandler && window.unregisterWSHandler) {
       unregisterWSHandler(wsHandler);
       wsHandler = null;
@@ -293,3 +302,135 @@
   });
 
 })();
+
+  // Store packet paths
+  let packetPaths = new Map();
+
+  // Fetch and display recent packet paths
+  async function loadPacketPaths() {
+    try {
+      console.log('[globe] Fetching recent packets...');
+      const response = await fetch('/api/packets?limit=100');
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      
+      const data = await response.json();
+      const packets = Array.isArray(data) ? data : (data.packets || []);
+      
+      console.log(`[globe] Loaded ${packets.length} packets`);
+      
+      let pathsAdded = 0;
+      packets.forEach(packet => {
+        if (packet.path && packet.path.length >= 2) {
+          addPacketPath(packet);
+          pathsAdded++;
+        }
+      });
+      
+      console.log(`[globe] Added ${pathsAdded} packet paths`);
+    } catch (err) {
+      console.error('[globe] Failed to load packets:', err);
+    }
+  }
+
+  // Add a packet path polyline
+  function addPacketPath(packet) {
+    if (!packet.path || packet.path.length < 2) return;
+    
+    const pathId = `path-${packet.id}`;
+    
+    // Remove old path if exists
+    if (packetPaths.has(pathId)) {
+      viewer.entities.remove(packetPaths.get(pathId));
+    }
+    
+    // Build positions array from path hops
+    const positions = [];
+    packet.path.forEach(hop => {
+      // Look up node coordinates
+      const nodeEntity = viewer.entities.getById(`node-${hop.id || hop}`);
+      if (nodeEntity && nodeEntity.position) {
+        positions.push(nodeEntity.position.getValue(Cesium.JulianDate.now()));
+      }
+    });
+    
+    if (positions.length < 2) return;
+    
+    // Calculate age for color
+    const age = packet.timestamp ? (Date.now() - new Date(packet.timestamp).getTime()) / 1000 : Infinity;
+    
+    // Color based on age (fade from cyan to grey)
+    let color;
+    if (age < 60) {
+      color = Cesium.Color.fromCssColorString('#00E5FF').withAlpha(0.8); // Signal Cyan
+    } else if (age < 600) {
+      color = Cesium.Color.fromCssColorString('#FFB300').withAlpha(0.6); // Beacon Amber
+    } else {
+      color = Cesium.Color.fromCssColorString('#6B7280').withAlpha(0.4); // Grey
+    }
+    
+    // Create polyline entity with arc
+    const entity = viewer.entities.add({
+      id: pathId,
+      polyline: {
+        positions: positions,
+        width: 3,
+        material: new Cesium.PolylineGlowMaterialProperty({
+          glowPower: 0.3,
+          color: color
+        }),
+        arcType: Cesium.ArcType.GEODESIC,
+        clampToGround: false
+      },
+      description: `
+        <div style="font-family: sans-serif;">
+          <h3 style="margin: 0 0 10px 0;">Packet Path</h3>
+          <p style="margin: 5px 0;"><strong>Hops:</strong> ${packet.path.length}</p>
+          <p style="margin: 5px 0;"><strong>Route:</strong> ${packet.path.map(h => h.id || h).join(' → ')}</p>
+          ${packet.timestamp ? `<p style="margin: 5px 0;"><strong>Time:</strong> ${new Date(packet.timestamp).toLocaleString()}</p>` : ''}
+          ${packet.snr ? `<p style="margin: 5px 0;"><strong>SNR:</strong> ${packet.snr} dB</p>` : ''}
+        </div>
+      `
+    });
+    
+    packetPaths.set(pathId, entity);
+    
+    // Auto-fade after 10 minutes
+    setTimeout(() => {
+      if (packetPaths.has(pathId)) {
+        viewer.entities.remove(packetPaths.get(pathId));
+        packetPaths.delete(pathId);
+      }
+    }, 600000);
+  }
+
+  // Add animated pulse effect for recent packets
+  function addPulseEffect(fromPos, toPos, color) {
+    const startTime = Cesium.JulianDate.now();
+    const stopTime = Cesium.JulianDate.addSeconds(startTime, 2, new Cesium.JulianDate());
+    
+    // Create moving point along path
+    const pulse = viewer.entities.add({
+      availability: new Cesium.TimeIntervalCollection([
+        new Cesium.TimeInterval({ start: startTime, stop: stopTime })
+      ]),
+      position: new Cesium.SampledPositionProperty(),
+      point: {
+        pixelSize: 8,
+        color: color,
+        outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 2
+      }
+    });
+    
+    // Animate position from source to destination
+    pulse.position.addSample(startTime, fromPos);
+    pulse.position.addSample(stopTime, toPos);
+    
+    // Remove after animation
+    setTimeout(() => {
+      viewer.entities.remove(pulse);
+    }, 2500);
+  }

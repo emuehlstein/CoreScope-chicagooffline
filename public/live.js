@@ -940,6 +940,13 @@
     // Use CO_BASEMAP if available for consistent basemap selection across pages
     if (window.CO_BASEMAP) {
       window.CO_BASEMAP.init(map, isDark);
+      // Watch for theme changes and update basemap
+      const _themeObs = new MutationObserver(function () {
+        const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+          (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        window.CO_BASEMAP.onThemeChange(dark);
+      });
+      _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     } else {
       let tileLayer = L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { maxZoom: 19 }).addTo(map);
       // Swap tiles when theme changes

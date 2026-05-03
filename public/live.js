@@ -1159,7 +1159,23 @@
         voiceSelect.appendChild(opt);
       });
       voiceSelect.value = MeshAudio.getVoiceName() || voices[0] || '';
-      voiceSelect.addEventListener('change', (e) => MeshAudio.setVoice(e.target.value));
+      // Apply default BPM for initially selected voice
+      const initialVoice = window._meshAudioVoices && window._meshAudioVoices[voiceSelect.value];
+      if (initialVoice && initialVoice.defaultBpm) {
+        MeshAudio.setBPM(initialVoice.defaultBpm);
+        bpmSlider.value = initialVoice.defaultBpm;
+        bpmVal.textContent = initialVoice.defaultBpm;
+      }
+      voiceSelect.addEventListener('change', (e) => {
+        MeshAudio.setVoice(e.target.value);
+        // Apply voice's default BPM
+        const voice = window._meshAudioVoices && window._meshAudioVoices[e.target.value];
+        if (voice && voice.defaultBpm) {
+          MeshAudio.setBPM(voice.defaultBpm);
+          bpmSlider.value = voice.defaultBpm;
+          bpmVal.textContent = voice.defaultBpm;
+        }
+      });
     }
 
     audioToggle.addEventListener('change', (e) => {

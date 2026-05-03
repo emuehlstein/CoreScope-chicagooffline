@@ -919,3 +919,8 @@ label:has(#liveMatrixRainToggle),
 #liveNodeFilterCount {
   display: none !important;
 }
+
+/* Hide BPM slider (chicagooffline - voices have fixed default BPMs) */
+label.audio-slider-label:has(#audioBpmSlider) {
+  display: none !important;
+}

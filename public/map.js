@@ -215,7 +215,7 @@
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
     
-    // Use CO_BASEMAP if available, else fallback to simple tile layer
+    // Initialize basemap layer (CO_BASEMAP from map-layers.js)
     if (window.CO_BASEMAP) {
       window.CO_BASEMAP.init(map, isDark);
     } else {
@@ -263,7 +263,8 @@
       
       // Restore saved opacity & show slider if hillshade is active
       if (window.CO_BASEMAP) {
-        slider.value = window.CO_BASEMAP.getHillshadeOpacity();
+        const savedOpacity = window.CO_BASEMAP.getHillshadeOpacity();
+        if (savedOpacity) slider.value = savedOpacity;
       }
       
       // Mark active basemap
@@ -280,7 +281,7 @@
           btn.classList.add('active');
           const mode = btn.dataset.basemap;
           localStorage.setItem('co-basemap-mode', mode);
-          if (window.CO_BASEMAP) window.CO_BASEMAP.setBasemap(map, mode);
+          if (window.CO_BASEMAP) window.CO_BASEMAP.setMode(mode);
           opacityWrap.style.display = mode === 'hillshade' ? '' : 'none';
         });
       });
@@ -288,7 +289,7 @@
       // Hillshade opacity slider
       if (slider) {
         slider.addEventListener('input', () => {
-          if (window.CO_BASEMAP) window.CO_BASEMAP.setHillshadeOpacity(slider.value);
+          if (window.CO_BASEMAP) window.CO_BASEMAP.setHillshadeOpacity(parseFloat(slider.value));
           localStorage.setItem('co-hillshade-opacity', slider.value);
         });
       }

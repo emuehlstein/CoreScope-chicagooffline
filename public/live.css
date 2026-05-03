@@ -924,3 +924,9 @@ label:has(#liveMatrixRainToggle),
 label.audio-slider-label:has(#audioBpmSlider) {
   display: none !important;
 }
+
+/* Hide pin button on live page (chicagooffline) */
+#navPinBtn,
+.nav-pin-btn {
+  display: none !important;
+}

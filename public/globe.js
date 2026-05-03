@@ -13,9 +13,8 @@
 
   // Initialize Cesium viewer
   function initViewer(container) {
-    // TODO: Replace with your Cesium Ion access token from https://cesium.com/ion/tokens
-    // Get your token: Login to Cesium Ion → Access Tokens → Create Token (or use default)
-    Cesium.Ion.defaultAccessToken = 'YOUR_CESIUM_ION_TOKEN_HERE';
+    // Cesium Ion access token
+    Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJhZjMzYTczNS03YTlkLTRkOWItYjI1Zi02YjJhNjBmNjYxNjgiLCJpZCI6NDI2ODYzLCJpc3MiOiJodHRwczovL2lvbi5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3Nzc4NDY5NDl9.-m7FPQsB4syRZQn6mt2WZ7jffejFyk1twYRTBFe-7BA';
 
     // Create viewer with Cesium Ion imagery (Bing Maps satellite)
     viewer = new Cesium.Viewer(container, {

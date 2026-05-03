@@ -16,10 +16,9 @@
     // Cesium Ion token (default demo token - replace with your own for production)
     Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI5N2UyMjcwOS00MDY1LTQxYjEtYjZjMy00YTU0ZTg1YmZhMzMiLCJpZCI6ODE5MDUsImlhdCI6MTYyNzY0NjAwNH0.qwnBTVHaIUPiLaSMHMM0XT6V31tO-xH9qCqz7KOjRgU';
 
+    // Create viewer with minimal config to ensure globe renders
     viewer = new Cesium.Viewer(container, {
-      imageryProvider: new Cesium.IonImageryProvider({ assetId: 2 }),
-      terrain: Cesium.Terrain.fromWorldTerrain(),
-      baseLayerPicker: false,
+      baseLayerPicker: true,  // Re-enable to ensure imagery loads
       geocoder: false,
       homeButton: true,
       sceneModePicker: true,
@@ -31,31 +30,38 @@
       selectionIndicator: true,
     });
 
-    // Ensure we start in 3D mode
-    viewer.scene.mode = Cesium.SceneMode.SCENE3D;
+    // Ensure globe is visible
+    viewer.scene.globe.show = true;
+    viewer.scene.skyBox.show = true;
+    viewer.scene.sun.show = true;
+    viewer.scene.moon.show = false;
 
-    // Set initial camera position (Chicago) - use setView for immediate positioning
+    console.log('[globe] Viewer created, globe.show:', viewer.scene.globe.show);
+
+    // Set initial camera position to look at Earth from above Chicago
     viewer.camera.setView({
-      destination: Cesium.Cartesian3.fromDegrees(-87.6298, 41.8781, 500000),
+      destination: Cesium.Cartesian3.fromDegrees(-87.6298, 41.8781, 10000000), // Start far out
       orientation: {
-        heading: Cesium.Math.toRadians(0),
-        pitch: Cesium.Math.toRadians(-90),
-        roll: 0.0
+        heading: 0,
+        pitch: -Cesium.Math.PI_OVER_TWO, // Look straight down
+        roll: 0
       }
     });
 
-    // Then fly to closer view
+    console.log('[globe] Camera positioned, distance:', Cesium.Cartesian3.magnitude(viewer.camera.position));
+
+    // Fly closer after a short delay
     setTimeout(() => {
       viewer.camera.flyTo({
         destination: Cesium.Cartesian3.fromDegrees(-87.6298, 41.8781, 50000),
         orientation: {
-          heading: Cesium.Math.toRadians(0),
+          heading: 0,
           pitch: Cesium.Math.toRadians(-45),
-          roll: 0.0
+          roll: 0
         },
-        duration: 2
+        duration: 3
       });
-    }, 100);
+    }, 500);
 
     // Enable depth testing for better 3D visualization
     viewer.scene.globe.depthTestAgainstTerrain = true;

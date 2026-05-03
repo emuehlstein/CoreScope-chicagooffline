@@ -39,6 +39,7 @@
   <link rel="stylesheet" href="style.css?v=__BUST__">
   <link rel="stylesheet" href="home.css?v=__BUST__">
   <link rel="stylesheet" href="live.css?v=__BUST__">
+  <link rel="stylesheet" href="globe.css?v=__BUST__">
   <!-- Chicago Offline brand theme — overrides upstream palette vars -->
   <link rel="stylesheet" href="chicagooffline-theme.css?v=__BUST__">
   <!-- Chicago Offline map layer catalog — must load before map.js / live.js -->
@@ -69,6 +70,7 @@
         <a href="#/nodes" class="nav-link" data-route="nodes" data-priority="high">Nodes</a>
         <a href="#/packets" class="nav-link" data-route="packets" data-priority="high">Packets</a>
         <a href="#/observers" class="nav-link" data-route="observers">Observers</a>
+        <a href="#/globe" class="nav-link" data-route="globe">Globe</a>
         <a href="#/traces" class="nav-link">Traces</a>
         <a href="#/analytics" class="nav-link">Analytics</a>
         <a href="#/perf" class="nav-link">Perf</a>
@@ -142,6 +144,10 @@
   <script src="audio-lab.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="drag-manager.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="live.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
+  <!-- Cesium for 3D Globe view -->
+  <link rel="stylesheet" href="https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Widgets/widgets.css">
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Cesium.js"></script>
+  <script src="globe.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="observers.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="observer-detail.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="compare.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>

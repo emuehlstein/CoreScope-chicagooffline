@@ -643,7 +643,7 @@ function navigate() {
 
   const app = document.getElementById('app');
   // Pages with fixed-height containers (maps, virtual-scroll, split-panels)
-  const fixedPages = { packets: 1, nodes: 1, map: 1, live: 1, channels: 1, 'audio-lab': 1 };
+  const fixedPages = { packets: 1, nodes: 1, map: 1, live: 1, channels: 1, 'audio-lab': 1, globe: 1 };
   app.classList.toggle('app-fixed', basePage in fixedPages);
   if (pages[basePage]?.init) {
     const t0 = performance.now();

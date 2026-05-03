@@ -1,0 +1,108 @@
+/**
+ * globe.css — Styles for 3D Globe view
+ */
+
+#globeContainer {
+  width: 100%;
+  height: calc(100vh - var(--top-nav-h, 52px));
+  position: relative;
+  background: var(--surface-0);
+}
+
+/* Override Cesium defaults for theme consistency */
+.cesium-viewer {
+  font-family: var(--font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+}
+
+.cesium-viewer-toolbar {
+  background: var(--surface-1);
+  border-radius: 4px;
+}
+
+.cesium-button {
+  background-color: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  transition: background-color 0.15s;
+}
+
+.cesium-button:hover {
+  background-color: var(--surface-3);
+}
+
+.cesium-button:active {
+  background-color: var(--accent);
+  color: white;
+}
+
+/* Info box styling */
+.cesium-infoBox {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+}
+
+.cesium-infoBox-title {
+  background: var(--surface-2);
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Selection indicator */
+.cesium-selection-wrapper {
+  border-color: var(--accent);
+}
+
+/* Loading indicator */
+.globe-loading {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--surface-1);
+  color: var(--text);
+  padding: 20px 40px;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  z-index: 1000;
+}
+
+/* Stats overlay */
+.globe-stats {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  background: var(--surface-1);
+  color: var(--text);
+  padding: 12px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  font-size: 0.875rem;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  z-index: 100;
+}
+
+.globe-stats-label {
+  color: var(--text-muted);
+  margin-right: 8px;
+}
+
+.globe-stats-value {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* Mobile responsiveness */
+@media (max-width: 640px) {
+  .cesium-viewer-toolbar {
+    right: 5px;
+    top: 5px;
+  }
+  
+  .globe-stats {
+    font-size: 0.75rem;
+    padding: 8px 12px;
+  }
+}

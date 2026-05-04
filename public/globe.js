@@ -40,25 +40,25 @@
     console.log('[globe] Viewer created, globe.show:', viewer.scene.globe.show);
 
     // Set initial camera position over Lake Michigan looking west at Chicago
-    // Start far out for context
+    // Further east over the lake, lower altitude, more horizontal view
     viewer.camera.setView({
-      destination: Cesium.Cartesian3.fromDegrees(-87.4, 41.88, 8000000), // Over the lake
+      destination: Cesium.Cartesian3.fromDegrees(-86.9, 41.88, 5000000), // Further east over lake
       orientation: {
-        heading: Cesium.Math.toRadians(270), // Point west
-        pitch: Cesium.Math.toRadians(-60), // Oblique angle
+        heading: Cesium.Math.toRadians(270), // Point west toward Chicago
+        pitch: Cesium.Math.toRadians(-50), // Less steep initial angle
         roll: 0
       }
     });
 
-    console.log('[globe] Camera positioned over Lake Michigan, distance:', Cesium.Cartesian3.magnitude(viewer.camera.position));
+    console.log('[globe] Camera positioned over Lake Michigan (further east), distance:', Cesium.Cartesian3.magnitude(viewer.camera.position));
 
-    // Fly closer after a short delay for dramatic effect
+    // Fly to lower, more horizontal view
     setTimeout(() => {
       viewer.camera.flyTo({
-        destination: Cesium.Cartesian3.fromDegrees(-87.4, 41.88, 35000), // Closer view
+        destination: Cesium.Cartesian3.fromDegrees(-86.9, 41.88, 18000), // Lower altitude (18km)
         orientation: {
           heading: Cesium.Math.toRadians(270), // Looking west at Chicago
-          pitch: Cesium.Math.toRadians(-35), // Oblique viewing angle
+          pitch: Cesium.Math.toRadians(-20), // More horizontal viewing angle
           roll: 0
         },
         duration: 3

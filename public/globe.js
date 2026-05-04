@@ -79,26 +79,9 @@
       });
     }, 500);
 
-    // Add hillshade overlay
-    try {
-      const hillshadeProvider = new Cesium.UrlTemplateImageryProvider({
-        url: 'https://tiles.chicagooffline.com/services/cook-hillshade-combined-dark-9x/tiles/{z}/{x}/{y}.png',
-        maximumLevel: 14,
-        credit: '© Chicago Offline — 3DEP+LiDAR Hillshade',
-        tilingScheme: new Cesium.WebMercatorTilingScheme()
-      });
-      
-      await hillshadeProvider.readyPromise;
-      const hillshadeLayer = viewer.imageryLayers.addImageryProvider(hillshadeProvider);
-      hillshadeLayer.alpha = 1.0; // Full opacity for maximum visibility
-      hillshadeLayer.brightness = 2.0; // Significantly brighter
-      hillshadeLayer.contrast = 1.8; // Higher contrast for terrain definition
-      hillshadeLayer.show = true;
-      
-      console.log('[globe] Hillshade layer added');
-    } catch (err) {
-      console.error('[globe] Hillshade failed:', err);
-    }
+    // Hillshade overlay disabled for now - not rendering properly over satellite imagery
+    // TODO: Revisit with actual terrain elevation data instead of pre-rendered tiles
+    console.log('[globe] Terrain visualization disabled (hillshade tiles incompatible with Cesium Ion imagery)');
   }
 
   // Load nodes from API
@@ -438,7 +421,7 @@
     app.innerHTML = `
       <div id="globeContainer" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0;"></div>
       <div class="globe-stats" id="globeStats" style="position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 13px;">Loading...</div>
-      <div class="globe-controls" id="globeControls" style="position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: sans-serif; font-size: 12px;">
+      <div class="globe-controls" id="globeControls" style="position: absolute; top: 10px; right: 70px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: sans-serif; font-size: 12px;">
         <label style="display: block; margin-bottom: 6px; cursor: pointer;">
           <input type="checkbox" id="globeRealisticToggle" style="margin-right: 6px;">
           Realistic propagation

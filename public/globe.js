@@ -12,6 +12,16 @@
   let wsHandler;
   let statsDiv;
   let pulseInterval;
+  
+  // VCR replay state
+  const VCR = {
+    mode: 'LIVE',        // LIVE | REPLAY
+    buffer: [],          // Fetched historical packets
+    playhead: 0,         // Current index in buffer
+    speed: 1,            // Replay speed: 1, 2, 4, 8
+    timer: null,         // Replay interval timer
+    isPlaying: false
+  };
 
   // Initialize Cesium viewer
   async function initViewer(container) {
@@ -313,11 +323,139 @@
     }, 300);
   }
 
+  // VCR Functions
+  async function fetchHistoricalPackets() {
+    try {
+      const since = new Date(Date.now() - 3600000).toISOString(); // Last 1 hour
+      console.log('[globe] Fetching historical packets since', since);
+      const response = await fetch(`/api/packets?limit=1000&grouped=false&expand=observations&since=${encodeURIComponent(since)}&order=asc`);
+      const data = await response.json();
+      const packets = data.packets || [];
+      
+      VCR.buffer = packets.map(pkt => ({
+        ts: new Date(pkt.created_at || pkt.timestamp).getTime(),
+        packet: pkt
+      }));
+      
+      console.log(`[globe] Loaded ${VCR.buffer.length} historical packets`);
+      updateVCRUI();
+    } catch (err) {
+      console.error('[globe] Failed to fetch historical packets:', err);
+    }
+  }
+
+  function startReplay() {
+    if (VCR.buffer.length === 0) {
+      console.log('[globe] No packets in buffer, fetching...');
+      fetchHistoricalPackets();
+      return;
+    }
+    
+    VCR.mode = 'REPLAY';
+    VCR.isPlaying = true;
+    VCR.playhead = 0;
+    updateVCRUI();
+    replayStep();
+  }
+
+  function stopReplay() {
+    VCR.isPlaying = false;
+    if (VCR.timer) {
+      clearTimeout(VCR.timer);
+      VCR.timer = null;
+    }
+    updateVCRUI();
+  }
+
+  function replayStep() {
+    if (!VCR.isPlaying || VCR.playhead >= VCR.buffer.length) {
+      // End of buffer
+      VCR.mode = 'LIVE';
+      VCR.isPlaying = false;
+      VCR.playhead = 0;
+      updateVCRUI();
+      console.log('[globe] Replay complete');
+      return;
+    }
+    
+    const entry = VCR.buffer[VCR.playhead];
+    const pkt = entry.packet;
+    
+    // Pulse nodes for this packet
+    if (pkt.from) pulseNode(pkt.from);
+    if (pkt.to) pulseNode(pkt.to);
+    if (pkt.hops && pkt.hops.length > 0) {
+      pkt.hops.forEach(hop => {
+        if (hop.node) pulseNode(hop.node);
+      });
+    }
+    
+    VCR.playhead++;
+    updateVCRUI();
+    
+    // Calculate delay to next packet (realistic timing) or use fixed interval
+    let delay = 500 / VCR.speed; // Default 500ms between packets, adjusted by speed
+    
+    if (VCR.playhead < VCR.buffer.length) {
+      const nextEntry = VCR.buffer[VCR.playhead];
+      const realDelay = (nextEntry.ts - entry.ts) / VCR.speed;
+      if (realDelay > 0 && realDelay < 5000) { // Cap at 5s per step
+        delay = realDelay;
+      }
+    }
+    
+    VCR.timer = setTimeout(replayStep, delay);
+  }
+
+  function cycleSpeed() {
+    const speeds = [1, 2, 4, 8];
+    const idx = speeds.indexOf(VCR.speed);
+    VCR.speed = speeds[(idx + 1) % speeds.length];
+    updateVCRUI();
+  }
+
+  function updateVCRUI() {
+    const playBtn = document.getElementById('vcrPlay');
+    const pauseBtn = document.getElementById('vcrPause');
+    const speedBtn = document.getElementById('vcrSpeed');
+    const statusSpan = document.getElementById('vcrStatus');
+    const progressSpan = document.getElementById('vcrProgress');
+    
+    if (!playBtn || !pauseBtn || !speedBtn || !statusSpan || !progressSpan) return;
+    
+    if (VCR.isPlaying) {
+      playBtn.style.display = 'none';
+      pauseBtn.style.display = 'inline-block';
+      statusSpan.textContent = 'REPLAY';
+      statusSpan.style.color = '#FFB300';
+    } else {
+      playBtn.style.display = 'inline-block';
+      pauseBtn.style.display = 'none';
+      statusSpan.textContent = VCR.mode;
+      statusSpan.style.color = VCR.mode === 'LIVE' ? '#39FF14' : '#A0AABF';
+    }
+    
+    speedBtn.textContent = `${VCR.speed}x`;
+    
+    if (VCR.buffer.length > 0) {
+      progressSpan.textContent = `${VCR.playhead}/${VCR.buffer.length}`;
+    } else {
+      progressSpan.textContent = 'No packets loaded';
+    }
+  }
+
   // Initialize the page
   async function init(app, routeParam) {
     app.innerHTML = `
       <div id="globeContainer"></div>
       <div class="globe-stats" id="globeStats">Loading...</div>
+      <div class="globe-vcr" id="globeVCR" style="position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); color: white; padding: 12px 20px; border-radius: 8px; font-family: monospace; font-size: 14px; z-index: 1000; display: flex; gap: 12px; align-items: center;">
+        <button id="vcrPlay" style="background: #39FF14; color: #000; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-weight: bold;">▶ Play</button>
+        <button id="vcrPause" style="background: #FFB300; color: #000; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-weight: bold; display: none;">⏸ Pause</button>
+        <button id="vcrSpeed" style="background: #444; color: #fff; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer;">1x</button>
+        <span id="vcrStatus" style="color: #A0AABF;">LIVE</span>
+        <span id="vcrProgress" style="color: #00E5FF;"></span>
+      </div>
     `;
 
     const container = document.getElementById('globeContainer');
@@ -381,6 +519,14 @@
       registerWSHandler(wsHandler);
     }
     
+    // Wire up VCR controls
+    document.getElementById('vcrPlay').addEventListener('click', startReplay);
+    document.getElementById('vcrPause').addEventListener('click', stopReplay);
+    document.getElementById('vcrSpeed').addEventListener('click', cycleSpeed);
+    
+    // Fetch historical packets for replay
+    fetchHistoricalPackets();
+    
     // Periodic pulse animation on recent paths (visual heartbeat)
     pulseInterval = setInterval(() => {
       // Find paths from last 2 minutes and randomly pulse one
@@ -410,12 +556,20 @@
       clearInterval(pulseInterval);
       pulseInterval = null;
     }
+    if (VCR.timer) {
+      clearTimeout(VCR.timer);
+      VCR.timer = null;
+    }
     if (viewer) {
       viewer.destroy();
       viewer = null;
     }
     nodeEntities.clear();
+    nodeData.clear();
     packetPaths.clear();
+    VCR.buffer = [];
+    VCR.playhead = 0;
+    VCR.isPlaying = false;
     if (wsHandler && window.unregisterWSHandler) {
       unregisterWSHandler(wsHandler);
       wsHandler = null;

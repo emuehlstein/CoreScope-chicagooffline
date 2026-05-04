@@ -68,6 +68,23 @@
     // Enable depth testing for better 3D visualization
     viewer.scene.globe.depthTestAgainstTerrain = true;
 
+    // Add hillshade terrain layer from tiles.chicagooffline.com
+    try {
+      const hillshadeProvider = new Cesium.UrlTemplateImageryProvider({
+        url: 'https://tiles.chicagooffline.com/hillshade/{z}/{x}/{y}.png',
+        maximumLevel: 14,
+        credit: 'Hillshade tiles by Chicago Offline'
+      });
+      
+      const hillshadeLayer = viewer.imageryLayers.addImageryProvider(hillshadeProvider);
+      hillshadeLayer.alpha = 0.55; // 55% opacity (matches Leaflet map)
+      hillshadeLayer.brightness = 1.0;
+      
+      console.log('[globe] Hillshade layer added from tiles.chicagooffline.com');
+    } catch (err) {
+      console.warn('[globe] Failed to load hillshade layer:', err);
+    }
+
     console.log('[globe] Cesium viewer initialized');
   }
 

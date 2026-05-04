@@ -17,9 +17,9 @@
     // Cesium Ion access token
     Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJhZjMzYTczNS03YTlkLTRkOWItYjI1Zi02YjJhNjBmNjYxNjgiLCJpZCI6NDI2ODYzLCJpc3MiOiJodHRwczovL2lvbi5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3Nzc4NDY5NDl9.-m7FPQsB4syRZQn6mt2WZ7jffejFyk1twYRTBFe-7BA';
 
-    // Create viewer with OSM basemap for better hillshade visibility
+    // Create viewer with Cesium Ion imagery and base layer picker
     viewer = new Cesium.Viewer(container, {
-      baseLayerPicker: false,
+      baseLayerPicker: true,  // Enable layer picker for Cesium Ion basemaps
       geocoder: false,
       homeButton: true,
       sceneModePicker: true,
@@ -28,11 +28,7 @@
       timeline: false,
       fullscreenButton: true,
       infoBox: true,
-      selectionIndicator: true,
-      imageryProvider: Cesium.createOpenStreetMapImageryProvider({
-        url: 'https://tile.openstreetmap.org/',
-        credit: '© OpenStreetMap contributors'
-      })
+      selectionIndicator: true
     });
 
     // Ensure globe is visible

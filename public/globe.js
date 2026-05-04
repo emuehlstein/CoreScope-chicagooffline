@@ -45,8 +45,18 @@
       timeline: false,
       fullscreenButton: true,
       infoBox: true,
-      selectionIndicator: true
+      selectionIndicator: true,
+      // Ensure camera controls are enabled
+      scene3DOnly: false,
+      shouldAnimate: false
     });
+
+    // Explicitly enable camera controls
+    viewer.scene.screenSpaceCameraController.enableRotate = true;
+    viewer.scene.screenSpaceCameraController.enableZoom = true;
+    viewer.scene.screenSpaceCameraController.enableTranslate = true;
+    viewer.scene.screenSpaceCameraController.enableTilt = true;
+    viewer.scene.screenSpaceCameraController.enableLook = true;
 
     viewer.scene.globe.show = true;
     viewer.scene.skyBox.show = true;
@@ -419,7 +429,7 @@
   // Initialize
   async function init(app, routeParam) {
     app.innerHTML = `
-      <div id="globeContainer" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0;">
+      <div id="globeContainer" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 0;">
         <style>
           /* Push Cesium widgets below navbar */
           .cesium-viewer .cesium-viewer-toolbar,

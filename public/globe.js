@@ -8,6 +8,7 @@
 (function() {
   let viewer;
   let nodeEntities = new Map();
+  let nodeData = new Map(); // Store node info by public_key
   let wsHandler;
   let statsDiv;
   let pulseInterval;
@@ -144,6 +145,12 @@
       nodes.forEach((node, index) => {
         if (node.lat && node.lon) {
           addNodeToGlobe(node);
+          // Store node data for pulse lookups
+          nodeData.set(node.public_key || node.id, {
+            lat: node.lat,
+            lon: node.lon,
+            name: node.name
+          });
           plotted++;
           if (index < 5) {
             console.log(`  [${index}] ✓ ${node.name || node.id} at ${node.lat}, ${node.lon}`);
@@ -282,6 +289,30 @@
     }
   }
 
+  // Pulse a node when a packet involves it
+  function pulseNode(publicKey) {
+    const entity = nodeEntities.get(publicKey);
+    if (!entity) {
+      // Node not on globe yet, skip pulse
+      return;
+    }
+    
+    const originalSize = 8;
+    const pulseSize = 16;
+    const originalColor = Cesium.Color.fromCssColorString('#39FF14'); // Mesh Green
+    const pulseColor = Cesium.Color.fromCssColorString('#FFB300'); // Beacon Amber
+    
+    // Pulse effect: grow and change color
+    entity.point.pixelSize = pulseSize;
+    entity.point.color = pulseColor;
+    
+    // Return to normal after 300ms
+    setTimeout(() => {
+      entity.point.pixelSize = originalSize;
+      entity.point.color = originalColor;
+    }, 300);
+  }
+
   // Initialize the page
   async function init(app, routeParam) {
     app.innerHTML = `
@@ -325,12 +356,24 @@
       if (msg.type === 'node' && msg.node) {
         updateNode(msg.node);
       } else if (msg.type === 'packet' && msg.packet) {
-        // Log packet (no rendering yet)
-        console.log('[globe] Packet received:', {
-          from: msg.packet.from,
-          to: msg.packet.to,
-          hops: msg.packet.hops?.length || 0,
-          hash: msg.packet.hash
+        // Pulse nodes on packet arrival
+        const { from, to, hops } = msg.packet;
+        
+        // Pulse source node
+        if (from) pulseNode(from);
+        
+        // Pulse destination node
+        if (to) pulseNode(to);
+        
+        // Pulse intermediate hops
+        if (hops && hops.length > 0) {
+          hops.forEach(hop => {
+            if (hop.node) pulseNode(hop.node);
+          });
+        }
+        
+        console.log('[globe] Packet pulses:', {
+          from, to, hops: hops?.length || 0
         });
       }
     };

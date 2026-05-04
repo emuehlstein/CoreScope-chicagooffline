@@ -90,9 +90,9 @@
       
       await hillshadeProvider.readyPromise;
       const hillshadeLayer = viewer.imageryLayers.addImageryProvider(hillshadeProvider);
-      hillshadeLayer.alpha = 0.6;
-      hillshadeLayer.brightness = 1.0;
-      hillshadeLayer.contrast = 1.3;
+      hillshadeLayer.alpha = 1.0; // Full opacity for maximum visibility
+      hillshadeLayer.brightness = 2.0; // Significantly brighter
+      hillshadeLayer.contrast = 1.8; // Higher contrast for terrain definition
       hillshadeLayer.show = true;
       
       console.log('[globe] Hillshade layer added');

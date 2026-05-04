@@ -72,7 +72,7 @@
     const position = Cesium.Cartesian3.fromDegrees(node.lon, node.lat, 0);
     
     // Color based on activity (green = recent, amber = old, grey = inactive)
-    const lastSeen = node.lastSeenAt ? new Date(node.lastSeenAt) : null;
+    const lastSeen = node.last_seen ? new Date(node.last_seen) : null;
     const ageMinutes = lastSeen ? (Date.now() - lastSeen.getTime()) / 60000 : Infinity;
     
     let color;
@@ -85,7 +85,7 @@
     }
 
     const entity = viewer.entities.add({
-      id: `node-${node.id}`,
+      id: `node-${node.public_key}`,
       position: position,
       point: {
         pixelSize: 12,
@@ -95,7 +95,7 @@
         heightReference: Cesium.HeightReference.CLAMP_TO_GROUND
       },
       label: {
-        text: node.name || node.id,
+        text: node.name || node.public_key,
         font: '14px sans-serif',
         fillColor: Cesium.Color.WHITE,
         outlineColor: Cesium.Color.BLACK,
@@ -108,16 +108,16 @@
       },
       description: `
         <div style="font-family: sans-serif;">
-          <h3 style="margin: 0 0 10px 0;">${node.name || node.id}</h3>
-          <p style="margin: 5px 0;"><strong>ID:</strong> ${node.id}</p>
+          <h3 style="margin: 0 0 10px 0;">${node.name || node.public_key}</h3>
+          <p style="margin: 5px 0;"><strong>ID:</strong> ${node.public_key}</p>
           <p style="margin: 5px 0;"><strong>Location:</strong> ${node.lat.toFixed(6)}, ${node.lon.toFixed(6)}</p>
           <p style="margin: 5px 0;"><strong>Last Seen:</strong> ${lastSeen ? lastSeen.toLocaleString() : 'Never'}</p>
-          ${node.hardwareModel ? `<p style="margin: 5px 0;"><strong>Hardware:</strong> ${node.hardwareModel}</p>` : ''}
+          ${node.role ? `<p style="margin: 5px 0;"><strong>Role:</strong> ${node.role}</p>` : ''}
         </div>
       `
     });
 
-    nodeEntities.set(node.id, entity);
+    nodeEntities.set(node.public_key, entity);
   }
 
   // Update node stats display
@@ -142,7 +142,7 @@
   function updateNode(node) {
     if (!node.lat || !node.lon) return;
     
-    const existing = nodeEntities.get(node.id);
+    const existing = nodeEntities.get(node.public_key);
     if (existing) {
       // Update existing node (color based on recent activity)
       existing.point.color = Cesium.Color.fromCssColorString('#39FF14'); // Mesh Green

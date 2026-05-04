@@ -563,33 +563,36 @@
       registerWSHandler(wsHandler);
     }
     
-    // Wire up VCR controls
-    console.log('[globe] Wiring up VCR controls...');
-    const playBtn = document.getElementById('vcrPlay');
-    const pauseBtn = document.getElementById('vcrPause');
-    const speedBtn = document.getElementById('vcrSpeed');
-    
-    console.log('[globe] Button elements:', { playBtn, pauseBtn, speedBtn });
-    
-    if (!playBtn || !pauseBtn || !speedBtn) {
-      console.error('[globe] VCR button elements not found!');
-      return;
-    }
-    
-    playBtn.addEventListener('click', () => {
-      console.log('[globe] Play button clicked');
-      startReplay();
+    // Wire up VCR controls - must wait for DOM to be ready
+    requestAnimationFrame(() => {
+      console.log('[globe] Wiring up VCR controls...');
+      const playBtn = document.getElementById('vcrPlay');
+      const pauseBtn = document.getElementById('vcrPause');
+      const speedBtn = document.getElementById('vcrSpeed');
+      
+      console.log('[globe] Button elements:', { playBtn, pauseBtn, speedBtn });
+      
+      if (!playBtn || !pauseBtn || !speedBtn) {
+        console.error('[globe] VCR button elements not found!');
+        console.error('[globe] DOM innerHTML:', document.getElementById('globeVCR')?.outerHTML);
+        return;
+      }
+      
+      playBtn.addEventListener('click', () => {
+        console.log('[globe] Play button clicked');
+        startReplay();
+      });
+      pauseBtn.addEventListener('click', () => {
+        console.log('[globe] Pause button clicked');
+        stopReplay();
+      });
+      speedBtn.addEventListener('click', () => {
+        console.log('[globe] Speed button clicked');
+        cycleSpeed();
+      });
+      
+      console.log('[globe] VCR event listeners attached');
     });
-    pauseBtn.addEventListener('click', () => {
-      console.log('[globe] Pause button clicked');
-      stopReplay();
-    });
-    speedBtn.addEventListener('click', () => {
-      console.log('[globe] Speed button clicked');
-      cycleSpeed();
-    });
-    
-    console.log('[globe] VCR event listeners attached');
     
     // Fetch historical packets for replay
     fetchHistoricalPackets();

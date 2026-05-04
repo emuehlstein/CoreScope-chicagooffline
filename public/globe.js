@@ -190,7 +190,7 @@
       const position = Cesium.Cartesian3.fromDegrees(node.lon, node.lat, 0); // At ground level
       
       // Color based on activity (green = recent, amber = old, grey = inactive)
-      const lastSeen = node.lastSeenAt ? new Date(node.lastSeenAt) : null;
+      const lastSeen = node.last_seen ? new Date(node.last_seen) : null;
       const ageMinutes = lastSeen ? (Date.now() - lastSeen.getTime()) / 60000 : Infinity;
       
       let color;
@@ -204,7 +204,7 @@
 
       // Simple, highly visible point marker
       const entity = viewer.entities.add({
-        id: `node-${node.id}`,
+        id: `node-${node.public_key}`,
         position: position,
         point: {
           pixelSize: 24, // Large visible point
@@ -214,7 +214,7 @@
           scaleByDistance: new Cesium.NearFarScalar(1000, 2.0, 100000, 0.5) // Scale based on distance
         },
         label: {
-          text: node.name || node.id,
+          text: node.name || node.public_key,
           font: 'bold 18px sans-serif',
           fillColor: Cesium.Color.WHITE,
           outlineColor: Cesium.Color.BLACK,
@@ -227,20 +227,19 @@
         },
         description: `
           <div style="font-family: sans-serif;">
-            <h3 style="margin: 0 0 10px 0;">${node.name || node.id}</h3>
-            <p style="margin: 5px 0;"><strong>ID:</strong> ${node.id}</p>
+            <h3 style="margin: 0 0 10px 0;">${node.name || node.public_key}</h3>
+            <p style="margin: 5px 0;"><strong>ID:</strong> ${node.public_key}</p>
             <p style="margin: 5px 0;"><strong>Location:</strong> ${node.lat.toFixed(6)}, ${node.lon.toFixed(6)}</p>
             <p style="margin: 5px 0;"><strong>Last Seen:</strong> ${lastSeen ? lastSeen.toLocaleString() : 'Never'}</p>
-            ${node.hardwareModel ? `<p style="margin: 5px 0;"><strong>Hardware:</strong> ${node.hardwareModel}</p>` : ''}
             ${node.role ? `<p style="margin: 5px 0;"><strong>Role:</strong> ${node.role}</p>` : ''}
           </div>
         `
       });
 
-      nodeEntities.set(node.id, entity);
-      console.log(`[globe] ✓ Added node: ${node.name || node.id} at ${node.lat}, ${node.lon}`);
+      nodeEntities.set(node.public_key, entity);
+      console.log(`[globe] ✓ Added node: ${node.name || node.public_key} at ${node.lat}, ${node.lon}`);
     } catch (err) {
-      console.error(`[globe] ✗ Failed to add node ${node.id}:`, err);
+      console.error(`[globe] ✗ Failed to add node ${node.public_key}:`, err);
     }
   }
 
@@ -270,7 +269,7 @@
   function updateNode(node) {
     if (!node.lat || !node.lon) return;
     
-    const existing = nodeEntities.get(node.id);
+    const existing = nodeEntities.get(node.public_key);
     if (existing) {
       // Update existing node (color based on recent activity)
       existing.point.color = Cesium.Color.fromCssColorString('#39FF14'); // Mesh Green

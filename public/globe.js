@@ -56,15 +56,28 @@
 
     console.log('[globe] Viewer created');
 
-    // Camera over Chicago
+    // Set initial camera position over Lake Michigan looking west at Chicago
     viewer.camera.setView({
-      destination: Cesium.Cartesian3.fromDegrees(-87.65, 41.88, 500000),
+      destination: Cesium.Cartesian3.fromDegrees(-86.9, 41.88, 5000000), // Over the lake
       orientation: {
-        heading: 0,
-        pitch: Cesium.Math.toRadians(-45),
+        heading: Cesium.Math.toRadians(270), // Point west toward Chicago
+        pitch: Cesium.Math.toRadians(-50), // Angled view
         roll: 0
       }
     });
+
+    // Fly to lower, more horizontal view
+    setTimeout(() => {
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(-86.9, 41.88, 18000), // Lower altitude (18km)
+        orientation: {
+          heading: Cesium.Math.toRadians(270), // Looking west at Chicago
+          pitch: Cesium.Math.toRadians(-20), // More horizontal viewing angle
+          roll: 0
+        },
+        duration: 3
+      });
+    }, 500);
 
     // Add hillshade overlay
     try {

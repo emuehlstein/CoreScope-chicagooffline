@@ -345,17 +345,30 @@
   }
 
   function startReplay() {
+    console.log('[globe] startReplay() called, buffer length:', VCR.buffer.length);
+    
     if (VCR.buffer.length === 0) {
       console.log('[globe] No packets in buffer, fetching...');
-      fetchHistoricalPackets();
+      fetchHistoricalPackets().then(() => {
+        console.log('[globe] Fetch complete, restarting replay...');
+        if (VCR.buffer.length > 0) {
+          startReplay();
+        }
+      });
       return;
     }
     
+    console.log('[globe] Starting replay with', VCR.buffer.length, 'packets');
     VCR.mode = 'REPLAY';
     VCR.isPlaying = true;
     VCR.playhead = 0;
     updateVCRUI();
-    replayStep();
+    
+    try {
+      replayStep();
+    } catch (err) {
+      console.error('[globe] Replay error:', err);
+    }
   }
 
   function stopReplay() {
@@ -551,9 +564,18 @@
     }
     
     // Wire up VCR controls
-    document.getElementById('vcrPlay').addEventListener('click', startReplay);
-    document.getElementById('vcrPause').addEventListener('click', stopReplay);
-    document.getElementById('vcrSpeed').addEventListener('click', cycleSpeed);
+    document.getElementById('vcrPlay').addEventListener('click', () => {
+      console.log('[globe] Play button clicked');
+      startReplay();
+    });
+    document.getElementById('vcrPause').addEventListener('click', () => {
+      console.log('[globe] Pause button clicked');
+      stopReplay();
+    });
+    document.getElementById('vcrSpeed').addEventListener('click', () => {
+      console.log('[globe] Speed button clicked');
+      cycleSpeed();
+    });
     
     // Fetch historical packets for replay
     fetchHistoricalPackets();

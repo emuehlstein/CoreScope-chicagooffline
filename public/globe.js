@@ -17,7 +17,7 @@
     // Cesium Ion access token
     Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJhZjMzYTczNS03YTlkLTRkOWItYjI1Zi02YjJhNjBmNjYxNjgiLCJpZCI6NDI2ODYzLCJpc3MiOiJodHRwczovL2lvbi5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3Nzc4NDY5NDl9.-m7FPQsB4syRZQn6mt2WZ7jffejFyk1twYRTBFe-7BA';
 
-    // Create viewer with Cesium Ion imagery (Bing Maps satellite)
+    // Create viewer with Carto Light basemap for better hillshade visibility
     viewer = new Cesium.Viewer(container, {
       baseLayerPicker: false,
       geocoder: false,
@@ -29,6 +29,11 @@
       fullscreenButton: true,
       infoBox: true,
       selectionIndicator: true,
+      imageryProvider: new Cesium.UrlTemplateImageryProvider({
+        url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+        subdomains: ['a', 'b', 'c', 'd'],
+        credit: '© OpenStreetMap contributors, © CARTO'
+      })
     });
 
     // Ensure globe is visible
@@ -89,8 +94,9 @@
       });
       
       const hillshadeLayer = viewer.imageryLayers.addImageryProvider(hillshadeProvider);
-      hillshadeLayer.alpha = 1.0; // Full opacity for testing
-      hillshadeLayer.brightness = 1.5; // High brightness for visibility
+      hillshadeLayer.alpha = 0.6; // Semi-transparent for blending with base map
+      hillshadeLayer.brightness = 1.0; // Normal brightness
+      hillshadeLayer.contrast = 1.3; // Increase contrast for visibility
       hillshadeLayer.show = true;
       
       console.log('[globe] ✓ Hillshade layer added:', {

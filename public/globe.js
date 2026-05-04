@@ -69,26 +69,27 @@
     viewer.scene.globe.depthTestAgainstTerrain = true;
 
     // Add hillshade terrain layer from tiles.chicagooffline.com
-    // Theme-aware: use dark hillshade by default (matches most satellite imagery)
+    // Use dark hillshade (better contrast on satellite imagery)
     try {
-      const isDark = document.documentElement.classList.contains('theme-dark');
-      const hillshadeUrl = isDark 
-        ? 'https://tiles.chicagooffline.com/services/cook-hillshade-combined-dark-9x/tiles/{z}/{x}/{y}.png'
-        : 'https://tiles.chicagooffline.com/services/cook-hillshade-combined-light-9x/tiles/{z}/{x}/{y}.png';
-      
       const hillshadeProvider = new Cesium.UrlTemplateImageryProvider({
-        url: hillshadeUrl,
+        url: 'https://tiles.chicagooffline.com/services/cook-hillshade-combined-dark-9x/tiles/{z}/{x}/{y}.png',
         maximumLevel: 14,
-        credit: '© Chicago Offline — 3DEP+LiDAR Hillshade'
+        credit: '© Chicago Offline — 3DEP+LiDAR Hillshade',
+        tilingScheme: new Cesium.WebMercatorTilingScheme()
       });
       
       const hillshadeLayer = viewer.imageryLayers.addImageryProvider(hillshadeProvider);
-      hillshadeLayer.alpha = 0.55; // 55% opacity (matches Leaflet map)
-      hillshadeLayer.brightness = 1.0;
+      hillshadeLayer.alpha = 0.8; // Increased to 80% for better visibility
+      hillshadeLayer.brightness = 1.2; // Boost brightness slightly
       
-      console.log(`[globe] Hillshade layer added: ${isDark ? 'dark' : 'light'} theme`);
+      console.log('[globe] Hillshade layer added:', {
+        url: hillshadeProvider.url,
+        alpha: hillshadeLayer.alpha,
+        layerIndex: viewer.imageryLayers.indexOf(hillshadeLayer),
+        totalLayers: viewer.imageryLayers.length
+      });
     } catch (err) {
-      console.warn('[globe] Failed to load hillshade layer:', err);
+      console.error('[globe] Failed to load hillshade layer:', err);
     }
 
     console.log('[globe] Cesium viewer initialized');

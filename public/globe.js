@@ -431,14 +431,14 @@
           }
         </style>
       </div>
-      <div class="globe-stats" id="globeStats" style="position: absolute; top: 70px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; z-index: 1000;">Loading...</div>
-      <div class="globe-controls" id="globeControls" style="position: absolute; top: 70px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: sans-serif; font-size: 12px; z-index: 1000;">
+      <div class="globe-stats" id="globeStats" style="position: absolute; top: 70px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; z-index: 1000; pointer-events: none;">Loading...</div>
+      <div class="globe-controls" id="globeControls" style="position: absolute; top: 70px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: sans-serif; font-size: 12px; z-index: 1000; pointer-events: auto;">
         <label style="display: block; margin-bottom: 6px; cursor: pointer;">
-          <input type="checkbox" id="globeRealisticToggle" style="margin-right: 6px;">
+          <input type="checkbox" id="globeRealisticToggle" style="margin-right: 6px; pointer-events: auto;">
           Realistic propagation
         </label>
         <label style="display: block; cursor: pointer;">
-          <input type="checkbox" id="globeColorHashToggle" style="margin-right: 6px;">
+          <input type="checkbox" id="globeColorHashToggle" style="margin-right: 6px; pointer-events: auto;">
           Color by hash
         </label>
       </div>

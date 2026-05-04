@@ -1,5 +1,5 @@
 /**
- * globe.js — 3D Globe view for MeshCore network
+ * globe.js — 3D Globe view for MeshCore network with live packet animations
  * Uses Cesium for 3D visualization of nodes and packet paths
  */
 
@@ -8,18 +8,35 @@
 (function() {
   let viewer;
   let nodeEntities = new Map();
+  let nodeData = new Map(); // pubkey -> {name, lat, lon, role}
   let wsHandler;
   let statsDiv;
   let pulseInterval;
+  let packetPaths = new Map();
+  let activeAnimations = 0;
+  const MAX_CONCURRENT_ANIMATIONS = 50;
+  let packetCount = 0;
+  let realisticPropagation = localStorage.getItem('globe-realistic-propagation') === 'true';
+  let colorByHash = localStorage.getItem('meshcore-color-packets-by-hash') !== 'false';
+  const propagationBuffer = new Map(); // hash -> {timer, packets[]}
+  const PROPAGATION_BUFFER_MS = 800;
+
+  // Packet type colors (from live.js)
+  const TYPE_COLORS = {
+    ADVERT: '#10b981',
+    TRACE: '#3b82f6',
+    MESSAGE: '#8b5cf6',
+    ACK: '#22d3ee',
+    DISC: '#f59e0b',
+    UNKNOWN: '#6b7280'
+  };
 
   // Initialize Cesium viewer
   async function initViewer(container) {
-    // Cesium Ion access token
     Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJhZjMzYTczNS03YTlkLTRkOWItYjI1Zi02YjJhNjBmNjYxNjgiLCJpZCI6NDI2ODYzLCJpc3MiOiJodHRwczovL2lvbi5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3Nzc4NDY5NDl9.-m7FPQsB4syRZQn6mt2WZ7jffejFyk1twYRTBFe-7BA';
 
-    // Create viewer with Cesium Ion imagery and base layer picker
     viewer = new Cesium.Viewer(container, {
-      baseLayerPicker: true,  // Enable layer picker for Cesium Ion basemaps
+      baseLayerPicker: true,
       geocoder: false,
       homeButton: true,
       sceneModePicker: true,
@@ -31,46 +48,25 @@
       selectionIndicator: true
     });
 
-    // Ensure globe is visible
     viewer.scene.globe.show = true;
     viewer.scene.skyBox.show = true;
     viewer.scene.sun.show = true;
     viewer.scene.moon.show = false;
+    viewer.scene.globe.depthTestAgainstTerrain = true;
 
-    console.log('[globe] Viewer created, globe.show:', viewer.scene.globe.show);
+    console.log('[globe] Viewer created');
 
-    // Set initial camera position over Lake Michigan looking west at Chicago
-    // Further east over the lake, lower altitude, more horizontal view
+    // Camera over Chicago
     viewer.camera.setView({
-      destination: Cesium.Cartesian3.fromDegrees(-86.9, 41.88, 5000000), // Further east over lake
+      destination: Cesium.Cartesian3.fromDegrees(-87.65, 41.88, 500000),
       orientation: {
-        heading: Cesium.Math.toRadians(270), // Point west toward Chicago
-        pitch: Cesium.Math.toRadians(-50), // Less steep initial angle
+        heading: 0,
+        pitch: Cesium.Math.toRadians(-45),
         roll: 0
       }
     });
 
-    console.log('[globe] Camera positioned over Lake Michigan (further east), distance:', Cesium.Cartesian3.magnitude(viewer.camera.position));
-
-    // Fly to lower, more horizontal view
-    setTimeout(() => {
-      viewer.camera.flyTo({
-        destination: Cesium.Cartesian3.fromDegrees(-86.9, 41.88, 18000), // Lower altitude (18km)
-        orientation: {
-          heading: Cesium.Math.toRadians(270), // Looking west at Chicago
-          pitch: Cesium.Math.toRadians(-20), // More horizontal viewing angle
-          roll: 0
-        },
-        duration: 3
-      });
-    }, 500);
-
-    // Enable depth testing for better 3D visualization
-    viewer.scene.globe.depthTestAgainstTerrain = true;
-
-    // Add hillshade terrain layer from tiles.chicagooffline.com
-    // Use dark hillshade (better contrast on satellite imagery)
-    console.log('[globe] Attempting to add hillshade layer...');
+    // Add hillshade overlay
     try {
       const hillshadeProvider = new Cesium.UrlTemplateImageryProvider({
         url: 'https://tiles.chicagooffline.com/services/cook-hillshade-combined-dark-9x/tiles/{z}/{x}/{y}.png',
@@ -79,295 +75,433 @@
         tilingScheme: new Cesium.WebMercatorTilingScheme()
       });
       
-      // Wait for provider to be ready
       await hillshadeProvider.readyPromise;
-      console.log('[globe] Hillshade provider ready:', {
-        ready: hillshadeProvider.ready,
-        rectangle: hillshadeProvider.rectangle,
-        tileWidth: hillshadeProvider.tileWidth,
-        tileHeight: hillshadeProvider.tileHeight
-      });
-      
       const hillshadeLayer = viewer.imageryLayers.addImageryProvider(hillshadeProvider);
-      hillshadeLayer.alpha = 0.6; // Semi-transparent for blending with base map
-      hillshadeLayer.brightness = 1.0; // Normal brightness
-      hillshadeLayer.contrast = 1.3; // Increase contrast for visibility
+      hillshadeLayer.alpha = 0.6;
+      hillshadeLayer.brightness = 1.0;
+      hillshadeLayer.contrast = 1.3;
       hillshadeLayer.show = true;
       
-      console.log('[globe] ✓ Hillshade layer added:', {
-        url: hillshadeProvider.url,
-        alpha: hillshadeLayer.alpha,
-        brightness: hillshadeLayer.brightness,
-        show: hillshadeLayer.show,
-        layerIndex: viewer.imageryLayers.indexOf(hillshadeLayer),
-        totalLayers: viewer.imageryLayers.length
-      });
-      
-      // Log tile requests
-      hillshadeProvider.errorEvent.addEventListener((error) => {
-        console.error('[globe] Hillshade tile error:', error);
-      });
-      
+      console.log('[globe] Hillshade layer added');
     } catch (err) {
-      console.error('[globe] ✗ Failed to load hillshade layer:', err);
-      console.error('[globe] Error details:', err.message, err.stack);
+      console.error('[globe] Hillshade failed:', err);
     }
-
-    console.log('[globe] Cesium viewer initialized');
   }
 
-  // Fetch and display nodes
+  // Load nodes from API
   async function loadNodes() {
     try {
-      console.log('[globe] Fetching nodes from /api/nodes...');
       const response = await fetch('/api/nodes');
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       
       const data = await response.json();
-      console.log('[globe] Raw API response type:', Array.isArray(data) ? 'array' : 'object');
-      console.log('[globe] Raw API response keys:', Object.keys(data));
-      
-      // Handle both array and object responses
       const nodes = Array.isArray(data) ? data : (data.nodes || []);
       
-      if (!Array.isArray(nodes)) {
-        throw new Error(`Expected nodes array, got ${typeof nodes}`);
-      }
+      console.log(`[globe] Loading ${nodes.length} nodes`);
       
-      console.log(`[globe] Processing ${nodes.length} nodes...`);
-      
-      let plotted = 0;
-      let skipped = 0;
-      nodes.forEach((node, index) => {
-        if (node.lat && node.lon) {
+      nodes.forEach(node => {
+        if (node.lat && node.lon && node.public_key) {
+          nodeData.set(node.public_key, {
+            name: node.name || node.public_key.slice(0, 8),
+            lat: node.lat,
+            lon: node.lon,
+            role: node.role || 'unknown',
+            last_seen: node.last_seen
+          });
           addNodeToGlobe(node);
-          plotted++;
-          if (index < 5) {
-            console.log(`  [${index}] ✓ ${node.name || node.id} at ${node.lat}, ${node.lon}`);
-          }
-        } else {
-          skipped++;
-          if (index < 5 || skipped < 3) {
-            console.warn(`  [${index}] ✗ ${node.name || node.id} - no coordinates`);
-          }
         }
       });
       
-      console.log(`[globe] ✓ Loaded ${plotted} nodes, ${skipped} skipped (no coords)`);
-      console.log(`[globe] Total entities in viewer: ${viewer.entities.values.length}`);
+      console.log(`[globe] Loaded ${nodeEntities.size} nodes`);
       updateStats();
     } catch (err) {
-      console.error('[globe] ✗ Failed to load nodes:', err);
-      console.error('[globe] Error stack:', err.stack);
+      console.error('[globe] Failed to load nodes:', err);
     }
   }
-  
-  // Add test markers to verify the globe is working
-  function addTestMarker() {
-    // Add several highly visible test nodes in Chicago area
-    const testNodes = [
-      { id: 'test-downtown', name: '🔴 TEST Downtown', lat: 41.8781, lon: -87.6298, lastSeenAt: new Date().toISOString() },
-      { id: 'test-northside', name: '🔴 TEST North', lat: 41.95, lon: -87.65, lastSeenAt: new Date().toISOString() },
-      { id: 'test-southside', name: '🔴 TEST South', lat: 41.80, lon: -87.60, lastSeenAt: new Date().toISOString() },
-      { id: 'test-west', name: '🔴 TEST West', lat: 41.88, lon: -87.75, lastSeenAt: new Date().toISOString() },
-      { id: 'test-evanston', name: '🔴 TEST Evanston', lat: 42.05, lon: -87.68, lastSeenAt: new Date().toISOString() }
-    ];
-    
-    console.log('[globe] Adding test markers at:');
-    testNodes.forEach(node => {
-      console.log(`  - ${node.name}: ${node.lat}, ${node.lon}`);
-      addNodeToGlobe(node);
-    });
-    updateStats();
-    console.log(`[globe] ✓ Added ${testNodes.length} test markers`);
-  }
 
-  // Add a node marker to the globe
+  // Add node marker
   function addNodeToGlobe(node) {
-    try {
-      const position = Cesium.Cartesian3.fromDegrees(node.lon, node.lat, 0); // At ground level
-      
-      // Color based on activity (green = recent, amber = old, grey = inactive)
-      const lastSeen = node.last_seen ? new Date(node.last_seen) : null;
-      const ageMinutes = lastSeen ? (Date.now() - lastSeen.getTime()) / 60000 : Infinity;
-      
-      let color;
-      if (ageMinutes < 60) {
-        color = Cesium.Color.fromCssColorString('#39FF14'); // Mesh Green
-      } else if (ageMinutes < 1440) {
-        color = Cesium.Color.fromCssColorString('#FFB300'); // Beacon Amber
-      } else {
-        color = Cesium.Color.fromCssColorString('#6B7280'); // Grey
+    const position = Cesium.Cartesian3.fromDegrees(node.lon, node.lat, 0);
+    
+    const lastSeen = node.last_seen ? new Date(node.last_seen) : null;
+    const ageMinutes = lastSeen ? (Date.now() - lastSeen.getTime()) / 60000 : Infinity;
+    
+    let color;
+    if (ageMinutes < 60) {
+      color = Cesium.Color.fromCssColorString('#39FF14'); // Mesh Green
+    } else if (ageMinutes < 1440) {
+      color = Cesium.Color.fromCssColorString('#FFB300'); // Beacon Amber
+    } else {
+      color = Cesium.Color.fromCssColorString('#6B7280'); // Grey
+    }
+
+    const entity = viewer.entities.add({
+      id: `node-${node.public_key}`,
+      position: position,
+      point: {
+        pixelSize: 18,
+        color: color,
+        outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 3,
+        scaleByDistance: new Cesium.NearFarScalar(1000, 2.0, 500000, 0.3)
+      },
+      label: {
+        text: node.name || node.public_key.slice(0, 8),
+        font: '14px sans-serif',
+        fillColor: Cesium.Color.WHITE,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+        pixelOffset: new Cesium.Cartesian2(0, -20),
+        show: true,
+        scaleByDistance: new Cesium.NearFarScalar(1000, 1.2, 500000, 0.2)
+      },
+      description: `
+        <div style="font-family: sans-serif;">
+          <h3>${node.name || node.public_key.slice(0, 12)}</h3>
+          <p><strong>Role:</strong> ${node.role}</p>
+          <p><strong>Location:</strong> ${node.lat.toFixed(5)}, ${node.lon.toFixed(5)}</p>
+          ${lastSeen ? `<p><strong>Last Seen:</strong> ${lastSeen.toLocaleString()}</p>` : ''}
+        </div>
+      `
+    });
+
+    nodeEntities.set(node.public_key, entity);
+  }
+
+  // Parse path from packet
+  function getParsedPath(packet) {
+    if (packet.path_json) {
+      try {
+        const parsed = typeof packet.path_json === 'string' ? JSON.parse(packet.path_json) : packet.path_json;
+        return parsed.hops || [];
+      } catch (e) {
+        return [];
       }
+    }
+    return packet.decoded?.path?.hops || [];
+  }
 
-      // Simple, highly visible point marker
-      const entity = viewer.entities.add({
-        id: `node-${node.public_key}`,
-        position: position,
-        point: {
-          pixelSize: 24, // Large visible point
-          color: color,
-          outlineColor: Cesium.Color.WHITE,
-          outlineWidth: 4,
-          scaleByDistance: new Cesium.NearFarScalar(1000, 2.0, 100000, 0.5) // Scale based on distance
-        },
-        label: {
-          text: node.name || node.public_key,
-          font: 'bold 18px sans-serif',
-          fillColor: Cesium.Color.WHITE,
-          outlineColor: Cesium.Color.BLACK,
-          outlineWidth: 4,
-          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-          pixelOffset: new Cesium.Cartesian2(0, -30),
-          show: true,
-          scaleByDistance: new Cesium.NearFarScalar(1000, 1.5, 100000, 0.5)
-        },
-        description: `
-          <div style="font-family: sans-serif;">
-            <h3 style="margin: 0 0 10px 0;">${node.name || node.public_key}</h3>
-            <p style="margin: 5px 0;"><strong>ID:</strong> ${node.public_key}</p>
-            <p style="margin: 5px 0;"><strong>Location:</strong> ${node.lat.toFixed(6)}, ${node.lon.toFixed(6)}</p>
-            <p style="margin: 5px 0;"><strong>Last Seen:</strong> ${lastSeen ? lastSeen.toLocaleString() : 'Never'}</p>
-            ${node.role ? `<p style="margin: 5px 0;"><strong>Role:</strong> ${node.role}</p>` : ''}
-          </div>
-        `
+  // Resolve hop positions (adapted from live.js)
+  function resolveHopPositions(hops, payload, resolvedPath) {
+    const positions = [];
+    
+    // Try sender from payload first
+    if (payload?.pubKey && nodeData.has(payload.pubKey)) {
+      const node = nodeData.get(payload.pubKey);
+      positions.push({
+        key: payload.pubKey,
+        lat: node.lat,
+        lon: node.lon,
+        ghost: false
       });
+    }
 
-      nodeEntities.set(node.public_key, entity);
-      console.log(`[globe] ✓ Added node: ${node.name || node.public_key} at ${node.lat}, ${node.lon}`);
-    } catch (err) {
-      console.error(`[globe] ✗ Failed to add node ${node.public_key}:`, err);
+    // Process hops
+    hops.forEach(hop => {
+      const key = hop.pubKey || hop;
+      if (nodeData.has(key)) {
+        const node = nodeData.get(key);
+        positions.push({
+          key: key,
+          lat: node.lat,
+          lon: node.lon,
+          ghost: false
+        });
+      } else if (hop.lat && hop.lon) {
+        // Ghost hop with coordinates
+        positions.push({
+          key: key,
+          lat: hop.lat,
+          lon: hop.lon,
+          ghost: true
+        });
+      }
+    });
+
+    return positions;
+  }
+
+  // Render packet tree (adapted from live.js)
+  function renderPacketTree(packets) {
+    if (!packets || !packets.length) return;
+    
+    const first = packets[0];
+    const decoded = first.decoded || {};
+    const header = decoded.header || {};
+    const payload = decoded.payload || {};
+    const typeName = header.payloadTypeName || 'UNKNOWN';
+    const color = TYPE_COLORS[typeName] || '#6b7280';
+    
+    // Update packet count
+    packetCount += packets.length;
+    updateStats();
+
+    // Extract unique paths
+    const allPaths = [];
+    const seenPathKeys = new Set();
+    
+    packets.forEach(pkt => {
+      const hops = getParsedPath(pkt);
+      const pathKey = hops.map(h => h.pubKey || h).join(',');
+      
+      if (!seenPathKeys.has(pathKey)) {
+        seenPathKeys.add(pathKey);
+        const hopPositions = resolveHopPositions(hops, payload, null);
+        
+        if (hopPositions.length >= 2) {
+          allPaths.push({
+            hopPositions: hopPositions,
+            hash: first.hash,
+            typeName: typeName,
+            color: color
+          });
+        } else if (hopPositions.length === 1) {
+          // Single node - pulse it
+          pulseNode(hopPositions[0].lat, hopPositions[0].lon, color);
+        }
+      }
+    });
+
+    // Animate all unique paths
+    allPaths.forEach(path => {
+      animatePath(path.hopPositions, path.typeName, path.color, path.hash);
+    });
+  }
+
+  // Animate packet path
+  function animatePath(hopPositions, typeName, color, hash) {
+    if (activeAnimations >= MAX_CONCURRENT_ANIMATIONS) return;
+    if (hopPositions.length < 2) return;
+    
+    activeAnimations++;
+    
+    // Build Cesium positions
+    const positions = hopPositions.map(hp => 
+      Cesium.Cartesian3.fromDegrees(hp.lon, hp.lat, 500) // 500m altitude
+    );
+
+    // Hash-based color
+    let pathColor = Cesium.Color.fromCssColorString(color);
+    if (colorByHash && hash && window.HashColor) {
+      try {
+        const hsl = window.HashColor.hashToHsl(hash, 'dark');
+        pathColor = Cesium.Color.fromCssColorString(hsl);
+      } catch (e) {}
+    }
+
+    // Create contrail polyline
+    const contrailEntity = viewer.entities.add({
+      polyline: {
+        positions: positions,
+        width: 4,
+        material: new Cesium.PolylineGlowMaterialProperty({
+          glowPower: 0.2,
+          color: pathColor.withAlpha(0.3)
+        }),
+        arcType: Cesium.ArcType.GEODESIC
+      }
+    });
+
+    // Animate packet dot along path
+    const startTime = Cesium.JulianDate.now();
+    const stopTime = Cesium.JulianDate.addSeconds(startTime, hopPositions.length * 0.5, new Cesium.JulianDate());
+    
+    const sampledPosition = new Cesium.SampledPositionProperty();
+    hopPositions.forEach((hp, i) => {
+      const time = Cesium.JulianDate.addSeconds(startTime, i * 0.5, new Cesium.JulianDate());
+      sampledPosition.addSample(time, Cesium.Cartesian3.fromDegrees(hp.lon, hp.lat, 500));
+      
+      // Pulse node on arrival
+      setTimeout(() => {
+        pulseNode(hp.lat, hp.lon, pathColor);
+      }, i * 500);
+    });
+
+    const packetDot = viewer.entities.add({
+      position: sampledPosition,
+      point: {
+        pixelSize: 10,
+        color: pathColor,
+        outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 2
+      },
+      availability: new Cesium.TimeIntervalCollection([
+        new Cesium.TimeInterval({ start: startTime, stop: stopTime })
+      ])
+    });
+
+    // Cleanup after animation
+    setTimeout(() => {
+      viewer.entities.remove(packetDot);
+      
+      // Fade contrail
+      let opacity = 0.3;
+      const fadeInterval = setInterval(() => {
+        opacity -= 0.05;
+        if (opacity <= 0) {
+          viewer.entities.remove(contrailEntity);
+          clearInterval(fadeInterval);
+          activeAnimations = Math.max(0, activeAnimations - 1);
+          updateStats();
+        } else {
+          contrailEntity.polyline.material = new Cesium.PolylineGlowMaterialProperty({
+            glowPower: 0.2,
+            color: pathColor.withAlpha(opacity)
+          });
+        }
+      }, 100);
+    }, hopPositions.length * 500);
+  }
+
+  // Pulse node
+  function pulseNode(lat, lon, color) {
+    const position = Cesium.Cartesian3.fromDegrees(lon, lat, 0);
+    const pulseColor = color instanceof Cesium.Color ? color : Cesium.Color.fromCssColorString(color);
+    
+    const pulse = viewer.entities.add({
+      position: position,
+      ellipsoid: {
+        radii: new Cesium.Cartesian3(100, 100, 100),
+        material: pulseColor.withAlpha(0.5)
+      }
+    });
+
+    let scale = 1.0;
+    const pulseInterval = setInterval(() => {
+      scale += 0.2;
+      if (scale >= 3.0) {
+        viewer.entities.remove(pulse);
+        clearInterval(pulseInterval);
+      } else {
+        pulse.ellipsoid.radii = new Cesium.Cartesian3(100 * scale, 100 * scale, 100 * scale);
+        pulse.ellipsoid.material = pulseColor.withAlpha(0.5 / scale);
+      }
+    }, 50);
+  }
+
+  // Handle incoming packet from WebSocket
+  function handlePacket(packet) {
+    if (realisticPropagation && packet.hash) {
+      // Buffer packets by hash
+      if (propagationBuffer.has(packet.hash)) {
+        propagationBuffer.get(packet.hash).packets.push(packet);
+      } else {
+        const entry = {
+          packets: [packet],
+          timer: setTimeout(() => {
+            const buffered = propagationBuffer.get(packet.hash);
+            propagationBuffer.delete(packet.hash);
+            if (buffered) renderPacketTree(buffered.packets);
+          }, PROPAGATION_BUFFER_MS)
+        };
+        propagationBuffer.set(packet.hash, entry);
+      }
+    } else {
+      renderPacketTree([packet]);
     }
   }
 
-  // Update node stats display
+  // Update stats display
   function updateStats() {
     if (!statsDiv) return;
     
-    const total = nodeEntities.size;
-    const active = Array.from(nodeEntities.values()).filter(e => {
-      const color = e.point.color.getValue();
-      return color.equals(Cesium.Color.fromCssColorString('#39FF14'));
-    }).length;
+    const nodeCount = nodeEntities.size;
+    const animCount = activeAnimations;
     
-    const paths = packetPaths.size;
-
     statsDiv.innerHTML = `
       <span class="globe-stats-label">Nodes:</span>
-      <span class="globe-stats-value">${total}</span>
+      <span class="globe-stats-value">${nodeCount}</span>
+      <span class="globe-stats-label" style="margin-left: 12px;">Packets:</span>
+      <span class="globe-stats-value">${packetCount}</span>
       <span class="globe-stats-label" style="margin-left: 12px;">Active:</span>
-      <span class="globe-stats-value">${active}</span>
-      <span class="globe-stats-label" style="margin-left: 12px;">Paths:</span>
-      <span class="globe-stats-value">${paths}</span>
+      <span class="globe-stats-value">${animCount}</span>
     `;
   }
 
-  // Update an existing node or add if new
-  function updateNode(node) {
-    if (!node.lat || !node.lon) return;
-    
-    const existing = nodeEntities.get(node.public_key);
-    if (existing) {
-      // Update existing node (color based on recent activity)
-      existing.point.color = Cesium.Color.fromCssColorString('#39FF14'); // Mesh Green
-      updateStats();
-    } else {
-      // Add new node
-      addNodeToGlobe(node);
-      updateStats();
-    }
-  }
-
-  // Initialize the page
+  // Initialize
   async function init(app, routeParam) {
     app.innerHTML = `
-      <div id="globeContainer"></div>
-      <div class="globe-stats" id="globeStats">Loading...</div>
+      <div id="globeContainer" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0;"></div>
+      <div class="globe-stats" id="globeStats" style="position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 13px;">Loading...</div>
+      <div class="globe-controls" id="globeControls" style="position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: sans-serif; font-size: 12px;">
+        <label style="display: block; margin-bottom: 6px; cursor: pointer;">
+          <input type="checkbox" id="globeRealisticToggle" style="margin-right: 6px;">
+          Realistic propagation
+        </label>
+        <label style="display: block; cursor: pointer;">
+          <input type="checkbox" id="globeColorHashToggle" style="margin-right: 6px;">
+          Color by hash
+        </label>
+      </div>
     `;
 
     const container = document.getElementById('globeContainer');
     statsDiv = document.getElementById('globeStats');
 
     if (typeof Cesium === 'undefined') {
-      app.innerHTML = '<div style="padding: 40px; text-align: center; color: var(--text);">Cesium library failed to load. Please refresh the page.</div>';
-      console.error('[globe] Cesium library not loaded');
+      app.innerHTML = '<div style="padding: 40px; text-align: center;">Cesium not loaded</div>';
       return;
     }
 
     await initViewer(container);
-    
-    // Add test markers immediately for debugging
-    console.log('[globe] === INITIALIZATION STARTING ===');
-    console.log('[globe] Adding test markers...');
-    addTestMarker();
-    console.log(`[globe] Test markers added, total entities: ${viewer.entities.values.length}`);
-    
-    // Load real nodes
-    console.log('[globe] Starting loadNodes()...');
-    loadNodes().then(() => {
-      console.log('[globe] === loadNodes() completed ===');
-      console.log(`[globe] Final entity count: ${viewer.entities.values.length}`);
-    }).catch(err => {
-      console.error('[globe] === loadNodes() FAILED ===', err);
-    });
-    
-    // Load packet paths after nodes (so we have node positions)
-    setTimeout(() => {
-      loadPacketPaths();
-    }, 2000);
+    await loadNodes();
 
-    // Set up WebSocket handler for real-time updates
-    wsHandler = function (msg) {
-      if (msg.type === 'node' && msg.node) {
-        updateNode(msg.node);
-      } else if (msg.type === 'packet' && msg.packet) {
-        // Add new packet path in real-time
-        addPacketPath(msg.packet);
-      }
-    };
-    if (window.registerWSHandler) {
-      registerWSHandler(wsHandler);
-    }
-    
-    // Periodic pulse animation on recent paths (visual heartbeat)
-    pulseInterval = setInterval(() => {
-      // Find paths from last 2 minutes and randomly pulse one
-      const recentPaths = Array.from(packetPaths.entries())
-        .filter(([id, entity]) => {
-          // Check if path has description with timestamp
-          return entity.description; // Simple check
-        })
-        .slice(0, 5); // Take up to 5 most recent
-      
-      if (recentPaths.length > 0) {
-        const randomPath = recentPaths[Math.floor(Math.random() * recentPaths.length)][1];
-        if (randomPath.polyline && randomPath.polyline.positions) {
-          const positions = randomPath.polyline.positions.getValue(Cesium.JulianDate.now());
-          if (positions && positions.length >= 2) {
-            const pulseColor = Cesium.Color.fromCssColorString('#00E5FF').withAlpha(0.8);
-            addPulseAlongPath(positions, pulseColor);
+    // Set up controls
+    const realisticToggle = document.getElementById('globeRealisticToggle');
+    realisticToggle.checked = realisticPropagation;
+    realisticToggle.addEventListener('change', (e) => {
+      realisticPropagation = e.target.checked;
+      localStorage.setItem('globe-realistic-propagation', realisticPropagation);
+    });
+
+    const colorHashToggle = document.getElementById('globeColorHashToggle');
+    colorHashToggle.checked = colorByHash;
+    colorHashToggle.addEventListener('change', (e) => {
+      colorByHash = e.target.checked;
+      localStorage.setItem('meshcore-color-packets-by-hash', colorByHash);
+    });
+
+    // WebSocket handler
+    wsHandler = function(msg) {
+      if (msg.type === 'packet' && msg.packet) {
+        handlePacket(msg.packet);
+      } else if (msg.type === 'node' && msg.node) {
+        // Update node data
+        if (msg.node.public_key && msg.node.lat && msg.node.lon) {
+          nodeData.set(msg.node.public_key, {
+            name: msg.node.name || msg.node.public_key.slice(0, 8),
+            lat: msg.node.lat,
+            lon: msg.node.lon,
+            role: msg.node.role || 'unknown',
+            last_seen: msg.node.last_seen
+          });
+          
+          // Add node if not exists
+          if (!nodeEntities.has(msg.node.public_key)) {
+            addNodeToGlobe(msg.node);
           }
         }
       }
-    }, 5000); // Every 5 seconds
+    };
+    
+    if (window.registerWSHandler) {
+      registerWSHandler(wsHandler);
+    }
   }
 
-  // Cleanup when leaving the page
+  // Cleanup
   function destroy() {
-    if (pulseInterval) {
-      clearInterval(pulseInterval);
-      pulseInterval = null;
-    }
+    if (pulseInterval) clearInterval(pulseInterval);
     if (viewer) {
       viewer.destroy();
       viewer = null;
     }
     nodeEntities.clear();
+    nodeData.clear();
     packetPaths.clear();
+    propagationBuffer.clear();
     if (wsHandler && window.unregisterWSHandler) {
       unregisterWSHandler(wsHandler);
       wsHandler = null;
@@ -375,171 +509,10 @@
     statsDiv = null;
   }
 
-  // Register the page
+  // Register page
   registerPage('globe', {
     init: init,
     destroy: destroy
   });
 
 })();
-
-  // Store packet paths
-  let packetPaths = new Map();
-
-  // Fetch and display recent packet paths
-  async function loadPacketPaths() {
-    try {
-      console.log('[globe] Fetching recent packets...');
-      const response = await fetch('/api/packets?limit=100');
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      
-      const data = await response.json();
-      const packets = Array.isArray(data) ? data : (data.packets || []);
-      
-      console.log(`[globe] Loaded ${packets.length} packets`);
-      
-      let pathsAdded = 0;
-      packets.forEach(packet => {
-        if (packet.path && packet.path.length >= 2) {
-          addPacketPath(packet);
-          pathsAdded++;
-        }
-      });
-      
-      console.log(`[globe] Added ${pathsAdded} packet paths`);
-    } catch (err) {
-      console.error('[globe] Failed to load packets:', err);
-    }
-  }
-
-  // Add a packet path polyline
-  function addPacketPath(packet) {
-    if (!packet.path || packet.path.length < 2) return;
-    
-    const pathId = `path-${packet.id}`;
-    
-    // Remove old path if exists
-    if (packetPaths.has(pathId)) {
-      viewer.entities.remove(packetPaths.get(pathId));
-    }
-    
-    // Build positions array from path hops
-    const positions = [];
-    packet.path.forEach(hop => {
-      // Look up node coordinates
-      const nodeEntity = viewer.entities.getById(`node-${hop.id || hop}`);
-      if (nodeEntity && nodeEntity.position) {
-        positions.push(nodeEntity.position.getValue(Cesium.JulianDate.now()));
-      }
-    });
-    
-    if (positions.length < 2) return;
-    
-    // Calculate age for color
-    const age = packet.timestamp ? (Date.now() - new Date(packet.timestamp).getTime()) / 1000 : Infinity;
-    
-    // Color based on age (fade from cyan to grey)
-    let color;
-    if (age < 60) {
-      color = Cesium.Color.fromCssColorString('#00E5FF').withAlpha(0.8); // Signal Cyan
-    } else if (age < 600) {
-      color = Cesium.Color.fromCssColorString('#FFB300').withAlpha(0.6); // Beacon Amber
-    } else {
-      color = Cesium.Color.fromCssColorString('#6B7280').withAlpha(0.4); // Grey
-    }
-    
-    // Create polyline entity with arc
-    const entity = viewer.entities.add({
-      id: pathId,
-      polyline: {
-        positions: positions,
-        width: 3,
-        material: new Cesium.PolylineGlowMaterialProperty({
-          glowPower: 0.3,
-          color: color
-        }),
-        arcType: Cesium.ArcType.GEODESIC,
-        clampToGround: false
-      },
-      description: `
-        <div style="font-family: sans-serif;">
-          <h3 style="margin: 0 0 10px 0;">Packet Path</h3>
-          <p style="margin: 5px 0;"><strong>Hops:</strong> ${packet.path.length}</p>
-          <p style="margin: 5px 0;"><strong>Route:</strong> ${packet.path.map(h => h.id || h).join(' → ')}</p>
-          ${packet.timestamp ? `<p style="margin: 5px 0;"><strong>Time:</strong> ${new Date(packet.timestamp).toLocaleString()}</p>` : ''}
-          ${packet.snr ? `<p style="margin: 5px 0;"><strong>SNR:</strong> ${packet.snr} dB</p>` : ''}
-        </div>
-      `
-    });
-    
-    packetPaths.set(pathId, entity);
-    
-    // Trigger animated pulse for fresh packets (< 30 seconds old)
-    if (age < 30) {
-      const pulseColor = Cesium.Color.fromCssColorString('#00E5FF'); // Signal Cyan
-      addPulseAlongPath(positions, pulseColor);
-      console.log(`[globe] Animating pulse for fresh packet ${packet.id}`);
-    }
-    
-    // Auto-fade after 10 minutes
-    setTimeout(() => {
-      if (packetPaths.has(pathId)) {
-        viewer.entities.remove(packetPaths.get(pathId));
-        packetPaths.delete(pathId);
-      }
-    }, 600000);
-  }
-
-  // Add animated pulse along a path (hop by hop)
-  function addPulseAlongPath(positions, color, delayMs = 0) {
-    if (positions.length < 2) return;
-    
-    // Animate pulse for each hop in sequence
-    positions.forEach((pos, i) => {
-      if (i === positions.length - 1) return; // Skip last (no next hop)
-      
-      const fromPos = positions[i];
-      const toPos = positions[i + 1];
-      const hopDelay = delayMs + (i * 800); // Stagger hops by 800ms
-      
-      setTimeout(() => {
-        animatePulse(fromPos, toPos, color);
-      }, hopDelay);
-    });
-  }
-  
-  // Animate a single pulse between two positions
-  function animatePulse(fromPos, toPos, color) {
-    const startTime = Cesium.JulianDate.now();
-    const stopTime = Cesium.JulianDate.addSeconds(startTime, 0.8, new Cesium.JulianDate());
-    
-    // Create moving point
-    const pulse = viewer.entities.add({
-      availability: new Cesium.TimeIntervalCollection([
-        new Cesium.TimeInterval({ start: startTime, stop: stopTime })
-      ]),
-      position: new Cesium.SampledPositionProperty(),
-      point: {
-        pixelSize: 12,
-        color: color,
-        outlineColor: Cesium.Color.WHITE,
-        outlineWidth: 3
-      },
-      ellipsoid: {
-        radii: new Cesium.Cartesian3(50, 50, 50),
-        material: color.withAlpha(0.5)
-      }
-    });
-    
-    // Animate from source to destination
-    pulse.position.addSample(startTime, fromPos);
-    pulse.position.addSample(stopTime, toPos);
-    
-    // Auto-remove after animation
-    setTimeout(() => {
-      viewer.entities.remove(pulse);
-    }, 1000);
-  }

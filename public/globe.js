@@ -419,9 +419,20 @@
   // Initialize
   async function init(app, routeParam) {
     app.innerHTML = `
-      <div id="globeContainer" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0;"></div>
-      <div class="globe-stats" id="globeStats" style="position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 13px;">Loading...</div>
-      <div class="globe-controls" id="globeControls" style="position: absolute; top: 10px; right: 70px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: sans-serif; font-size: 12px;">
+      <div id="globeContainer" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0;">
+        <style>
+          /* Push Cesium widgets below navbar */
+          .cesium-viewer .cesium-viewer-toolbar,
+          .cesium-viewer .cesium-viewer-bottom {
+            top: 60px !important;
+          }
+          .cesium-baseLayerPicker-dropDown {
+            top: 60px !important;
+          }
+        </style>
+      </div>
+      <div class="globe-stats" id="globeStats" style="position: absolute; top: 70px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; z-index: 1000;">Loading...</div>
+      <div class="globe-controls" id="globeControls" style="position: absolute; top: 70px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: sans-serif; font-size: 12px; z-index: 1000;">
         <label style="display: block; margin-bottom: 6px; cursor: pointer;">
           <input type="checkbox" id="globeRealisticToggle" style="margin-right: 6px;">
           Realistic propagation

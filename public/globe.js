@@ -106,30 +106,41 @@
       }
       
       const data = await response.json();
-      console.log('[globe] Raw API response:', data);
+      console.log('[globe] Raw API response type:', Array.isArray(data) ? 'array' : 'object');
+      console.log('[globe] Raw API response keys:', Object.keys(data));
       
       // Handle both array and object responses
       const nodes = Array.isArray(data) ? data : (data.nodes || []);
       
-      console.log(`[globe] Parsed ${nodes.length} nodes`);
+      if (!Array.isArray(nodes)) {
+        throw new Error(`Expected nodes array, got ${typeof nodes}`);
+      }
+      
+      console.log(`[globe] Processing ${nodes.length} nodes...`);
       
       let plotted = 0;
-      nodes.forEach(node => {
+      let skipped = 0;
+      nodes.forEach((node, index) => {
         if (node.lat && node.lon) {
-          console.log(`[globe] Plotting node: ${node.id || node.name} at ${node.lat}, ${node.lon}`);
           addNodeToGlobe(node);
           plotted++;
+          if (index < 5) {
+            console.log(`  [${index}] ✓ ${node.name || node.id} at ${node.lat}, ${node.lon}`);
+          }
         } else {
-          console.warn('[globe] Node missing coordinates:', node);
+          skipped++;
+          if (index < 5 || skipped < 3) {
+            console.warn(`  [${index}] ✗ ${node.name || node.id} - no coordinates`);
+          }
         }
       });
       
-      console.log(`[globe] Plotted ${plotted}/${nodes.length} nodes with coordinates`);
+      console.log(`[globe] ✓ Loaded ${plotted} nodes, ${skipped} skipped (no coords)`);
+      console.log(`[globe] Total entities in viewer: ${viewer.entities.values.length}`);
       updateStats();
     } catch (err) {
-      console.error('[globe] Failed to load nodes:', err);
-      // Add test marker on error
-      addTestMarker();
+      console.error('[globe] ✗ Failed to load nodes:', err);
+      console.error('[globe] Error stack:', err.stack);
     }
   }
   
@@ -270,11 +281,19 @@
     initViewer(container);
     
     // Add test markers immediately for debugging
+    console.log('[globe] === INITIALIZATION STARTING ===');
     console.log('[globe] Adding test markers...');
     addTestMarker();
+    console.log(`[globe] Test markers added, total entities: ${viewer.entities.values.length}`);
     
     // Load real nodes
-    loadNodes();
+    console.log('[globe] Starting loadNodes()...');
+    loadNodes().then(() => {
+      console.log('[globe] === loadNodes() completed ===');
+      console.log(`[globe] Final entity count: ${viewer.entities.values.length}`);
+    }).catch(err => {
+      console.error('[globe] === loadNodes() FAILED ===', err);
+    });
     
     // Load packet paths after nodes (so we have node positions)
     setTimeout(() => {

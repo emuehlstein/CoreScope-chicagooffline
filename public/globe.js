@@ -102,12 +102,6 @@
       
       console.log(`[globe] Plotted ${plotted}/${nodes.length} nodes with coordinates`);
       updateStats();
-      
-      // Always add test markers for now (debugging)
-      if (plotted < 5) {
-        console.warn(`[globe] Only ${plotted} real nodes - adding test markers for visibility`);
-        addTestMarker();
-      }
     } catch (err) {
       console.error('[globe] Failed to load nodes:', err);
       // Add test marker on error
@@ -117,98 +111,82 @@
   
   // Add test markers to verify the globe is working
   function addTestMarker() {
-    // Add several test nodes in Chicago area
+    // Add several highly visible test nodes in Chicago area
     const testNodes = [
-      { id: 'test-downtown', name: 'Downtown Test', lat: 41.8781, lon: -87.6298, lastSeenAt: new Date().toISOString() },
-      { id: 'test-northside', name: 'North Side Test', lat: 41.95, lon: -87.65, lastSeenAt: new Date().toISOString() },
-      { id: 'test-southside', name: 'South Side Test', lat: 41.80, lon: -87.60, lastSeenAt: new Date().toISOString() },
-      { id: 'test-west', name: 'West Side Test', lat: 41.88, lon: -87.75, lastSeenAt: new Date().toISOString() }
+      { id: 'test-downtown', name: '🔴 TEST Downtown', lat: 41.8781, lon: -87.6298, lastSeenAt: new Date().toISOString() },
+      { id: 'test-northside', name: '🔴 TEST North', lat: 41.95, lon: -87.65, lastSeenAt: new Date().toISOString() },
+      { id: 'test-southside', name: '🔴 TEST South', lat: 41.80, lon: -87.60, lastSeenAt: new Date().toISOString() },
+      { id: 'test-west', name: '🔴 TEST West', lat: 41.88, lon: -87.75, lastSeenAt: new Date().toISOString() },
+      { id: 'test-evanston', name: '🔴 TEST Evanston', lat: 42.05, lon: -87.68, lastSeenAt: new Date().toISOString() }
     ];
     
-    testNodes.forEach(node => addNodeToGlobe(node));
+    console.log('[globe] Adding test markers at:');
+    testNodes.forEach(node => {
+      console.log(`  - ${node.name}: ${node.lat}, ${node.lon}`);
+      addNodeToGlobe(node);
+    });
     updateStats();
-    console.log(`[globe] Added ${testNodes.length} test markers`);
+    console.log(`[globe] ✓ Added ${testNodes.length} test markers`);
   }
 
   // Add a node marker to the globe
   function addNodeToGlobe(node) {
-    const position = Cesium.Cartesian3.fromDegrees(node.lon, node.lat, 500); // 500m above ground for better visibility
-    
-    // Color based on activity (green = recent, amber = old, grey = inactive)
-    const lastSeen = node.lastSeenAt ? new Date(node.lastSeenAt) : null;
-    const ageMinutes = lastSeen ? (Date.now() - lastSeen.getTime()) / 60000 : Infinity;
-    
-    let color;
-    if (ageMinutes < 60) {
-      color = Cesium.Color.fromCssColorString('#39FF14'); // Mesh Green
-    } else if (ageMinutes < 1440) {
-      color = Cesium.Color.fromCssColorString('#FFB300'); // Beacon Amber
-    } else {
-      color = Cesium.Color.fromCssColorString('#6B7280'); // Grey
+    try {
+      const position = Cesium.Cartesian3.fromDegrees(node.lon, node.lat, 0); // At ground level
+      
+      // Color based on activity (green = recent, amber = old, grey = inactive)
+      const lastSeen = node.lastSeenAt ? new Date(node.lastSeenAt) : null;
+      const ageMinutes = lastSeen ? (Date.now() - lastSeen.getTime()) / 60000 : Infinity;
+      
+      let color;
+      if (ageMinutes < 60) {
+        color = Cesium.Color.fromCssColorString('#39FF14'); // Mesh Green
+      } else if (ageMinutes < 1440) {
+        color = Cesium.Color.fromCssColorString('#FFB300'); // Beacon Amber
+      } else {
+        color = Cesium.Color.fromCssColorString('#6B7280'); // Grey
+      }
+
+      // Simple, highly visible point marker
+      const entity = viewer.entities.add({
+        id: `node-${node.id}`,
+        position: position,
+        point: {
+          pixelSize: 24, // Large visible point
+          color: color,
+          outlineColor: Cesium.Color.WHITE,
+          outlineWidth: 4,
+          scaleByDistance: new Cesium.NearFarScalar(1000, 2.0, 100000, 0.5) // Scale based on distance
+        },
+        label: {
+          text: node.name || node.id,
+          font: 'bold 18px sans-serif',
+          fillColor: Cesium.Color.WHITE,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 4,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          pixelOffset: new Cesium.Cartesian2(0, -30),
+          show: true,
+          scaleByDistance: new Cesium.NearFarScalar(1000, 1.5, 100000, 0.5)
+        },
+        description: `
+          <div style="font-family: sans-serif;">
+            <h3 style="margin: 0 0 10px 0;">${node.name || node.id}</h3>
+            <p style="margin: 5px 0;"><strong>ID:</strong> ${node.id}</p>
+            <p style="margin: 5px 0;"><strong>Location:</strong> ${node.lat.toFixed(6)}, ${node.lon.toFixed(6)}</p>
+            <p style="margin: 5px 0;"><strong>Last Seen:</strong> ${lastSeen ? lastSeen.toLocaleString() : 'Never'}</p>
+            ${node.hardwareModel ? `<p style="margin: 5px 0;"><strong>Hardware:</strong> ${node.hardwareModel}</p>` : ''}
+            ${node.role ? `<p style="margin: 5px 0;"><strong>Role:</strong> ${node.role}</p>` : ''}
+          </div>
+        `
+      });
+
+      nodeEntities.set(node.id, entity);
+      console.log(`[globe] ✓ Added node: ${node.name || node.id} at ${node.lat}, ${node.lon}`);
+    } catch (err) {
+      console.error(`[globe] ✗ Failed to add node ${node.id}:`, err);
     }
-
-    const entity = viewer.entities.add({
-      id: `node-${node.id}`,
-      position: position,
-      billboard: {
-        image: createNodeMarker(color),
-        width: 32,
-        height: 32,
-        heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND,
-        verticalOrigin: Cesium.VerticalOrigin.BOTTOM
-      },
-      point: {
-        pixelSize: 16,
-        color: color,
-        outlineColor: Cesium.Color.WHITE,
-        outlineWidth: 3,
-        heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND
-      },
-      label: {
-        text: node.name || node.id,
-        font: 'bold 16px sans-serif',
-        fillColor: Cesium.Color.WHITE,
-        outlineColor: Cesium.Color.BLACK,
-        outlineWidth: 3,
-        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-        pixelOffset: new Cesium.Cartesian2(0, -20),
-        show: true, // Always show labels
-        heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND,
-        distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 500000) // Hide when too far
-      },
-      description: `
-        <div style="font-family: sans-serif;">
-          <h3 style="margin: 0 0 10px 0;">${node.name || node.id}</h3>
-          <p style="margin: 5px 0;"><strong>ID:</strong> ${node.id}</p>
-          <p style="margin: 5px 0;"><strong>Location:</strong> ${node.lat.toFixed(6)}, ${node.lon.toFixed(6)}</p>
-          <p style="margin: 5px 0;"><strong>Last Seen:</strong> ${lastSeen ? lastSeen.toLocaleString() : 'Never'}</p>
-          ${node.hardwareModel ? `<p style="margin: 5px 0;"><strong>Hardware:</strong> ${node.hardwareModel}</p>` : ''}
-          ${node.role ? `<p style="margin: 5px 0;"><strong>Role:</strong> ${node.role}</p>` : ''}
-        </div>
-      `
-    });
-
-    nodeEntities.set(node.id, entity);
-  }
-
-  // Create a colored marker canvas for billboards
-  function createNodeMarker(color) {
-    const canvas = document.createElement('canvas');
-    canvas.width = 32;
-    canvas.height = 32;
-    const ctx = canvas.getContext('2d');
-    
-    // Draw circle
-    ctx.beginPath();
-    ctx.arc(16, 16, 12, 0, 2 * Math.PI);
-    ctx.fillStyle = color.toCssColorString();
-    ctx.fill();
-    ctx.strokeStyle = 'white';
-    ctx.lineWidth = 3;
-    ctx.stroke();
-    
-    return canvas;
   }
 
   // Update node stats display
@@ -266,12 +244,18 @@
     }
 
     initViewer(container);
+    
+    // Add test markers immediately for debugging
+    console.log('[globe] Adding test markers...');
+    addTestMarker();
+    
+    // Load real nodes
     loadNodes();
     
     // Load packet paths after nodes (so we have node positions)
     setTimeout(() => {
       loadPacketPaths();
-    }, 1000);
+    }, 2000);
 
     // Set up WebSocket handler for real-time updates
     wsHandler = function (msg) {

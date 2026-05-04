@@ -17,7 +17,7 @@
     // Cesium Ion access token
     Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJhZjMzYTczNS03YTlkLTRkOWItYjI1Zi02YjJhNjBmNjYxNjgiLCJpZCI6NDI2ODYzLCJpc3MiOiJodHRwczovL2lvbi5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3Nzc4NDY5NDl9.-m7FPQsB4syRZQn6mt2WZ7jffejFyk1twYRTBFe-7BA';
 
-    // Create viewer with Carto Light basemap for better hillshade visibility
+    // Create viewer with OSM basemap for better hillshade visibility
     viewer = new Cesium.Viewer(container, {
       baseLayerPicker: false,
       geocoder: false,
@@ -29,10 +29,9 @@
       fullscreenButton: true,
       infoBox: true,
       selectionIndicator: true,
-      imageryProvider: new Cesium.UrlTemplateImageryProvider({
-        url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-        subdomains: ['a', 'b', 'c', 'd'],
-        credit: '© OpenStreetMap contributors, © CARTO'
+      imageryProvider: Cesium.createOpenStreetMapImageryProvider({
+        url: 'https://tile.openstreetmap.org/',
+        credit: '© OpenStreetMap contributors'
       })
     });
 

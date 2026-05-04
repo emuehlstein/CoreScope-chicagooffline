@@ -39,25 +39,26 @@
 
     console.log('[globe] Viewer created, globe.show:', viewer.scene.globe.show);
 
-    // Set initial camera position to look at Earth from above Chicago
+    // Set initial camera position over Lake Michigan looking west at Chicago
+    // Start far out for context
     viewer.camera.setView({
-      destination: Cesium.Cartesian3.fromDegrees(-87.6298, 41.8781, 10000000), // Start far out
+      destination: Cesium.Cartesian3.fromDegrees(-87.4, 41.88, 8000000), // Over the lake
       orientation: {
-        heading: 0,
-        pitch: -Cesium.Math.PI_OVER_TWO, // Look straight down
+        heading: Cesium.Math.toRadians(270), // Point west
+        pitch: Cesium.Math.toRadians(-60), // Oblique angle
         roll: 0
       }
     });
 
-    console.log('[globe] Camera positioned, distance:', Cesium.Cartesian3.magnitude(viewer.camera.position));
+    console.log('[globe] Camera positioned over Lake Michigan, distance:', Cesium.Cartesian3.magnitude(viewer.camera.position));
 
-    // Fly closer after a short delay
+    // Fly closer after a short delay for dramatic effect
     setTimeout(() => {
       viewer.camera.flyTo({
-        destination: Cesium.Cartesian3.fromDegrees(-87.6298, 41.8781, 50000),
+        destination: Cesium.Cartesian3.fromDegrees(-87.4, 41.88, 35000), // Closer view
         orientation: {
-          heading: 0,
-          pitch: Cesium.Math.toRadians(-45),
+          heading: Cesium.Math.toRadians(270), // Looking west at Chicago
+          pitch: Cesium.Math.toRadians(-35), // Oblique viewing angle
           roll: 0
         },
         duration: 3
@@ -99,12 +100,12 @@
         }
       });
       
-      console.log(`[globe] Plotted ${plotted}/${nodes.length} nodes`);
+      console.log(`[globe] Plotted ${plotted}/${nodes.length} nodes with coordinates`);
       updateStats();
       
-      // If no nodes, add a test marker at Chicago
-      if (plotted === 0) {
-        console.warn('[globe] No nodes plotted - adding test marker');
+      // Always add test markers for now (debugging)
+      if (plotted < 5) {
+        console.warn(`[globe] Only ${plotted} real nodes - adding test markers for visibility`);
         addTestMarker();
       }
     } catch (err) {
@@ -114,23 +115,24 @@
     }
   }
   
-  // Add a test marker to verify the globe is working
+  // Add test markers to verify the globe is working
   function addTestMarker() {
-    const testNode = {
-      id: 'test-marker',
-      name: 'Test Node (Chicago)',
-      lat: 41.8781,
-      lon: -87.6298,
-      lastSeenAt: new Date().toISOString()
-    };
-    addNodeToGlobe(testNode);
+    // Add several test nodes in Chicago area
+    const testNodes = [
+      { id: 'test-downtown', name: 'Downtown Test', lat: 41.8781, lon: -87.6298, lastSeenAt: new Date().toISOString() },
+      { id: 'test-northside', name: 'North Side Test', lat: 41.95, lon: -87.65, lastSeenAt: new Date().toISOString() },
+      { id: 'test-southside', name: 'South Side Test', lat: 41.80, lon: -87.60, lastSeenAt: new Date().toISOString() },
+      { id: 'test-west', name: 'West Side Test', lat: 41.88, lon: -87.75, lastSeenAt: new Date().toISOString() }
+    ];
+    
+    testNodes.forEach(node => addNodeToGlobe(node));
     updateStats();
-    console.log('[globe] Added test marker at Chicago');
+    console.log(`[globe] Added ${testNodes.length} test markers`);
   }
 
   // Add a node marker to the globe
   function addNodeToGlobe(node) {
-    const position = Cesium.Cartesian3.fromDegrees(node.lon, node.lat, 100); // 100m above ground for visibility
+    const position = Cesium.Cartesian3.fromDegrees(node.lon, node.lat, 500); // 500m above ground for better visibility
     
     // Color based on activity (green = recent, amber = old, grey = inactive)
     const lastSeen = node.lastSeenAt ? new Date(node.lastSeenAt) : null;

@@ -325,8 +325,13 @@
       if (msg.type === 'node' && msg.node) {
         updateNode(msg.node);
       } else if (msg.type === 'packet' && msg.packet) {
-        // Add new packet path in real-time
-        addPacketPath(msg.packet);
+        // Log packet (no rendering yet)
+        console.log('[globe] Packet received:', {
+          from: msg.packet.from,
+          to: msg.packet.to,
+          hops: msg.packet.hops?.length || 0,
+          hash: msg.packet.hash
+        });
       }
     };
     if (window.registerWSHandler) {

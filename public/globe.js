@@ -74,6 +74,16 @@
     viewer.scene.globe.depthTestAgainstTerrain = true;
 
     console.log('[globe] Viewer created');
+    
+    // Diagnostic: log mouse events to verify they're reaching the viewer
+    const canvas = viewer.scene.canvas;
+    canvas.addEventListener('mousedown', (e) => console.log('[globe] Canvas mousedown:', e.button));
+    canvas.addEventListener('mousemove', (e) => console.log('[globe] Canvas mousemove'));
+    canvas.addEventListener('wheel', (e) => console.log('[globe] Canvas wheel:', e.deltaY));
+    
+    // Also check if the viewer container is receiving events
+    console.log('[globe] Canvas element:', canvas);
+    console.log('[globe] Canvas computed style pointer-events:', window.getComputedStyle(canvas).pointerEvents);
 
     // Set initial camera position over Lake Michigan looking west at Chicago
     viewer.camera.setView({

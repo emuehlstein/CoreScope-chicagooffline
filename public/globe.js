@@ -13,7 +13,7 @@
   let pulseInterval;
 
   // Initialize Cesium viewer
-  function initViewer(container) {
+  async function initViewer(container) {
     // Cesium Ion access token
     Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJhZjMzYTczNS03YTlkLTRkOWItYjI1Zi02YjJhNjBmNjYxNjgiLCJpZCI6NDI2ODYzLCJpc3MiOiJodHRwczovL2lvbi5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3Nzc4NDY5NDl9.-m7FPQsB4syRZQn6mt2WZ7jffejFyk1twYRTBFe-7BA';
 
@@ -70,6 +70,7 @@
 
     // Add hillshade terrain layer from tiles.chicagooffline.com
     // Use dark hillshade (better contrast on satellite imagery)
+    console.log('[globe] Attempting to add hillshade layer...');
     try {
       const hillshadeProvider = new Cesium.UrlTemplateImageryProvider({
         url: 'https://tiles.chicagooffline.com/services/cook-hillshade-combined-dark-9x/tiles/{z}/{x}/{y}.png',
@@ -78,18 +79,37 @@
         tilingScheme: new Cesium.WebMercatorTilingScheme()
       });
       
-      const hillshadeLayer = viewer.imageryLayers.addImageryProvider(hillshadeProvider);
-      hillshadeLayer.alpha = 0.8; // Increased to 80% for better visibility
-      hillshadeLayer.brightness = 1.2; // Boost brightness slightly
+      // Wait for provider to be ready
+      await hillshadeProvider.readyPromise;
+      console.log('[globe] Hillshade provider ready:', {
+        ready: hillshadeProvider.ready,
+        rectangle: hillshadeProvider.rectangle,
+        tileWidth: hillshadeProvider.tileWidth,
+        tileHeight: hillshadeProvider.tileHeight
+      });
       
-      console.log('[globe] Hillshade layer added:', {
+      const hillshadeLayer = viewer.imageryLayers.addImageryProvider(hillshadeProvider);
+      hillshadeLayer.alpha = 1.0; // Full opacity for testing
+      hillshadeLayer.brightness = 1.5; // High brightness for visibility
+      hillshadeLayer.show = true;
+      
+      console.log('[globe] ✓ Hillshade layer added:', {
         url: hillshadeProvider.url,
         alpha: hillshadeLayer.alpha,
+        brightness: hillshadeLayer.brightness,
+        show: hillshadeLayer.show,
         layerIndex: viewer.imageryLayers.indexOf(hillshadeLayer),
         totalLayers: viewer.imageryLayers.length
       });
+      
+      // Log tile requests
+      hillshadeProvider.errorEvent.addEventListener((error) => {
+        console.error('[globe] Hillshade tile error:', error);
+      });
+      
     } catch (err) {
-      console.error('[globe] Failed to load hillshade layer:', err);
+      console.error('[globe] ✗ Failed to load hillshade layer:', err);
+      console.error('[globe] Error details:', err.message, err.stack);
     }
 
     console.log('[globe] Cesium viewer initialized');
@@ -263,7 +283,7 @@
   }
 
   // Initialize the page
-  function init(app, routeParam) {
+  async function init(app, routeParam) {
     app.innerHTML = `
       <div id="globeContainer"></div>
       <div class="globe-stats" id="globeStats">Loading...</div>
@@ -278,7 +298,7 @@
       return;
     }
 
-    initViewer(container);
+    await initViewer(container);
     
     // Add test markers immediately for debugging
     console.log('[globe] === INITIALIZATION STARTING ===');

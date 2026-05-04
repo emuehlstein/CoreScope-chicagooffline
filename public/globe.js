@@ -52,11 +52,20 @@
     });
 
     // Explicitly enable camera controls
-    viewer.scene.screenSpaceCameraController.enableRotate = true;
-    viewer.scene.screenSpaceCameraController.enableZoom = true;
-    viewer.scene.screenSpaceCameraController.enableTranslate = true;
-    viewer.scene.screenSpaceCameraController.enableTilt = true;
-    viewer.scene.screenSpaceCameraController.enableLook = true;
+    const controller = viewer.scene.screenSpaceCameraController;
+    controller.enableRotate = true;
+    controller.enableZoom = true;
+    controller.enableTranslate = true;
+    controller.enableTilt = true;
+    controller.enableLook = true;
+    
+    console.log('[globe] Camera controls enabled:', {
+      enableRotate: controller.enableRotate,
+      enableZoom: controller.enableZoom,
+      enableTranslate: controller.enableTranslate,
+      enableTilt: controller.enableTilt,
+      enableLook: controller.enableLook
+    });
 
     viewer.scene.globe.show = true;
     viewer.scene.skyBox.show = true;
@@ -429,18 +438,36 @@
   // Initialize
   async function init(app, routeParam) {
     app.innerHTML = `
-      <div id="globeContainer" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 0;">
-        <style>
-          /* Push Cesium widgets below navbar */
-          .cesium-viewer .cesium-viewer-toolbar,
-          .cesium-viewer .cesium-viewer-bottom {
-            top: 60px !important;
-          }
-          .cesium-baseLayerPicker-dropDown {
-            top: 60px !important;
-          }
-        </style>
-      </div>
+      <style>
+        /* Force globe container to take full space */
+        #globeContainer {
+          position: absolute;
+          top: 0;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          width: 100%;
+          height: 100%;
+          z-index: 0;
+          pointer-events: auto !important;
+        }
+        /* Push Cesium widgets below navbar */
+        .cesium-viewer .cesium-viewer-toolbar,
+        .cesium-viewer .cesium-viewer-bottom {
+          top: 60px !important;
+        }
+        .cesium-baseLayerPicker-dropDown {
+          top: 60px !important;
+        }
+        /* Ensure Cesium canvas receives events */
+        .cesium-viewer,
+        .cesium-viewer-cesiumWidgetContainer,
+        .cesium-widget,
+        .cesium-widget canvas {
+          pointer-events: auto !important;
+        }
+      </style>
+      <div id="globeContainer"></div>
       <div class="globe-stats" id="globeStats" style="position: absolute; top: 70px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; z-index: 1000; pointer-events: none;">Loading...</div>
       <div class="globe-controls" id="globeControls" style="position: absolute; top: 70px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: sans-serif; font-size: 12px; z-index: 1000; pointer-events: auto;">
         <label style="display: block; margin-bottom: 6px; cursor: pointer;">

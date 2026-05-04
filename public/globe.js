@@ -437,52 +437,55 @@
 
   // Initialize
   async function init(app, routeParam) {
-    app.innerHTML = `
-      <style>
-        /* Force globe container to take full space */
-        #globeContainer {
-          position: absolute;
-          top: 0;
-          left: 0;
-          right: 0;
-          bottom: 0;
-          width: 100%;
-          height: 100%;
-          z-index: 0;
-          pointer-events: auto !important;
-        }
-        /* Push Cesium widgets below navbar */
-        .cesium-viewer .cesium-viewer-toolbar,
-        .cesium-viewer .cesium-viewer-bottom {
-          top: 60px !important;
-        }
-        .cesium-baseLayerPicker-dropDown {
-          top: 60px !important;
-        }
-        /* Ensure Cesium canvas receives events */
-        .cesium-viewer,
-        .cesium-viewer-cesiumWidgetContainer,
-        .cesium-widget,
-        .cesium-widget canvas {
-          pointer-events: auto !important;
-        }
-      </style>
-      <div id="globeContainer"></div>
-      <div class="globe-stats" id="globeStats" style="position: absolute; top: 70px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; z-index: 1000; pointer-events: none;">Loading...</div>
-      <div class="globe-controls" id="globeControls" style="position: absolute; top: 70px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: sans-serif; font-size: 12px; z-index: 1000; pointer-events: auto;">
-        <label style="display: block; margin-bottom: 6px; cursor: pointer;">
-          <input type="checkbox" id="globeRealisticToggle" style="margin-right: 6px; pointer-events: auto;">
-          Realistic propagation
-        </label>
-        <label style="display: block; cursor: pointer;">
-          <input type="checkbox" id="globeColorHashToggle" style="margin-right: 6px; pointer-events: auto;">
-          Color by hash
-        </label>
-      </div>
-    `;
+    // Clear app and set it up as the Cesium container directly
+    app.innerHTML = '';
+    app.style.position = 'absolute';
+    app.style.top = '0';
+    app.style.left = '0';
+    app.style.right = '0';
+    app.style.bottom = '0';
+    app.style.width = '100%';
+    app.style.height = '100%';
+    app.style.overflow = 'hidden';
 
-    const container = document.getElementById('globeContainer');
-    statsDiv = document.getElementById('globeStats');
+    // Add stylesheet
+    const style = document.createElement('style');
+    style.textContent = `
+      /* Push Cesium widgets below navbar */
+      .cesium-viewer .cesium-viewer-toolbar,
+      .cesium-viewer .cesium-viewer-bottom {
+        top: 60px !important;
+      }
+      .cesium-baseLayerPicker-dropDown {
+        top: 60px !important;
+      }
+    `;
+    document.head.appendChild(style);
+
+    // Create stats panel
+    statsDiv = document.createElement('div');
+    statsDiv.id = 'globeStats';
+    statsDiv.style.cssText = 'position: absolute; top: 70px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; z-index: 1000; pointer-events: none;';
+    statsDiv.textContent = 'Loading...';
+    document.body.appendChild(statsDiv);
+
+    // Create controls panel
+    const controlsDiv = document.createElement('div');
+    controlsDiv.id = 'globeControls';
+    controlsDiv.style.cssText = 'position: absolute; top: 70px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: sans-serif; font-size: 12px; z-index: 1000;';
+    controlsDiv.innerHTML = `
+      <label style="display: block; margin-bottom: 6px; cursor: pointer;">
+        <input type="checkbox" id="globeRealisticToggle" style="margin-right: 6px;">
+        Realistic propagation
+      </label>
+      <label style="display: block; cursor: pointer;">
+        <input type="checkbox" id="globeColorHashToggle" style="margin-right: 6px;">
+        Color by hash
+      </label>
+    `;
+    document.body.appendChild(controlsDiv);
+
+    const container = app;
 
     if (typeof Cesium === 'undefined') {
       app.innerHTML = '<div style="padding: 40px; text-align: center;">Cesium not loaded</div>';
@@ -550,6 +553,13 @@
       unregisterWSHandler(wsHandler);
       wsHandler = null;
     }
+    
+    // Remove panels from document.body
+    const stats = document.getElementById('globeStats');
+    const controls = document.getElementById('globeControls');
+    if (stats) stats.remove();
+    if (controls) controls.remove();
+    
     statsDiv = null;
   }
 

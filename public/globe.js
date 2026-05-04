@@ -381,12 +381,43 @@
     const entry = VCR.buffer[VCR.playhead];
     const pkt = entry.packet;
     
+    // Debug: log packet structure on first packet
+    if (VCR.playhead === 0) {
+      console.log('[globe] First packet structure:', {
+        keys: Object.keys(pkt),
+        from: pkt.from,
+        to: pkt.to,
+        source: pkt.source,
+        destination: pkt.destination,
+        hops: pkt.hops,
+        observations: pkt.observations
+      });
+    }
+    
+    // Try different field names (API uses source/destination, not from/to)
+    const from = pkt.from || pkt.source;
+    const to = pkt.to || pkt.destination;
+    
     // Pulse nodes for this packet
-    if (pkt.from) pulseNode(pkt.from);
-    if (pkt.to) pulseNode(pkt.to);
-    if (pkt.hops && pkt.hops.length > 0) {
-      pkt.hops.forEach(hop => {
-        if (hop.node) pulseNode(hop.node);
+    if (from) {
+      console.log(`[globe] Pulsing source: ${from}`);
+      pulseNode(from);
+    }
+    if (to) {
+      console.log(`[globe] Pulsing destination: ${to}`);
+      pulseNode(to);
+    }
+    
+    // Check observations array for hops
+    const hops = pkt.hops || pkt.observations || [];
+    if (hops.length > 0) {
+      console.log(`[globe] Processing ${hops.length} hops/observations`);
+      hops.forEach(hop => {
+        const hopNode = hop.node || hop.observer_id || hop.observerId;
+        if (hopNode) {
+          console.log(`[globe] Pulsing hop: ${hopNode}`);
+          pulseNode(hopNode);
+        }
       });
     }
     

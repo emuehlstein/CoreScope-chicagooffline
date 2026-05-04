@@ -447,16 +447,23 @@
 
   // Initialize
   async function init(app, routeParam) {
-    // Clear app and set it up as the Cesium container directly
-    app.innerHTML = '';
-    app.style.position = 'absolute';
-    app.style.top = '0';
-    app.style.left = '0';
-    app.style.right = '0';
-    app.style.bottom = '0';
-    app.style.width = '100%';
-    app.style.height = '100%';
-    app.style.overflow = 'hidden';
+    // Create a full-viewport container that sits ABOVE CoreScope's #app
+    // This bypasses any event handlers CoreScope has on #app
+    const fullscreenContainer = document.createElement('div');
+    fullscreenContainer.id = 'cesium-fullscreen-container';
+    fullscreenContainer.style.cssText = `
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: 9999;
+      background: #000;
+    `;
+    document.body.appendChild(fullscreenContainer);
+    
+    // Clear app (it's now just a placeholder)
+    app.innerHTML = '<div style="padding: 20px; color: white;">Globe view active (fullscreen)</div>';
 
     // Add stylesheet
     const style = document.createElement('style');
@@ -495,7 +502,7 @@
     `;
     document.body.appendChild(controlsDiv);
 
-    const container = app;
+    const container = fullscreenContainer;
 
     if (typeof Cesium === 'undefined') {
       app.innerHTML = '<div style="padding: 40px; text-align: center;">Cesium not loaded</div>';
@@ -564,11 +571,13 @@
       wsHandler = null;
     }
     
-    // Remove panels from document.body
+    // Remove panels and fullscreen container from document.body
     const stats = document.getElementById('globeStats');
     const controls = document.getElementById('globeControls');
+    const fsContainer = document.getElementById('cesium-fullscreen-container');
     if (stats) stats.remove();
     if (controls) controls.remove();
+    if (fsContainer) fsContainer.remove();
     
     statsDiv = null;
   }

@@ -957,6 +957,15 @@ window.addEventListener('DOMContentLoaded', () => {
                                   .reverse() // right-to-left
                                   .concat(allLinks.filter(a => a.dataset.priority === 'high').reverse());
 
+    // Chicago Offline override: mark all non-priority links as overflow
+    // so they populate the More dropdown (CSS hides them inline, but
+    // upstream JS needs .is-overflow class to clone them into the menu)
+    allLinks.forEach(function(link) {
+      if (link.dataset.priority !== 'high') {
+        link.classList.add('is-overflow');
+      }
+    });
+
     function rebuildMoreMenu() {
       navMoreMenu.innerHTML = '';
       const hidden = allLinks.filter(a => a.classList.contains('is-overflow'));

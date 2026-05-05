@@ -917,15 +917,17 @@ window.addEventListener('DOMContentLoaded', () => {
   // --- Hamburger Menu ---
   const hamburger = document.getElementById('hamburger');
   const navLinks = document.querySelector('.nav-links');
-  hamburger.addEventListener('click', () => {
-    const opening = !navLinks.classList.contains('open');
-    navLinks.classList.toggle('open');
-    document.body.classList.toggle('nav-open');
-    hamburger.setAttribute('aria-expanded', String(opening));
-  });
-  navLinks.querySelectorAll('.nav-link').forEach(link => {
-    link.addEventListener('click', closeNav);
-  });
+  if (hamburger && navLinks) {
+    hamburger.addEventListener('click', () => {
+      const opening = !navLinks.classList.contains('open');
+      navLinks.classList.toggle('open');
+      document.body.classList.toggle('nav-open');
+      hamburger.setAttribute('aria-expanded', String(opening));
+    });
+    navLinks.querySelectorAll('.nav-link').forEach(link => {
+      link.addEventListener('click', closeNav);
+    });
+  }
 
   // --- "More" dropdown — JS-driven Priority+ (Issue #1102) ---
   const navMoreBtn = document.getElementById('navMoreBtn');

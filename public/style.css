@@ -1336,7 +1336,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 .nav-more-wrap { display: none; position: relative; }
 .nav-more-btn { display: inline-flex; }
 .nav-more-menu {
-  display: none; position: absolute; top: calc(var(--top-nav-h, 52px) - 4px); right: 0;
+  display: none; position: absolute; top: calc(100% + 4px); right: 0;
   background: var(--nav-bg); border: 1px solid var(--border); border-radius: 8px;
   box-shadow: 0 4px 12px rgba(0,0,0,0.15); flex-direction: column;
   min-width: 160px; padding: 4px 0; z-index: 1200;

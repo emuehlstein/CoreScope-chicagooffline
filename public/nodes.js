@@ -82,12 +82,26 @@
     var parts = [];
     if (tab && tab !== 'all') parts.push('tab=' + encodeURIComponent(tab));
     if (searchStr) parts.push('search=' + encodeURIComponent(searchStr));
+    // #749 — encode current sort state (default 'last_seen:desc' is omitted).
+    if (window.URLState) {
+      var st = _getSortState();
+      var isDefault = st.column === 'last_seen' && st.direction === 'desc';
+      if (!isDefault) {
+        var token = URLState.serializeSort(st.column, st.direction);
+        if (token) parts.push('sort=' + encodeURIComponent(token));
+      }
+    }
     return parts.length ? '?' + parts.join('&') : '';
   }
   window.buildNodesQuery = buildNodesQuery;
 
   function updateNodesUrl() {
-    history.replaceState(null, '', '#/nodes' + buildNodesQuery(activeTab, search));
+    // Preserve subpath (e.g. #/nodes/<pubkey>) so this doesn't break detail deep-links.
+    var cur = String(location.hash || '');
+    var subpath = '';
+    var m = cur.match(/^#\/nodes(\/[^?]*)?/);
+    if (m && m[1]) subpath = m[1];
+    history.replaceState(null, '', '#/nodes' + subpath + buildNodesQuery(activeTab, search));
   }
 
   function renderNodeTimestampHtml(isoString) {
@@ -370,6 +384,15 @@
     const _urlSearch = _listUrlParams.get('search');
     if (_urlTab && TABS.some(function(t) { return t.key === _urlTab; })) activeTab = _urlTab;
     if (_urlSearch) search = _urlSearch;
+    // #749 — restore sort from URL (overrides localStorage persistence).
+    var _urlSort = _listUrlParams.get('sort');
+    if (_urlSort && window.URLState) {
+      var _parsedSort = URLState.parseSort(_urlSort);
+      if (_parsedSort && _parsedSort.column) {
+        try { localStorage.setItem('meshcore-nodes-sort', JSON.stringify(_parsedSort)); } catch {}
+        _fallbackSortState = _parsedSort;
+      }
+    }
 
     app.innerHTML = `<div class="nodes-page">
       <div class="nodes-topbar">
@@ -492,6 +515,7 @@
           <div class="node-detail-key mono" style="font-size:11px;word-break:break-all;margin-bottom:6px">${n.public_key}</div>
           <div>
             <button class="btn-primary" id="copyUrlBtn" style="font-size:12px;padding:4px 10px">📋 Copy URL</button>
+            <button class="btn-primary" id="copyShortUrlBtn" title="Short URL using an 8-char pubkey prefix — easier to send over the mesh (issue #772)" style="font-size:12px;padding:4px 10px;margin-left:6px">📡 Copy short URL</button>
             <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="display:inline-block;margin-left:6px;text-decoration:none;font-size:12px;padding:4px 10px">📊 Analytics</a>
           </div>
         </div>
@@ -507,6 +531,22 @@
         <table class="node-stats-table" id="node-stats">
           <tr><td>Status</td><td><span title="${si.statusTooltip}">${statusLabel}</span> <span style="font-size:11px;color:var(--text-muted);margin-left:4px">${statusExplanation}</span></td></tr>
           <tr><td>Last Heard</td><td>${renderNodeTimestampHtml(lastHeard || n.last_seen)}</td></tr>
+          ${(n.role === 'repeater' || n.role === 'room') ? `<tr><td title="Last time this repeater appeared as a relay hop in a non-advert packet observed by the network. Distinct from 'Last Heard' (which counts the repeater's own adverts). See issue #662.">Last Relayed</td><td>${n.last_relayed ? renderNodeTimestampHtml(n.last_relayed) + ' ' + (n.relay_active ? '<span style="color:var(--status-green);font-size:11px">🟢 actively relaying</span>' : '<span style="color:var(--status-yellow);font-size:11px">🟡 alive (idle)</span>') : '<span style="color:var(--text-muted)">never observed as relay hop</span> <span style="color:var(--status-yellow);font-size:11px">🟡 alive (idle)</span>'}${(n.relay_count_1h != null || n.relay_count_24h != null) ? ` <span style="color:var(--text-muted);font-size:11px;margin-left:4px">(${n.relay_count_1h || 0} relays/hr, ${n.relay_count_24h || 0} relays/24h)</span>` : ''}</td></tr>` : ''}
+          ${(n.role === 'repeater' || n.role === 'room') && n.usefulness_score != null ? (() => {
+            const s = Number(n.usefulness_score) || 0;
+            const pct = (s * 100).toFixed(1);
+            // Visual indicator: width % bar with green→yellow→red color by score.
+            // Per issue #672 classification table: 0.8+ Critical, 0.6+ Valuable,
+            // 0.3+ Moderate, 0.1+ Marginal, else Redundant.
+            let label, color;
+            if (s >= 0.8) { label = 'Critical'; color = 'var(--status-green, #2ecc71)'; }
+            else if (s >= 0.6) { label = 'Valuable'; color = 'var(--status-green, #2ecc71)'; }
+            else if (s >= 0.3) { label = 'Moderate'; color = 'var(--status-yellow, #f1c40f)'; }
+            else if (s >= 0.1) { label = 'Marginal'; color = 'var(--status-orange, #e67e22)'; }
+            else { label = 'Redundant'; color = 'var(--status-red, #e74c3c)'; }
+            const barWidth = Math.max(2, Math.round(s * 100));
+            return `<tr id="row-usefulness-score" data-usefulness-score="${s.toFixed(4)}"><td title="Fraction of non-advert traffic in the network observed by CoreScope that this repeater carries as a relay hop (Traffic axis of issue #672). Range 0–1; higher = forwards more of the mesh's actual traffic.">Usefulness</td><td><span style="display:inline-block;vertical-align:middle;width:80px;height:8px;background:var(--bg-secondary,#333);border-radius:4px;overflow:hidden;margin-right:6px"><span style="display:block;width:${barWidth}%;height:100%;background:${color}"></span></span><span style="color:${color};font-weight:600">${pct}%</span> <span style="color:var(--text-muted);font-size:11px;margin-left:4px">${label}</span></td></tr>`;
+          })() : ''}
           <tr><td>First Seen</td><td>${renderNodeTimestampHtml(n.first_seen)}</td></tr>
           <tr><td>Total Packets</td><td>${stats.totalTransmissions || stats.totalPackets || n.advert_count || 0}${stats.totalObservations && stats.totalObservations !== (stats.totalTransmissions || stats.totalPackets) ? ' <span class="text-muted" style="font-size:0.85em">(seen ' + stats.totalObservations + '×)</span>' : ''}</td></tr>
           <tr><td>Packets Today</td><td>${stats.packetsToday || 0}</td></tr>
@@ -609,6 +649,17 @@
         window.copyToClipboard(nodeUrl, () => {
           btn.textContent = '✅ Copied!';
           setTimeout(() => btn.textContent = '📋 Copy URL', 2000);
+        });
+      });
+
+      // Copy short URL — issue #772. Uses an 8-char pubkey prefix; the
+      // backend resolves it to the canonical pubkey when unambiguous.
+      const shortUrl = location.origin + '#/nodes/' + n.public_key.slice(0, 8);
+      document.getElementById('copyShortUrlBtn')?.addEventListener('click', () => {
+        const btn = document.getElementById('copyShortUrlBtn');
+        window.copyToClipboard(shortUrl, () => {
+          btn.textContent = '✅ Copied!';
+          setTimeout(() => btn.textContent = '📡 Copy short URL', 2000);
         });
       });
 
@@ -1039,16 +1090,16 @@
           </select>
         </div>
       </div>
-      <table class="data-table" id="nodesTable">
+      <div class="table-fluid-wrap"><table class="data-table" id="nodesTable">
         <thead><tr>
-          <th scope="col" data-sort-key="name">Name</th>
-          <th scope="col" class="col-pubkey" data-sort-key="public_key">Public Key</th>
-          <th scope="col" data-sort-key="role">Role</th>
-          <th scope="col" data-sort-key="last_seen" data-sort-default="desc">Last Seen</th>
-          <th scope="col" data-sort-key="advert_count" data-sort-default="desc">Adverts</th>
+          <th scope="col" data-sort-key="name" data-priority="1">Name</th>
+          <th scope="col" class="col-pubkey" data-sort-key="public_key" data-priority="3">Public Key</th>
+          <th scope="col" data-sort-key="role" data-priority="2">Role</th>
+          <th scope="col" data-sort-key="last_seen" data-sort-default="desc" data-priority="1">Last Seen</th>
+          <th scope="col" data-sort-key="advert_count" data-sort-default="desc" data-priority="2">Adverts</th>
         </tr></thead>
         <tbody id="nodesBody"></tbody>
-      </table>`;
+      </table></div>`;
 
     // Tab clicks
     const nodeTabs = document.getElementById('nodeTabs');
@@ -1079,7 +1130,7 @@
         defaultColumn: 'last_seen',
         defaultDirection: 'desc',
         storageKey: 'meshcore-nodes-sort',
-        onSort: function () { renderRows(); }
+        onSort: function () { renderRows(); updateNodesUrl(); }
       });
     }
 
@@ -1182,6 +1233,11 @@
     }).join('');
     bindFavStars(tbody);
     makeColumnsResizable('#nodesTable', 'meshcore-nodes-col-widths');
+    // #1056: fluid columns + +N hidden pill
+    if (window.TableResponsive) {
+      var _ndTbl = document.getElementById('nodesTable');
+      if (_ndTbl) window.TableResponsive.register(_ndTbl);
+    }
   }
 
   /**

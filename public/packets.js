@@ -1,6 +1,178 @@
 /* === CoreScope — packets.js === */
 'use strict';
 
+/* === #1056: TableResponsive — fluid columns + "+N hidden" pill ============
+ * Tiny helper, defined once, used by packets/nodes/observers tables.
+ *
+ * Usage: TableResponsive.apply(tableEl)
+ *
+ * Each <th> may carry a `data-priority` attribute (1=keep always, higher
+ * numbers = drop first as viewport narrows). Default priority is 1.
+ *
+ * apply() measures the container width and progressively hides the highest-
+ * priority columns (and matching <td>s) until the table's natural scrollWidth
+ * fits, then renders a "+N hidden" pill in the last visible <th>. Click the
+ * pill to reveal all hidden columns until the next layout pass.
+ *
+ * Re-runs on window resize (debounced) and is idempotent — safe to call after
+ * every render. ResizeObserver on the wrapping element also triggers re-fit.
+ */
+(function () {
+  if (window.TableResponsive) return;
+
+  const REVEAL_FLAG = '__tr_reveal';
+  const PILL_CLASS = 'col-hidden-pill';
+  const HIDDEN_CLASS = 'col-hidden';
+
+  function thsOf(table) { return Array.from(table.querySelectorAll('thead > tr > th')); }
+
+  function clearHidden(table) {
+    table.querySelectorAll('.' + HIDDEN_CLASS).forEach(el => el.classList.remove(HIDDEN_CLASS));
+    const pill = table.querySelector('.' + PILL_CLASS);
+    if (pill) pill.remove();
+  }
+
+  function colIndexCells(table, idx) {
+    // Return the <td> at column index `idx` for every body row.
+    const out = [];
+    const rows = table.querySelectorAll('tbody > tr');
+    rows.forEach(r => {
+      // colSpan-aware mapping: walk cells, accumulate colspans.
+      let i = 0;
+      for (const cell of r.children) {
+        const span = cell.colSpan || 1;
+        if (i <= idx && idx < i + span) { out.push(cell); break; }
+        i += span;
+      }
+    });
+    return out;
+  }
+
+  function apply(table) {
+    if (!table || !table.isConnected) return;
+    if (table[REVEAL_FLAG]) {
+      // user explicitly requested reveal — clear hidden state and skip
+      clearHidden(table);
+      return;
+    }
+    clearHidden(table);
+
+    const ths = thsOf(table);
+    if (ths.length === 0) return;
+
+    // Viewport-breakpoint hiding (per issue #1056 acceptance criteria):
+    //   data-priority on each <th>:
+    //     1 → always visible
+    //     2 → hide when viewport ≤ 1280
+    //     3 → hide when viewport ≤ 1024  (per AC #1 wording)
+    //     4 → hide when viewport ≤  900
+    //     5 → hide when viewport ≤  768
+    // Higher priority numbers drop FIRST (least important).
+    // Drop direction: a column is hidden if its breakpoint ≥ current viewport.
+    const BP = { 2: 1280, 3: 1024, 4: 900, 5: 768 };
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+
+    const candidates = ths
+      .map((th, i) => ({ th, i, prio: parseInt(th.getAttribute('data-priority') || '1', 10) }))
+      .filter(c => c.prio > 1 && BP[c.prio] !== undefined && vw <= BP[c.prio])
+      // hide highest priority numbers first (drop-first), then right-to-left ties
+      .sort((a, b) => b.prio - a.prio || b.i - a.i);
+
+    let hidden = 0;
+    for (const c of candidates) {
+      c.th.classList.add(HIDDEN_CLASS);
+      colIndexCells(table, c.i).forEach(td => td.classList.add(HIDDEN_CLASS));
+      hidden++;
+    }
+
+    if (hidden > 0) {
+      const visible = ths.filter(th => !th.classList.contains(HIDDEN_CLASS));
+      const host = visible[visible.length - 1] || ths[0];
+      const pill = document.createElement('button');
+      pill.type = 'button';
+      pill.className = PILL_CLASS;
+      pill.textContent = '+' + hidden + ' hidden';
+      pill.title = 'Click to reveal hidden columns';
+      pill.setAttribute('aria-label', hidden + ' columns hidden — click to reveal');
+      pill.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        ev.preventDefault();
+        table[REVEAL_FLAG] = true;
+        clearHidden(table);
+        // Add a small "hide again" affordance after reveal so the user isn't stuck.
+        const rehide = document.createElement('button');
+        rehide.type = 'button';
+        rehide.className = PILL_CLASS + ' col-rehide-pill';
+        rehide.textContent = 'hide';
+        rehide.title = 'Re-hide collapsed columns';
+        rehide.setAttribute('aria-label', 'Re-hide previously collapsed columns');
+        rehide.addEventListener('click', function (ev2) {
+          ev2.stopPropagation();
+          ev2.preventDefault();
+          table[REVEAL_FLAG] = false;
+          apply(table);
+        });
+        rehide.addEventListener('keydown', function (ev2) {
+          // Prevent Enter/Space from bubbling up to TableSort handler on the <th>.
+          if (ev2.key === 'Enter' || ev2.key === ' ') ev2.stopPropagation();
+        });
+        host.appendChild(rehide);
+      });
+      // MAJOR-3: prevent Enter/Space keydown on the pill from bubbling to the
+      // <th>'s TableSort keydown handler (which would also trigger a sort).
+      pill.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') ev.stopPropagation();
+      });
+      host.appendChild(pill);
+    }
+  }
+
+  // Track tables we've wired up so resize triggers re-apply.
+  const wired = new Set();
+  // Track last-seen wrap width per table so we only treat ACTUAL container
+  // resizes as a reason to drop the user's reveal state. Hiding/showing
+  // columns and removing the pill mutate layout and re-trigger ResizeObserver,
+  // which would otherwise immediately stomp on the reveal the user just asked for.
+  const lastWrapW = new WeakMap();
+  function register(table) {
+    if (!table || wired.has(table)) { apply(table); return; }
+    wired.add(table);
+    if (typeof ResizeObserver !== 'undefined') {
+      const wrap = table.closest('.table-fluid-wrap, .obs-table-scroll, .table-scroll-wrap') || table.parentElement;
+      if (wrap) {
+        lastWrapW.set(table, wrap.clientWidth || 0);
+        const ro = new ResizeObserver(() => {
+          const prev = lastWrapW.get(table) || 0;
+          const cur = wrap.clientWidth || 0;
+          // Ignore self-induced layout reflows from apply()/clearHidden() —
+          // they don't change the wrap width. Only real viewport/container
+          // changes (>2px) clear the reveal flag.
+          if (Math.abs(cur - prev) <= 2) return;
+          lastWrapW.set(table, cur);
+          table[REVEAL_FLAG] = false;
+          apply(table);
+        });
+        ro.observe(wrap);
+      }
+    }
+    apply(table);
+  }
+
+  let _winTimer = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(_winTimer);
+    _winTimer = setTimeout(() => {
+      wired.forEach(t => {
+        if (!t.isConnected) { wired.delete(t); return; }
+        t[REVEAL_FLAG] = false;
+        apply(t);
+      });
+    }, 120);
+  });
+
+  window.TableResponsive = { apply, register };
+})();
+
 (function () {
   let packets = [];
   let hashIndex = new Map(); // hash → packet group for O(1) dedup
@@ -53,12 +225,25 @@
     if (filters.observer) parts.push('observer=' + encodeURIComponent(filters.observer));
     if (filters.channel) parts.push('channel=' + encodeURIComponent(filters.channel));
     if (filters._filterExpr) parts.push('filter=' + encodeURIComponent(filters._filterExpr));
+    // Sort state (#749) — encode as 'col[:asc]'; default 'time:desc' is omitted.
+    if (_packetSortColumn) {
+      var sortDefault = _packetSortColumn === 'time' && _packetSortDirection === 'desc';
+      if (!sortDefault && window.URLState) {
+        var sortToken = URLState.serializeSort(_packetSortColumn, _packetSortDirection);
+        if (sortToken) parts.push('sort=' + encodeURIComponent(sortToken));
+      }
+    }
     return parts.length ? '?' + parts.join('&') : '';
   }
   window.buildPacketsQuery = buildPacketsQuery;
 
   function updatePacketsUrl() {
-    history.replaceState(null, '', '#/packets' + buildPacketsQuery(savedTimeWindowMin, RegionFilter.getRegionParam()));
+    // Preserve any subpath after /packets (e.g. #/packets/<hash>).
+    var cur = String(location.hash || '');
+    var subpath = '';
+    var m = cur.match(/^#\/packets(\/[^?]*)?/);
+    if (m && m[1]) subpath = m[1];
+    history.replaceState(null, '', '#/packets' + subpath + buildPacketsQuery(savedTimeWindowMin, RegionFilter.getRegionParam()));
     // Update clear-filters button visibility
     var cb = document.getElementById('clearFiltersBtn');
     if (cb) {
@@ -366,6 +551,17 @@
     if (_urlChannel) filters.channel = _urlChannel;
     var _urlFilterExpr = _initUrlParams.get('filter');
     if (_urlFilterExpr) filters._filterExpr = _urlFilterExpr;
+    // #749 — restore sort state from URL (overrides localStorage).
+    var _urlSort = _initUrlParams.get('sort');
+    if (_urlSort && window.URLState) {
+      var _parsed = URLState.parseSort(_urlSort);
+      if (_parsed) {
+        _packetSortColumn = _parsed.column;
+        _packetSortDirection = _parsed.direction;
+        // Persist so TableSort init picks it up.
+        try { localStorage.setItem('meshcore-packets-sort', JSON.stringify({ column: _parsed.column, direction: _parsed.direction })); } catch {}
+      }
+    }
 
     app.innerHTML = `<div class="split-layout detail-collapsed">
       <div class="panel-left" id="pktLeft" aria-live="polite" aria-relevant="additions removals"></div>
@@ -781,7 +977,7 @@
           <button class="btn-icon" data-action="pkt-byop" title="Bring Your Own Packet" aria-label="Bring Your Own Packet - paste raw packet hex for analysis" aria-haspopup="dialog">📦 BYOP</button>
         </div>
       </div>
-      <div class="filter-group" style="flex:1;margin-bottom:8px">
+      <div class="filter-group" style="flex:1;margin-bottom:8px;position:relative">
         <input type="text" id="packetFilterInput" class="packet-filter-input"
           placeholder='Filter: type == Advert && snr > 5 · payload.name contains "Gilroy"'
           aria-label="Packet filter expression"
@@ -837,7 +1033,7 @@
             <option value="chrono-asc">Sort: Time ↑ (earliest)</option>
             <option value="chrono-desc">Sort: Time ↓ (latest)</option>
           </select>
-          <span class="sort-help" id="sortHelpIcon">ⓘ</span>
+          <span class="sort-help" id="sortHelpIcon" tabindex="0" role="button" aria-label="Sort help">ⓘ</span>
         </div>
         <div class="filter-group">
           <div class="col-toggle-wrap">
@@ -847,14 +1043,14 @@
           <button class="btn btn-icon${showHexHashes ? ' active' : ''}" id="hexHashToggle" title="Show raw hex hash prefixes instead of resolved node names in the path column">Hex Paths</button>
         </div>
       </div>
-      <table class="data-table" id="pktTable">
+      <div class="table-fluid-wrap"><table class="data-table" id="pktTable">
         <thead><tr>
-          <th scope="col"></th><th scope="col" class="col-region" data-sort-key="region">Region</th><th scope="col" class="col-time" data-sort-key="time" data-type="date">Time</th><th scope="col" class="col-hash" data-sort-key="hash">Hash</th><th scope="col" class="col-size" data-sort-key="size" data-type="numeric">Size</th>
-          <th scope="col" class="col-hashsize" data-sort-key="hb" data-type="numeric">HB</th>
-          <th scope="col" class="col-type" data-sort-key="type">Type</th><th scope="col" class="col-observer" data-sort-key="observer">Observer</th><th scope="col" class="col-path" data-sort-key="path">Path</th><th scope="col" class="col-rpt" data-sort-key="rpt" data-type="numeric">Rpt</th><th scope="col" class="col-details">Details</th>
+          <th scope="col" data-priority="1"></th><th scope="col" class="col-region" data-sort-key="region" data-priority="3">Region</th><th scope="col" class="col-time" data-sort-key="time" data-type="date" data-priority="1">Time</th><th scope="col" class="col-hash" data-sort-key="hash" data-priority="1">Hash</th><th scope="col" class="col-size" data-sort-key="size" data-type="numeric" data-priority="4">Size</th>
+          <th scope="col" class="col-hashsize" data-sort-key="hb" data-type="numeric" data-priority="5">HB</th>
+          <th scope="col" class="col-type" data-sort-key="type" data-priority="1">Type</th><th scope="col" class="col-observer" data-sort-key="observer" data-priority="3">Observer</th><th scope="col" class="col-path" data-sort-key="path" data-priority="2">Path</th><th scope="col" class="col-rpt" data-sort-key="rpt" data-type="numeric" data-priority="4">Rpt</th><th scope="col" class="col-details" data-priority="2">Details</th>
         </tr></thead>
         <tbody id="pktBody"></tbody>
-      </table>
+      </table></div>
     `;
 
     // Init shared RegionFilter component
@@ -915,6 +1111,12 @@
         }, 300);
       });
     })();
+
+    // Wireshark-style filter UX (#966): help popover, autocomplete, right-click
+    // context menu, saved-filter dropdown. Idempotent — safe to re-call.
+    if (window.FilterUX && typeof window.FilterUX.init === 'function') {
+      window.FilterUX.init();
+    }
 
     // --- Observer multi-select ---
     const obsMenu = document.getElementById('observerMenu');
@@ -1377,6 +1579,12 @@
 
     renderTableRows();
     makeColumnsResizable('#pktTable', 'meshcore-pkt-col-widths');
+    // #1056: register fluid-column responsive behavior (drops priority>1 cols
+    // when narrow, shows "+N hidden" pill, reveals on click). Idempotent.
+    if (window.TableResponsive) {
+      var _pktTbl = document.getElementById('pktTable');
+      if (_pktTbl) window.TableResponsive.register(_pktTbl);
+    }
 
     // Initialize table sorting (virtual scroll — sort data array, not DOM)
     if (window.TableSort) {
@@ -1393,6 +1601,7 @@
             _packetSortDirection = direction;
             sortPacketsArray();
             renderTableRows();
+            updatePacketsUrl();
           }
         });
         // Apply initial sort state from TableSort
@@ -1436,11 +1645,11 @@
           <td style="width:28px;text-align:center;cursor:pointer">${isSingle ? '' : (isExpanded ? '▼' : '▶')}</td>
           <td class="col-region">${groupRegion ? `<span class="badge-region">${groupRegion}</span>` : '—'}</td>
           <td class="col-time">${renderTimestampCell(p.latest)}</td>
-          <td class="mono col-hash">${truncate(p.hash || '—', 8)}</td>
-          <td class="col-size">${groupSize ? groupSize + 'B' : '—'}</td>
+          <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(p.hash || '')}">${truncate(p.hash || '—', 8)}</td>
+          <td class="col-size" data-filter-field="size" data-filter-value="${groupSize || ''}">${groupSize ? groupSize + 'B' : '—'}</td>
           <td class="col-hashsize mono">${groupHashBytes}</td>
-          <td class="col-type">${p.payload_type != null ? `<span class="badge badge-${groupTypeClass}">${groupTypeName}</span>${transportBadge(p.route_type)}` : '—'}</td>
-          <td class="col-observer">${isSingle ? truncate(obsName(headerObserverId), 16) : truncate(obsName(headerObserverId), 10) + (p.observer_count > 1 ? ' +' + (p.observer_count - 1) : '')}</td>
+          <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(groupTypeName || '')}">${p.payload_type != null ? `<span class="badge badge-${groupTypeClass}">${groupTypeName}</span>${transportBadge(p.route_type)}` : '—'}</td>
+          <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsName(headerObserverId) || '')}">${isSingle ? truncate(obsName(headerObserverId), 16) : truncate(obsName(headerObserverId), 10) + (p.observer_count > 1 ? ' +' + (p.observer_count - 1) : '')}</td>
           <td class="col-path"><span class="path-hops">${groupPathStr}</span></td>
           <td class="col-rpt">${p.observation_count > 1 ? '<span class="badge badge-obs" title="Seen ' + p.observation_count + ' times">👁 ' + p.observation_count + '</span>' : (isSingle ? '' : p.count)}</td>
           <td class="col-details">${getDetailPreview(getParsedDecoded(p))}</td>
@@ -1462,11 +1671,11 @@
         html += `<tr class="group-child" data-id="${c.id}" data-hash="${c.hash || ''}" data-action="select-observation" data-value="${c.id}" data-parent-hash="${p.hash}" data-entry-idx="${entryIdx}" tabindex="0" role="row"${_childHashStripe ? ' style="' + _childHashStripe + '"' : ''}>
               <td></td><td class="col-region">${childRegion ? `<span class="badge-region">${childRegion}</span>` : '—'}</td>
               <td class="col-time">${renderTimestampCell(c.timestamp)}</td>
-              <td class="mono col-hash">${truncate(c.hash || '', 8)}</td>
-              <td class="col-size">${size}B</td>
+              <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(c.hash || '')}">${truncate(c.hash || '', 8)}</td>
+              <td class="col-size" data-filter-field="size" data-filter-value="${size || ''}">${size}B</td>
               <td class="col-hashsize mono">${childHashBytes}</td>
-              <td class="col-type"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(c.route_type)}</td>
-              <td class="col-observer">${truncate(obsName(c.observer_id), 16)}</td>
+              <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(typeName || '')}"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(c.route_type)}</td>
+              <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsName(c.observer_id) || '')}">${truncate(obsName(c.observer_id), 16)}</td>
               <td class="col-path"><span class="path-hops">${childPathStr}</span></td>
               <td class="col-rpt"></td>
               <td class="col-details">${getDetailPreview(getParsedDecoded(c))}</td>
@@ -1494,11 +1703,11 @@
     return `<tr data-id="${p.id}" data-hash="${p.hash || ''}" data-action="select-hash" data-value="${p.hash || p.id}" data-entry-idx="${entryIdx}" tabindex="0" role="row" class="${selectedId === p.id ? 'selected' : ''}"${_flatStyle ? ' style="' + _flatStyle + '"' : ''}>
         <td></td><td class="col-region">${region ? `<span class="badge-region">${region}</span>` : '—'}</td>
         <td class="col-time">${renderTimestampCell(p.timestamp)}</td>
-        <td class="mono col-hash">${truncate(p.hash || String(p.id), 8)}</td>
-        <td class="col-size">${size}B</td>
+        <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(p.hash || '')}">${truncate(p.hash || String(p.id), 8)}</td>
+        <td class="col-size" data-filter-field="size" data-filter-value="${size || ''}">${size}B</td>
         <td class="col-hashsize mono">${hashBytes}</td>
-        <td class="col-type"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(p.route_type)}</td>
-        <td class="col-observer">${truncate(obsName(p.observer_id), 16)}</td>
+        <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(typeName || '')}"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(p.route_type)}</td>
+        <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsName(p.observer_id) || '')}">${truncate(obsName(p.observer_id), 16)}</td>
         <td class="col-path"><span class="path-hops">${pathStr}</span></td>
         <td class="col-rpt"></td>
         <td class="col-details">${detail}</td>
@@ -1574,11 +1783,17 @@
     if (!topSpacer) {
       topSpacer = document.createElement('tr');
       topSpacer.id = 'vscroll-top';
+      // aria-hidden + visibility:hidden so Playwright/AT treat the sentinel as invisible
+      // while preserving its layout role (the inner <td> height drives virtual-scroll padding).
+      topSpacer.setAttribute('aria-hidden', 'true');
+      topSpacer.style.visibility = 'hidden';
       topSpacer.innerHTML = '<td colspan="' + colCount + '" style="padding:0;border:0"></td>';
     }
     if (!bottomSpacer) {
       bottomSpacer = document.createElement('tr');
       bottomSpacer.id = 'vscroll-bottom';
+      bottomSpacer.setAttribute('aria-hidden', 'true');
+      bottomSpacer.style.visibility = 'hidden';
       bottomSpacer.innerHTML = '<td colspan="' + colCount + '" style="padding:0;border:0"></td>';
     }
 

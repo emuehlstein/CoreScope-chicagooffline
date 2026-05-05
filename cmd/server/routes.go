@@ -132,6 +132,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.Handle("/api/admin/prune", s.requireAPIKey(http.HandlerFunc(s.handleAdminPrune))).Methods("POST")
 	r.Handle("/api/debug/affinity", s.requireAPIKey(http.HandlerFunc(s.handleDebugAffinity))).Methods("GET")
 	r.Handle("/api/dropped-packets", s.requireAPIKey(http.HandlerFunc(s.handleDroppedPackets))).Methods("GET")
+	r.Handle("/api/backup", s.requireAPIKey(http.HandlerFunc(s.handleBackup))).Methods("GET")
 
 	// Packet endpoints
 	r.HandleFunc("/api/packets/observations", s.handleBatchObservations).Methods("POST")
@@ -150,6 +151,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/nodes/{pubkey}/health", s.handleNodeHealth).Methods("GET")
 	r.HandleFunc("/api/nodes/{pubkey}/paths", s.handleNodePaths).Methods("GET")
 	r.HandleFunc("/api/nodes/{pubkey}/analytics", s.handleNodeAnalytics).Methods("GET")
+	r.HandleFunc("/api/nodes/{pubkey}/battery", s.handleNodeBattery).Methods("GET")
 	r.HandleFunc("/api/nodes/clock-skew", s.handleFleetClockSkew).Methods("GET")
 	r.HandleFunc("/api/nodes/{pubkey}/clock-skew", s.handleNodeClockSkew).Methods("GET")
 	r.HandleFunc("/api/observers/clock-skew", s.handleObserverClockSkew).Methods("GET")
@@ -158,6 +160,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/nodes", s.handleNodes).Methods("GET")
 
 	// Analytics endpoints
+	r.HandleFunc("/api/analytics/roles", s.handleAnalyticsRoles).Methods("GET")
 	r.HandleFunc("/api/analytics/rf", s.handleAnalyticsRF).Methods("GET")
 	r.HandleFunc("/api/analytics/topology", s.handleAnalyticsTopology).Methods("GET")
 	r.HandleFunc("/api/analytics/channels", s.handleAnalyticsChannels).Methods("GET")
@@ -1095,16 +1098,37 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	if s.store != nil {
 		hashInfo := s.store.GetNodeHashSizeInfo()
 		mbCap := s.store.GetMultiByteCapMap()
+		relayWindow := s.cfg.GetHealthThresholds().RelayActiveHours
 		for _, node := range nodes {
 			if pk, ok := node["public_key"].(string); ok {
 				EnrichNodeWithHashSize(node, hashInfo[pk])
 				EnrichNodeWithMultiByte(node, mbCap[pk])
+				if role, _ := node["role"].(string); role == "repeater" || role == "room" {
+					info := s.store.GetRepeaterRelayInfo(pk, relayWindow)
+					if info.LastRelayed != "" {
+						node["last_relayed"] = info.LastRelayed
+					}
+					node["relay_active"] = info.RelayActive
+					node["relay_count_1h"] = info.RelayCount1h
+					node["relay_count_24h"] = info.RelayCount24h
+					node["usefulness_score"] = s.store.GetRepeaterUsefulnessScore(pk)
+				}
 			}
 		}
 	}
 	if s.cfg.GeoFilter != nil {
 		filtered := nodes[:0]
 		for _, node := range nodes {
+			// Foreign-flagged nodes (#730) are kept even when their GPS lies
+			// outside the geofilter polygon — that's the whole point of the
+			// flag: operators need to SEE bridged/leaked nodes, not have them
+			// filtered away. The ingestor sets foreign_advert=1 when its
+			// configured geo_filter rejected the advert; the server must
+			// surface those.
+			if isForeign, _ := node["foreign"].(bool); isForeign {
+				filtered = append(filtered, node)
+				continue
+			}
 			if NodePassesGeoFilter(node["lat"], node["lon"], s.cfg.GeoFilter) {
 				filtered = append(filtered, node)
 			}
@@ -1157,9 +1181,37 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	node, err := s.db.GetNodeByPubkey(pubkey)
-	if err != nil || node == nil {
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	// Issue #772: short-URL fallback. If exact pubkey lookup misses and the
+	// path looks like a hex prefix (>=8 chars, <64), try prefix resolution.
+	if node == nil && len(pubkey) >= 8 && len(pubkey) < 64 {
+		resolved, ambiguous, perr := s.db.GetNodeByPrefix(pubkey)
+		if perr != nil {
+			writeError(w, 500, perr.Error())
+			return
+		}
+		if ambiguous {
+			writeError(w, http.StatusConflict, "Ambiguous prefix: multiple nodes match. Use a longer prefix.")
+			return
+		}
+		if resolved != nil {
+			if pk, _ := resolved["public_key"].(string); pk != "" && s.cfg.IsBlacklisted(pk) {
+				writeError(w, 404, "Not found")
+				return
+			}
+			node = resolved
+		}
+	}
+	if node == nil {
 		writeError(w, 404, "Not found")
 		return
+	}
+	// From here on use the canonical pubkey for downstream lookups.
+	if pk, _ := node["public_key"].(string); pk != "" {
+		pubkey = pk
 	}
 
 	if s.store != nil {
@@ -1167,6 +1219,18 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 		EnrichNodeWithHashSize(node, hashInfo[pubkey])
 		mbCap := s.store.GetMultiByteCapMap()
 		EnrichNodeWithMultiByte(node, mbCap[pubkey])
+		if role, _ := node["role"].(string); role == "repeater" || role == "room" {
+			ht := s.cfg.GetHealthThresholds()
+			info := s.store.GetRepeaterRelayInfo(pubkey, ht.RelayActiveHours)
+			if info.LastRelayed != "" {
+				node["last_relayed"] = info.LastRelayed
+			}
+			node["relay_active"] = info.RelayActive
+			node["relay_window_hours"] = info.WindowHours
+			node["relay_count_1h"] = info.RelayCount1h
+			node["relay_count_24h"] = info.RelayCount24h
+			node["usefulness_score"] = s.store.GetRepeaterUsefulnessScore(pubkey)
+		}
 	}
 
 	name := ""
@@ -1525,8 +1589,9 @@ func (s *Server) handleFleetClockSkew(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAnalyticsRF(w http.ResponseWriter, r *http.Request) {
 	region := r.URL.Query().Get("region")
+	window := ParseTimeWindow(r)
 	if s.store != nil {
-		writeJSON(w, s.store.GetAnalyticsRF(region))
+		writeJSON(w, s.store.GetAnalyticsRFWithWindow(region, window))
 		return
 	}
 	writeJSON(w, RFAnalyticsResponse{
@@ -1545,8 +1610,9 @@ func (s *Server) handleAnalyticsRF(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAnalyticsTopology(w http.ResponseWriter, r *http.Request) {
 	region := r.URL.Query().Get("region")
+	window := ParseTimeWindow(r)
 	if s.store != nil {
-		data := s.store.GetAnalyticsTopology(region)
+		data := s.store.GetAnalyticsTopologyWithWindow(region, window)
 		if s.cfg != nil && len(s.cfg.NodeBlacklist) > 0 {
 			data = s.filterBlacklistedFromTopology(data)
 		}
@@ -1568,7 +1634,8 @@ func (s *Server) handleAnalyticsTopology(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleAnalyticsChannels(w http.ResponseWriter, r *http.Request) {
 	if s.store != nil {
 		region := r.URL.Query().Get("region")
-		writeJSON(w, s.store.GetAnalyticsChannels(region))
+		window := ParseTimeWindow(r)
+		writeJSON(w, s.store.GetAnalyticsChannelsWithWindow(region, window))
 		return
 	}
 	channels, _ := s.db.GetChannels()

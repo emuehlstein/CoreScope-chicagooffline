@@ -79,6 +79,21 @@ jobs:
           go test ./...
           echo "--- Decrypt CLI tests passed ---"
 
+      - name: Run JS unit tests (packet-filter)
+        run: |
+          set -e
+          node test-packet-filter.js
+          node test-packet-filter-time.js
+          node test-channel-decrypt-insecure-context.js
+          node test-live-region-filter.js
+          node test-channel-qr.js
+          node test-channel-qr-wiring.js
+          node test-channel-modal-ux.js
+          node test-channel-issue-1087.js
+          node test-channel-issue-1101.js
+          node test-pull-to-reconnect-1091.js
+          node test-channel-fluid-layout.js
+
       - name: Verify proto syntax
         run: |
           set -e
@@ -200,6 +215,13 @@ jobs:
       - name: Run Playwright E2E tests (fail-fast)
         run: |
           BASE_URL=http://localhost:13581 node test-e2e-playwright.js 2>&1 | tee e2e-output.txt
+          BASE_URL=http://localhost:13581 node test-filter-ux-e2e.js 2>&1 | tee -a e2e-output.txt
+          BASE_URL=http://localhost:13581 node test-channel-issue-1087-e2e.js 2>&1 | tee -a e2e-output.txt
+          BASE_URL=http://localhost:13581 node test-map-modal-fluid-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-fluid-1055-e2e.js 2>&1 | tee -a e2e-output.txt
+          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-priority-1102-e2e.js 2>&1 | tee -a e2e-output.txt
+          BASE_URL=http://localhost:13581 node test-channel-fluid-e2e.js 2>&1 | tee -a e2e-output.txt
+          BASE_URL=http://localhost:13581 node test-table-fluid-e2e.js 2>&1 | tee -a e2e-output.txt
 
       - name: Collect frontend coverage (parallel)
         if: success() && github.event_name == 'push'

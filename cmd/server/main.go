@@ -108,6 +108,25 @@ func main() {
 		log.Printf("[security] WARNING: API key is weak or a known default — write endpoints are vulnerable")
 	}
 
+	// Apply Go runtime soft memory limit (#836).
+	// Honors GOMEMLIMIT if set; otherwise derives from packetStore.maxMemoryMB.
+	{
+		_, envSet := os.LookupEnv("GOMEMLIMIT")
+		maxMB := 0
+		if cfg.PacketStore != nil {
+			maxMB = cfg.PacketStore.MaxMemoryMB
+		}
+		limit, source := applyMemoryLimit(maxMB, envSet)
+		switch source {
+		case "env":
+			log.Printf("[memlimit] using GOMEMLIMIT from environment (%s)", os.Getenv("GOMEMLIMIT"))
+		case "derived":
+			log.Printf("[memlimit] derived from packetStore.maxMemoryMB=%d → %d MiB (1.5x headroom)", maxMB, limit/(1024*1024))
+		default:
+			log.Printf("[memlimit] no soft memory limit set (GOMEMLIMIT unset, packetStore.maxMemoryMB=0); recommend setting one to avoid container OOM-kill")
+		}
+	}
+
 	// Resolve DB path
 	resolvedDB := cfg.ResolveDBPath(configDir)
 	log.Printf("[config] port=%d db=%s public=%s", cfg.Port, resolvedDB, publicDir)
@@ -184,6 +203,13 @@ func main() {
 	// adds it but server may run against DBs ingestor never touched, e.g. e2e fixture).
 	if err := ensureLastPacketAtColumn(dbPath); err != nil {
 		log.Printf("[store] warning: could not add observers.last_packet_at column: %v", err)
+	}
+
+	// Ensure nodes.foreign_advert column exists (#730 reads it on every /api/nodes
+	// scan; ingestor migration foreign_advert_v1 adds it but server may run against
+	// DBs ingestor never touched, e.g. e2e fixture).
+	if err := ensureForeignAdvertColumn(dbPath); err != nil {
+		log.Printf("[store] warning: could not add nodes.foreign_advert column: %v", err)
 	}
 
 	// Soft-delete observers that are in the blacklist (mark inactive=1) so

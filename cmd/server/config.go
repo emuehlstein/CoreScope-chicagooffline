@@ -89,6 +89,9 @@ type Config struct {
 
 	ResolvedPath  *ResolvedPathConfig  `json:"resolvedPath,omitempty"`
 	NeighborGraph *NeighborGraphConfig `json:"neighborGraph,omitempty"`
+
+	// BatteryThresholds: voltage cutoffs for low/critical alerts (#663).
+	BatteryThresholds *BatteryThresholdsConfig `json:"batteryThresholds,omitempty"`
 }
 
 // weakAPIKeys is the blocklist of known default/example API keys that must be rejected.
@@ -221,6 +224,10 @@ type HealthThresholds struct {
 	InfraSilentHours   float64 `json:"infraSilentHours"`
 	NodeDegradedHours  float64 `json:"nodeDegradedHours"`
 	NodeSilentHours    float64 `json:"nodeSilentHours"`
+	// RelayActiveHours: how recent a path-hop appearance must be for a
+	// repeater to be considered "actively relaying" vs only "alive
+	// (advert-only)". See issue #662. Defaults to 24h.
+	RelayActiveHours float64 `json:"relayActiveHours"`
 }
 
 // ThemeFile mirrors theme.json overlay.
@@ -289,6 +296,7 @@ func (c *Config) GetHealthThresholds() HealthThresholds {
 		InfraSilentHours:   72,
 		NodeDegradedHours:  1,
 		NodeSilentHours:    24,
+		RelayActiveHours:   24,
 	}
 	if c.HealthThresholds != nil {
 		if c.HealthThresholds.InfraDegradedHours > 0 {
@@ -302,6 +310,9 @@ func (c *Config) GetHealthThresholds() HealthThresholds {
 		}
 		if c.HealthThresholds.NodeSilentHours > 0 {
 			h.NodeSilentHours = c.HealthThresholds.NodeSilentHours
+		}
+		if c.HealthThresholds.RelayActiveHours > 0 {
+			h.RelayActiveHours = c.HealthThresholds.RelayActiveHours
 		}
 	}
 	return h

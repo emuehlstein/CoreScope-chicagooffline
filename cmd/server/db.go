@@ -787,7 +787,7 @@ func (db *DB) GetNodes(limit, offset int, role, search, before, lastHeard, sortB
 	var total int
 	db.conn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM nodes %s", w), args...).Scan(&total)
 
-	querySQL := fmt.Sprintf("SELECT public_key, name, role, lat, lon, last_seen, first_seen, advert_count, battery_mv, temperature_c FROM nodes %s ORDER BY %s LIMIT ? OFFSET ?", w, order)
+	querySQL := fmt.Sprintf("SELECT public_key, name, role, lat, lon, last_seen, first_seen, advert_count, battery_mv, temperature_c, foreign_advert FROM nodes %s ORDER BY %s LIMIT ? OFFSET ?", w, order)
 	qArgs := append(args, limit, offset)
 
 	rows, err := db.conn.Query(querySQL, qArgs...)
@@ -813,7 +813,7 @@ func (db *DB) SearchNodes(query string, limit int) ([]map[string]interface{}, er
 	if limit <= 0 {
 		limit = 10
 	}
-	rows, err := db.conn.Query(`SELECT public_key, name, role, lat, lon, last_seen, first_seen, advert_count, battery_mv, temperature_c
+	rows, err := db.conn.Query(`SELECT public_key, name, role, lat, lon, last_seen, first_seen, advert_count, battery_mv, temperature_c, foreign_advert
 		FROM nodes WHERE name LIKE ? OR public_key LIKE ? ORDER BY last_seen DESC LIMIT ?`,
 		"%"+query+"%", query+"%", limit)
 	if err != nil {
@@ -831,9 +831,58 @@ func (db *DB) SearchNodes(query string, limit int) ([]map[string]interface{}, er
 	return nodes, nil
 }
 
+// GetNodeByPrefix resolves a hex prefix (>=8 chars) to a unique node.
+// Returns (node, ambiguous, error). When multiple nodes share the prefix,
+// returns (nil, true, nil). Used by the short-URL feature (issue #772).
+//
+// Trade-off vs an opaque ID lookup table: prefixes are stable across
+// restarts, self-describing (no allocator needed), and resolve to the
+// authoritative pubkey on the server. Cost: ambiguity grows with the
+// node directory; we mitigate with a hard 8-hex-char (32-bit) minimum
+// and surface 409 Conflict when collisions occur.
+func (db *DB) GetNodeByPrefix(prefix string) (map[string]interface{}, bool, error) {
+	if len(prefix) < 8 {
+		return nil, false, nil
+	}
+	// Validate hex (avoid SQL LIKE wildcards leaking through).
+	for _, c := range prefix {
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isHex {
+			return nil, false, nil
+		}
+	}
+	rows, err := db.conn.Query(
+		`SELECT public_key, name, role, lat, lon, last_seen, first_seen, advert_count, battery_mv, temperature_c, foreign_advert
+		   FROM nodes WHERE public_key LIKE ? LIMIT 2`,
+		prefix+"%",
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	var first map[string]interface{}
+	count := 0
+	for rows.Next() {
+		n := scanNodeRow(rows)
+		if n == nil {
+			continue
+		}
+		count++
+		if count == 1 {
+			first = n
+		} else {
+			return nil, true, nil
+		}
+	}
+	if count == 0 {
+		return nil, false, nil
+	}
+	return first, false, nil
+}
+
 // GetNodeByPubkey returns a single node.
 func (db *DB) GetNodeByPubkey(pubkey string) (map[string]interface{}, error) {
-	rows, err := db.conn.Query("SELECT public_key, name, role, lat, lon, last_seen, first_seen, advert_count, battery_mv, temperature_c FROM nodes WHERE public_key = ?", pubkey)
+	rows, err := db.conn.Query("SELECT public_key, name, role, lat, lon, last_seen, first_seen, advert_count, battery_mv, temperature_c, foreign_advert FROM nodes WHERE public_key = ?", pubkey)
 	if err != nil {
 		return nil, err
 	}
@@ -1056,6 +1105,17 @@ func (db *DB) GetObserverIdsForRegion(regionParam string) ([]string, error) {
 	return ids, nil
 }
 
+// normalizeRegionCodes parses a region query parameter into a list of upper-case
+// IATA codes. Returns nil to signal "no filter" (match all regions).
+//
+// Sentinel handling (issue #770): the frontend region filter dropdown labels its
+// catch-all option "All". When that option is selected the UI may send
+// ?region=All; older code interpreted that literally and tried to match an
+// IATA code "ALL", which never exists, returning an empty result set. Treat
+// "All" / "ALL" / "all" (case-insensitive, optionally surrounded by whitespace
+// or mixed with empty CSV slots) as equivalent to an empty value.
+//
+// Real IATA codes (e.g. "SJC", "PDX") still pass through unchanged.
 func normalizeRegionCodes(regionParam string) []string {
 	if regionParam == "" {
 		return nil
@@ -1064,9 +1124,13 @@ func normalizeRegionCodes(regionParam string) []string {
 	codes := make([]string, 0, len(tokens))
 	for _, token := range tokens {
 		code := strings.TrimSpace(strings.ToUpper(token))
-		if code != "" {
-			codes = append(codes, code)
+		if code == "" || code == "ALL" {
+			continue
 		}
+		codes = append(codes, code)
+	}
+	if len(codes) == 0 {
+		return nil
 	}
 	return codes
 }
@@ -1803,8 +1867,9 @@ func scanNodeRow(rows *sql.Rows) map[string]interface{} {
 	var advertCount int
 	var batteryMv sql.NullInt64
 	var temperatureC sql.NullFloat64
+	var foreign sql.NullInt64
 
-	if err := rows.Scan(&pk, &name, &role, &lat, &lon, &lastSeen, &firstSeen, &advertCount, &batteryMv, &temperatureC); err != nil {
+	if err := rows.Scan(&pk, &name, &role, &lat, &lon, &lastSeen, &firstSeen, &advertCount, &batteryMv, &temperatureC, &foreign); err != nil {
 		return nil
 	}
 	m := map[string]interface{}{
@@ -1819,6 +1884,7 @@ func scanNodeRow(rows *sql.Rows) map[string]interface{} {
 		"last_heard":             nullStr(lastSeen),
 		"hash_size":              nil,
 		"hash_size_inconsistent": false,
+		"foreign":                foreign.Valid && foreign.Int64 != 0,
 	}
 	if batteryMv.Valid {
 		m["battery_mv"] = int(batteryMv.Int64)

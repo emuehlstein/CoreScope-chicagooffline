@@ -501,6 +501,166 @@ function connectWS() {
 function onWS(fn) { wsListeners.push(fn); }
 function offWS(fn) { wsListeners = wsListeners.filter(f => f !== fn); }
 
+// --- Pull-to-reconnect (#1063) ---
+// Touch-device pull-down at scrollTop=0 reconnects the WebSocket
+// (instead of triggering native pull-to-refresh full-page reload).
+// Visual indicator pulses during pull; toast confirms result.
+const PULL_THRESHOLD_PX = 140;
+let _pullToast = null;
+let _pullToastTimer = null;
+let _pullIndicator = null;
+
+function _ensurePullIndicator() {
+  if (_pullIndicator && document.body && typeof document.body.contains === 'function' && document.body.contains(_pullIndicator)) return _pullIndicator;
+  if (_pullIndicator) return _pullIndicator;
+  const el = document.createElement('div');
+  el.id = 'pullReconnectIndicator';
+  el.setAttribute('aria-hidden', 'true');
+  el.innerHTML = '<span class="prr-icon">⟳</span>';
+  el.style.cssText = [
+    'position:fixed', 'top:0', 'left:50%', 'transform:translate(-50%,-100%)',
+    'z-index:99999', 'padding:8px 14px', 'border-radius:0 0 12px 12px',
+    'background:var(--accent,#2563eb)', 'color:#fff', 'font:14px/1 var(--font,system-ui)',
+    'box-shadow:0 2px 8px rgba(0,0,0,.2)', 'pointer-events:none',
+    'transition:transform .15s ease, opacity .15s ease', 'opacity:0',
+  ].join(';');
+  document.body.appendChild(el);
+  _pullIndicator = el;
+  return el;
+}
+
+function _showPullToast(msg, ok) {
+  try {
+    if (_pullToast && _pullToast.remove) _pullToast.remove();
+  } catch (e) {}
+  if (_pullToastTimer) { try { clearTimeout(_pullToastTimer); } catch (e) {} _pullToastTimer = null; }
+  const el = document.createElement('div');
+  el.className = 'pull-reconnect-toast';
+  el.textContent = msg;
+  el.style.cssText = [
+    'position:fixed', 'top:12px', 'left:50%', 'transform:translateX(-50%)',
+    'z-index:99999', 'padding:8px 16px', 'border-radius:8px',
+    'background:' + (ok ? 'var(--status-green,#16a34a)' : 'var(--status-red,#dc2626)'),
+    'color:#fff', 'font:14px/1.2 var(--font,system-ui)',
+    'box-shadow:0 2px 8px rgba(0,0,0,.2)', 'pointer-events:none',
+  ].join(';');
+  document.body.appendChild(el);
+  _pullToast = el;
+  _pullToastTimer = setTimeout(function () {
+    _pullToastTimer = null;
+    try { el.remove(); } catch (e) {}
+  }, 1800);
+}
+
+function pullReconnect() {
+  // If WS is connected (readyState OPEN), give a brief "Connected ✓"
+  // confirmation but still cycle so the user sees fresh data.
+  const wasOpen = ws && ws.readyState === 1;
+  if (wasOpen) {
+    _showPullToast('Connected ✓', true);
+    // Fast cycle: close and let onclose reconnect immediately
+    try { ws.close(); } catch (e) {}
+  } else {
+    _showPullToast('Reconnecting…', true);
+    try { if (ws) ws.close(); } catch (e) {}
+    // onclose handler schedules reconnect; force one now in case ws was null
+    try { connectWS(); } catch (e) {}
+  }
+}
+
+function _isTouchDevice() {
+  try {
+    return ('ontouchstart' in window) ||
+      (navigator && (navigator.maxTouchPoints > 0 || navigator.msMaxTouchPoints > 0));
+  } catch (e) { return false; }
+}
+
+function setupPullToReconnect() {
+  // Always attach listeners (tests + future-proof). Inside the handler we
+  // gate on _isTouchDevice() AND scrollTop=0 so desktop/scrolled pages are
+  // unaffected.
+  let startY = null;
+  let pulling = false;
+  let dist = 0;
+
+  function getScrollTop() {
+    return (document.documentElement && document.documentElement.scrollTop) ||
+      (document.body && document.body.scrollTop) || 0;
+  }
+
+  function onStart(e) {
+    if (!_isTouchDevice()) return;
+    // Strict scrollTop === 0: ignore any negative overscroll, ignore any scrolled state
+    if (getScrollTop() !== 0) { startY = null; pulling = false; return; }
+    const t = e.touches && e.touches[0];
+    startY = t ? t.clientY : null;
+    pulling = false;
+    dist = 0;
+  }
+
+  function onMove(e) {
+    if (startY == null) return;
+    // Cancel gesture if scrollTop leaves 0 (page scrolled mid-pull)
+    if (getScrollTop() !== 0) { startY = null; pulling = false; dist = 0; return; }
+    const t = e.touches && e.touches[0];
+    if (!t) return;
+    const dy = t.clientY - startY;
+    if (dy <= 0) {
+      // Upward swipe / retract. If we were past the commit threshold and the
+      // user retracts back, cancel the gesture so a subsequent touchend does
+      // NOT fire reconnect.
+      if (pulling) {
+        pulling = false;
+        dist = 0;
+        if (_pullIndicator) {
+          _pullIndicator.style.opacity = '0';
+          _pullIndicator.style.transform = 'translate(-50%, -100%)';
+        }
+      }
+      return;
+    }
+    dist = dy;
+    if (dy > 8) {
+      pulling = true;
+      const ind = _ensurePullIndicator();
+      const pct = Math.min(1, dy / PULL_THRESHOLD_PX);
+      ind.style.opacity = String(pct);
+      ind.style.transform = 'translate(-50%, ' + (-100 + pct * 100) + '%)';
+      const icon = ind.querySelector && ind.querySelector('.prr-icon');
+      if (icon) icon.style.transform = 'rotate(' + Math.round(pct * 360) + 'deg)';
+      // Only block native pull-to-refresh once we've crossed the commit
+      // threshold — below that, let the browser handle natural scroll/bounce.
+      if (dy >= PULL_THRESHOLD_PX && typeof e.preventDefault === 'function' && e.cancelable !== false) {
+        try { e.preventDefault(); } catch (_) {}
+      }
+    }
+  }
+
+  function onEnd() {
+    const wasPulling = pulling;
+    const finalDist = dist;
+    const stillAtTop = getScrollTop() === 0;
+    startY = null; pulling = false; dist = 0;
+    if (_pullIndicator) {
+      _pullIndicator.style.opacity = '0';
+      _pullIndicator.style.transform = 'translate(-50%, -100%)';
+    }
+    // Trigger only if: gesture was active, crossed threshold, and page is still at scrollTop=0.
+    if (wasPulling && finalDist >= PULL_THRESHOLD_PX && stillAtTop) {
+      try { (window.pullReconnect || pullReconnect)(); } catch (e) {}
+    }
+  }
+
+  document.addEventListener('touchstart', onStart, { passive: true });
+  document.addEventListener('touchmove', onMove, { passive: false });
+  document.addEventListener('touchend', onEnd, { passive: true });
+  document.addEventListener('touchcancel', onEnd, { passive: true });
+}
+
+window.pullReconnect = pullReconnect;
+window.setupPullToReconnect = setupPullToReconnect;
+window.connectWS = connectWS;
+
 /* Global escapeHtml — used by multiple pages */
 function escapeHtml(s) {
   if (s == null) return '';
@@ -576,6 +736,14 @@ function navigate() {
   // Backward-compat redirect: #/traces/<hash> → #/tools/trace/<hash> (issue #944).
   if (location.hash.startsWith('#/traces/')) {
     location.hash = location.hash.replace('#/traces/', '#/tools/trace/');
+    return;
+  }
+
+  // Backward-compat redirect: #/roles → #/analytics?tab=roles (issue #1085).
+  // The Roles page was folded into the Analytics tab strip; old links and
+  // bookmarks must keep working.
+  if (location.hash === '#/roles' || location.hash.startsWith('#/roles?') || location.hash.startsWith('#/roles/')) {
+    location.hash = '#/analytics?tab=roles';
     return;
   }
 
@@ -676,6 +844,7 @@ window.addEventListener('timestamp-mode-changed', () => {
 });
 window.addEventListener('DOMContentLoaded', () => {
   connectWS();
+  setupPullToReconnect();
 
   // --- Dark Mode ---
   const darkToggle = document.getElementById('darkModeToggle');
@@ -758,18 +927,175 @@ window.addEventListener('DOMContentLoaded', () => {
     link.addEventListener('click', closeNav);
   });
 
-  // --- "More" dropdown (tablet Priority+ nav) ---
+  // --- "More" dropdown — JS-driven Priority+ (Issue #1102) ---
   const navMoreBtn = document.getElementById('navMoreBtn');
   const navMoreMenu = document.getElementById('navMoreMenu');
-  if (navMoreBtn && navMoreMenu) {
-    // Build More menu dynamically from non-priority nav links (DRY)
-    navMoreMenu.innerHTML = '';
-    document.querySelectorAll('.nav-links a:not([data-priority="high"])').forEach(function(link) {
-      var clone = link.cloneNode(true);
-      clone.setAttribute('role', 'menuitem');
-      clone.addEventListener('click', closeMoreMenu);
-      navMoreMenu.appendChild(clone);
+  const navMoreWrap = document.querySelector('.nav-more-wrap');
+  const navTop  = document.querySelector('.top-nav');
+  const navLeft = document.querySelector('.nav-left');
+  const navRightEl = document.querySelector('.nav-right');
+  const linksContainer = document.querySelector('.nav-links');
+  // Belt-and-braces null guards (#1105 MINOR 4): the outer block measures
+  // and mutates all of these; if any are missing the layout math throws
+  // before we can fall back gracefully.
+  if (navMoreBtn && navMoreMenu && navMoreWrap && navLeft && navRightEl && linksContainer && navTop) {
+    // Measure available room and decide which links overflow.
+    // Algorithm: try to fit all links inline. If the link strip doesn't
+    // fit alongside .nav-right + .nav-brand, hide non-priority links one
+    // at a time (right-to-left, lowest priority first) until it does.
+    // Then mirror the hidden links into the "More ▾" menu so nothing
+    // disappears from the user's reach.
+    const allLinks = Array.from(linksContainer.querySelectorAll('.nav-link'));
+    // overflowQueue (#1105 MINOR 6): the order links are removed from the
+    // inline strip when space runs out. Built right-to-left from
+    // non-priority links (lowest priority dropped first) and then high-
+    // priority links as a last-resort tail. `data-priority="high"` is the
+    // only signal — if you ever need finer ordering, switch to a numeric
+    // attribute (e.g. data-overflow-order="3") rather than re-shuffling
+    // index in HTML.
+    const overflowQueue = allLinks.filter(a => a.dataset.priority !== 'high')
+                                  .reverse() // right-to-left
+                                  .concat(allLinks.filter(a => a.dataset.priority === 'high').reverse());
+
+    function rebuildMoreMenu() {
+      navMoreMenu.innerHTML = '';
+      const hidden = allLinks.filter(a => a.classList.contains('is-overflow'));
+      hidden.forEach(function(link) {
+        var clone = link.cloneNode(true);
+        // The clone is in the overflow menu, not the inline strip.
+        clone.classList.remove('is-overflow');
+        clone.setAttribute('role', 'menuitem');
+        // cloneNode(true) preserves DOM but NOT event listeners. The
+        // originals get `closeNav` attached up above (#1105 MINOR 5);
+        // mirror that here so a click on the More-menu clone behaves
+        // identically to a click on the inline link (closes the
+        // hamburger panel + dismisses the More menu).
+        clone.addEventListener('click', closeNav);
+        clone.addEventListener('click', closeMoreMenu);
+        navMoreMenu.appendChild(clone);
+      });
+      // If nothing overflows, hide the More button entirely so wide
+      // viewports don't show a useless dropdown trigger.
+      navMoreWrap.classList.toggle('is-hidden', hidden.length === 0);
+      // Refresh active state on the More button (a hidden active link
+      // means the More menu currently "is" the active section).
+      var hasActiveMore = navMoreMenu.querySelector('.nav-link.active');
+      navMoreBtn.classList.toggle('active', !!hasActiveMore);
+    }
+
+    // #1105 MINOR 1: cached intrinsic width of the More button. Captured
+    // the first time `fits()` sees navMoreWrap rendered (display:flex).
+    // Falls back to MORE_BTN_RESERVE_PX (a conservative initial guess
+    // sized for "More ▾" at default font/padding) until that happens.
+    var cachedMoreW = 0;
+    var MORE_BTN_RESERVE_PX = 70;
+
+    function applyNavPriority() {
+      // Skip on mobile (<768px) — hamburger CSS owns that layout.
+      if (window.innerWidth < 768) {
+        allLinks.forEach(a => a.classList.remove('is-overflow'));
+        navMoreWrap.classList.add('is-hidden');
+        return;
+      }
+      // Reset: show everything, then hide as needed.
+      allLinks.forEach(a => a.classList.remove('is-overflow'));
+      navMoreWrap.classList.remove('is-hidden');
+      // #1106: in the 768-1100px narrow-desktop band the CSS already
+      // hides .nav-stats and tightens .nav-link padding (see the
+      // "Nav narrow-desktop tightening" media query in style.css).
+      // The design intent of that band is "show exactly the 5 high-
+      // priority links + More". Pure measurement says everything fits
+      // (~981px needed in a 1080px viewport once nav-stats is gone),
+      // but the design contract — locked by test-nav-priority-1102-
+      // e2e.js #1105 MINOR 7 — is exact identity, not "fits". Force-
+      // collapse all non-high-priority links inside this band so the
+      // overflow menu is non-empty and the high-priority set is the
+      // only thing inline. Above 1100px the measurement loop below
+      // owns the decision (and at 2560px nothing overflows).
+      if (window.innerWidth <= 1100) {
+        allLinks.forEach(a => {
+          if (a.dataset.priority !== 'high') a.classList.add('is-overflow');
+        });
+        rebuildMoreMenu();
+        return;
+      }
+      // Iteratively hide low-priority links until the link strip fits.
+      // .top-nav has overflow:hidden and .nav-left has flex-shrink:1, so
+      // an overflowing strip silently clips rather than pushing
+      // nav-right out — bounding-rect math on .nav-left lies. Instead
+      // measure the *intrinsic* widths of the parts (independent of
+      // current clipping) and compare to the viewport. SAFETY absorbs
+      // the .top-nav side padding + nav-right inner gaps + sub-pixel
+      // rounding (the historic #1055 bug was a 6–20px overlap).
+      //
+      // #1105 MINOR 3: at the 1101px media-query flip `.nav-stats`
+      // toggles from display:none → flex (and vice-versa). The resize
+      // handler is rAF-debounced and runs *after* the layout flip, so
+      // navRightEl.scrollWidth measured here reflects the post-flip
+      // intrinsic width — not stale pre-flip width.
+      const navBrand   = document.querySelector('.nav-brand');
+      const SAFETY     = 32;
+      // #1105 MINOR 1+2: read both gap values from CSS rather than a
+      // shared `GUTTER = 24` constant. Today `.nav-left` (gap between
+      // brand/links/more/right cells) and `.nav-links` (gap between
+      // individual link items) both resolve to --space-lg = 24px, but
+      // they're conceptually distinct gaps. If --space-lg or .nav-left's
+      // gap diverges in the future, the fit math must follow.
+      const navLeftGap = parseFloat(getComputedStyle(navLeft).columnGap ||
+                                    getComputedStyle(navLeft).gap || '0') || 0;
+      // #1105 MINOR 1: compute the More-button reserve from its actual
+      // rendered width on first measure, instead of a hard-coded 70px
+      // fallback. Cached so we don't re-measure (offsetWidth is 0 when
+      // display:none; we capture the value the first time it's visible).
+      function fits() {
+        const visibleLinks = allLinks.filter(a => !a.classList.contains('is-overflow'));
+        let linkW = 0;
+        visibleLinks.forEach(a => { linkW += a.getBoundingClientRect().width; });
+        const linkGapPx = parseFloat(getComputedStyle(linksContainer).columnGap ||
+                                     getComputedStyle(linksContainer).gap || '0') || 0;
+        const linksGap = Math.max(0, visibleLinks.length - 1) * linkGapPx;
+        const brandW = navBrand ? navBrand.getBoundingClientRect().width : 0;
+        // Always reserve space for the More button if anything could
+        // overflow. Measure the live width when visible and cache it
+        // for use when the button is currently hidden (display:none →
+        // getBoundingClientRect() returns 0). MORE_BTN_RESERVE_PX is
+        // the conservative initial fallback used until we get a real
+        // measurement.
+        const moreVis = !navMoreWrap.classList.contains('is-hidden');
+        const liveMoreW = moreVis ? navMoreWrap.getBoundingClientRect().width : 0;
+        if (liveMoreW > 0) cachedMoreW = liveMoreW;
+        const moreW = liveMoreW > 0 ? liveMoreW
+                    : (cachedMoreW > 0 ? cachedMoreW : MORE_BTN_RESERVE_PX);
+        const rightW  = navRightEl.scrollWidth; // intrinsic, ignores clipping
+        const needed  = brandW + navLeftGap + linkW + linksGap + navLeftGap + moreW + navLeftGap + rightW + SAFETY;
+        return needed <= window.innerWidth;
+      }
+      let i = 0;
+      while (!fits() && i < overflowQueue.length) {
+        overflowQueue[i].classList.add('is-overflow');
+        i++;
+      }
+      rebuildMoreMenu();
+    }
+
+    // Run once on load, again after fonts settle (label widths shift),
+    // and on resize (debounced via rAF).
+    applyNavPriority();
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(applyNavPriority);
+    }
+    let rafId = 0;
+    window.addEventListener('resize', function() {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(applyNavPriority);
     });
+    // Re-apply on route change too: the active link gets bigger padding
+    // (background pill), so which links fit can shift between pages.
+    window.addEventListener('hashchange', function() {
+      // Defer so the route handler's class toggles run first.
+      requestAnimationFrame(applyNavPriority);
+    });
+
     navMoreBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const opening = !navMoreMenu.classList.contains('open');

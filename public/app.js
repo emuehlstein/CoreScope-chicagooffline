@@ -957,15 +957,6 @@ window.addEventListener('DOMContentLoaded', () => {
                                   .reverse() // right-to-left
                                   .concat(allLinks.filter(a => a.dataset.priority === 'high').reverse());
 
-    // Chicago Offline override: mark all non-priority links as overflow
-    // so they populate the More dropdown (CSS hides them inline, but
-    // upstream JS needs .is-overflow class to clone them into the menu)
-    allLinks.forEach(function(link) {
-      if (link.dataset.priority !== 'high') {
-        link.classList.add('is-overflow');
-      }
-    });
-
     function rebuildMoreMenu() {
       navMoreMenu.innerHTML = '';
       const hidden = allLinks.filter(a => a.classList.contains('is-overflow'));
@@ -1009,6 +1000,15 @@ window.addEventListener('DOMContentLoaded', () => {
       // Reset: show everything, then hide as needed.
       allLinks.forEach(a => a.classList.remove('is-overflow'));
       navMoreWrap.classList.remove('is-hidden');
+      // Chicago Offline override: always force non-priority links to overflow
+      // (CSS hides them inline; this ensures they populate the More dropdown)
+      if (window.innerWidth >= 1024) {
+        allLinks.forEach(a => {
+          if (a.dataset.priority !== 'high') a.classList.add('is-overflow');
+        });
+        rebuildMoreMenu();
+        return;
+      }
       // #1106: in the 768-1100px narrow-desktop band the CSS already
       // hides .nav-stats and tightens .nav-link padding (see the
       // "Nav narrow-desktop tightening" media query in style.css).

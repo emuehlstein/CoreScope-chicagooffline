@@ -1333,7 +1333,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 /* === Hamburger (hidden on desktop) === */
 .hamburger { display: none; }
 /* "More" button (hidden on desktop) */
-.nav-more-wrap { display: none; position: relative; }
+.nav-more-wrap { display: none; position: relative; overflow: visible; }
 .nav-more-btn { display: inline-flex; }
 .nav-more-menu {
   display: none; position: absolute; top: calc(100% + 4px); right: 0;

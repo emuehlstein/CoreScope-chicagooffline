@@ -1422,6 +1422,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 
 /* === Responsive — Hamburger nav (<768px) === */
 @media (max-width: 767px) {
+  .top-nav { overflow: visible; }
   .hamburger { display: inline-flex; }
   .nav-more-wrap { display: none !important; }
   .nav-links {

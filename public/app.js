@@ -1107,16 +1107,29 @@ window.addEventListener('DOMContentLoaded', () => {
       requestAnimationFrame(applyNavPriority);
     });
 
+    // Position fixed dropdown relative to More button
+    function positionMoreDropdown() {
+      if (!navMoreMenu.classList.contains('open')) return;
+      const rect = navMoreBtn.getBoundingClientRect();
+      navMoreMenu.style.top = (rect.bottom + 4) + 'px';
+      navMoreMenu.style.right = (window.innerWidth - rect.right) + 'px';
+    }
+
     navMoreBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const opening = !navMoreMenu.classList.contains('open');
       navMoreMenu.classList.toggle('open');
       navMoreBtn.setAttribute('aria-expanded', String(opening));
       if (opening) {
+        positionMoreDropdown();
         var firstLink = navMoreMenu.querySelector('.nav-link');
         if (firstLink) firstLink.focus();
       }
     });
+
+    // Reposition on scroll/resize
+    window.addEventListener('scroll', positionMoreDropdown, true);
+    window.addEventListener('resize', positionMoreDropdown);
   }
 
   document.addEventListener('keydown', (e) => {

@@ -52,6 +52,28 @@
     return false;
   }
   function setObserverIataMap(m) { observerIataMap = m || {}; }
+
+  /**
+   * Build observer_id → IATA map from the /api/observers response.
+   * The endpoint returns `{ observers: [...], server_time: "..." }`
+   * (cmd/server/types.go ObserverListResponse). Defensive: also accepts
+   * a bare array in case the API shape ever changes back, and ignores
+   * observers without an IATA. Returns a plain object (used as a hash).
+   * Exported for tests via window._liveBuildObserverIataMap.
+   * Fixes #1136 (regression introduced in #1080 which assumed array shape).
+   */
+  function buildObserverIataMap(data) {
+    var list = null;
+    if (Array.isArray(data)) list = data;
+    else if (data && Array.isArray(data.observers)) list = data.observers;
+    var m = {};
+    if (!list) return m;
+    for (var i = 0; i < list.length; i++) {
+      var o = list[i];
+      if (o && o.id != null && o.iata) m[o.id] = o.iata;
+    }
+    return m;
+  }
   let rainCanvas = null, rainCtx = null, rainDrops = [], rainRAF = null;
   const propagationBuffer = new Map(); // hash -> {timer, packets[]}
   let _onResize = null;
@@ -217,6 +239,45 @@
   }
 
   // === VCR Controls ===
+
+  // #1206: publish the VCR bar's measured height as --vcr-bar-height on the
+  // .live-page root so bottom-pinned overlays (feed, legend, corner panels)
+  // can reserve the right amount of space and never get occluded by the bar.
+  // Cleanup state is captured in module-scoped _vcrHeightCleanup so destroy()
+  // can disconnect the ResizeObserver + remove the resize/visualViewport
+  // listeners on SPA page navigation (otherwise re-mounts of /live would
+  // accumulate observers forever — same leak class as #1180).
+  var _vcrHeightCleanup = null;
+  function initVCRHeightTracker() {
+    // #1206 r1 (adversarial should-fix): guard against double-init —
+    // if a prior tracker is still active (re-mount race, dev hot-reload),
+    // tear it down BEFORE overwriting _vcrHeightCleanup so the previous
+    // ResizeObserver/listeners aren't orphaned.
+    if (_vcrHeightCleanup) { try { _vcrHeightCleanup(); } catch (_) {} _vcrHeightCleanup = null; }
+    var bar = document.getElementById('vcrBar');
+    var page = document.querySelector('.live-page');
+    if (!bar || !page) return;
+    function publish() {
+      var h = Math.ceil(bar.getBoundingClientRect().height) || 58;
+      page.style.setProperty('--vcr-bar-height', h + 'px');
+    }
+    publish();
+    var ro = null;
+    if (typeof ResizeObserver === 'function') {
+      try { ro = new ResizeObserver(publish); ro.observe(bar); } catch (_) { ro = null; }
+    }
+    window.addEventListener('resize', publish);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', publish);
+    }
+    _vcrHeightCleanup = function() {
+      if (ro) { try { ro.disconnect(); } catch (_) {} ro = null; }
+      window.removeEventListener('resize', publish);
+      if (window.visualViewport) {
+        window.visualViewport.removeEventListener('resize', publish);
+      }
+    };
+  }
 
   function vcrSetMode(mode) {
     VCR.mode = mode;
@@ -838,17 +899,33 @@
       <div class="live-page">
         <div id="liveMap" style="width:100%;height:100%;position:absolute;top:0;left:0;z-index:1"></div>
         <div class="live-overlay live-header" id="liveHeader">
-          <div class="live-title">
-            <span class="live-beacon"></span>
-            MESH LIVE
+          <div class="live-header-critical" data-live-header-critical>
+            <span class="live-beacon" aria-label="WebSocket connection beacon"></span>
+            <div class="live-stat-pill live-stat-pill--critical"><span id="livePktCount">0</span> pkts</div>
           </div>
-          <div class="live-stats-row">
-            <div class="live-stat-pill"><span id="livePktCount">0</span> pkts</div>
+          <!-- #1234: stats row promoted to a direct child of .live-header so
+               the counters are always visible inline on mobile (single-row
+               header, no MESH LIVE label, no chart toggle). At desktop
+               this also flows inline next to the title via flex. -->
+          <div class="live-stats-row" data-live-stats-row>
             <div class="live-stat-pill"><span id="liveNodeCount">0</span> nodes</div>
             <div class="live-stat-pill anim-pill"><span id="liveAnimCount">0</span> active</div>
             <div class="live-stat-pill rate-pill"><span id="livePktRate">0</span>/min</div>
           </div>
-          <div class="live-toggles">
+          <button class="live-header-toggle" data-live-header-toggle id="liveHeaderToggle"
+                  aria-expanded="false" aria-controls="liveHeaderBody"
+                  aria-label="Show live stats">📊</button>
+          <div class="live-header-body" data-live-header-body id="liveHeaderBody">
+            <div class="live-title">
+              MESH LIVE
+            </div>
+          </div>
+        <!-- #1205: settings toggles are children of the MESH LIVE panel
+             (#liveHeader), not a free-floating .live-overlay. PR #1180
+             detached them; this restores the pre-regression structure. -->
+        <div class="live-controls" id="liveControls">
+          <div class="live-controls-body" data-live-controls-body id="liveControlsBody">
+            <div class="live-toggles">
             <label><input type="checkbox" id="liveHeatToggle" checked aria-describedby="heatDesc"> Heat</label>
             <span id="heatDesc" class="sr-only">Overlay a density heat map on the mesh nodes</span>
             <label><input type="checkbox" id="liveGhostToggle" checked aria-describedby="ghostDesc"> Ghosts</label>
@@ -865,27 +942,34 @@
             <span id="audioDesc" class="sr-only">Sonify packets — turn raw bytes into generative music</span>
             <label><input type="checkbox" id="liveFavoritesToggle" aria-describedby="favDesc"> ⭐ Favorites</label>
             <span id="favDesc" class="sr-only">Show only favorited and claimed nodes</span>
-            <div class="live-node-filter-wrap">
-              <input type="text" id="liveNodeFilterInput" list="liveNodeFilterList" placeholder="Filter by node…" autocomplete="off" class="live-node-filter-input">
-              <datalist id="liveNodeFilterList"></datalist>
+            <div class="live-node-filter-wrap" style="position:relative">
+              <input type="text" id="liveNodeFilterInput" placeholder="Filter by node…" autocomplete="off" class="live-node-filter-input" role="combobox" aria-expanded="false" aria-owns="liveNodeFilterDropdown" aria-autocomplete="list" aria-activedescendant="">
+              <div id="liveNodeFilterDropdown" class="live-node-filter-dropdown hidden" role="listbox"></div>
               <button id="liveNodeFilterClear" class="vcr-btn" title="Clear node filter" style="display:none">×</button>
             </div>
             <div id="liveNodeFilterCount" class="live-filter-count hidden"></div>
             <label id="liveGeoFilterLabel" style="display:none"><input type="checkbox" id="liveGeoFilterToggle"> Mesh live area</label>
             <div id="liveRegionFilter" class="region-filter-container live-region-filter-container" aria-label="Filter live packets by IATA region"></div>
+            </div>
+            <div class="audio-controls hidden" id="audioControls">
+              <label class="audio-slider-label">Voice <select id="audioVoiceSelect" class="audio-voice-select"></select></label>
+              <label class="audio-slider-label">BPM <input type="range" id="audioBpmSlider" min="40" max="300" value="120" class="audio-slider"><span id="audioBpmVal">120</span></label>
+              <label class="audio-slider-label">Vol <input type="range" id="audioVolSlider" min="0" max="100" value="30" class="audio-slider"><span id="audioVolVal">30</span></label>
+            </div>
           </div>
-          <div class="audio-controls hidden" id="audioControls">
-            <label class="audio-slider-label">Voice <select id="audioVoiceSelect" class="audio-voice-select"></select></label>
-            <label class="audio-slider-label">BPM <input type="range" id="audioBpmSlider" min="40" max="300" value="120" class="audio-slider"><span id="audioBpmVal">120</span></label>
-            <label class="audio-slider-label">Vol <input type="range" id="audioVolSlider" min="0" max="100" value="30" class="audio-slider"><span id="audioVolVal">30</span></label>
-          </div>
+          <button class="live-controls-toggle" data-live-controls-toggle id="liveControlsToggle"
+                  aria-expanded="false" aria-controls="liveControlsBody"
+                  aria-label="Show live controls">⚙</button>
         </div>
+        </div><!-- /#liveHeader -->
         <div class="live-overlay live-feed" id="liveFeed">
           <div class="panel-header">
             <button class="panel-corner-btn" data-panel="liveFeed" title="Move panel to next corner" aria-label="Move panel to next corner">◫</button>
             <button class="feed-hide-btn" id="feedHideBtn" title="Hide feed">✕</button>
           </div>
-          <div class="panel-content" aria-live="polite" aria-relevant="additions" role="log"></div>
+          <div class="panel-content" aria-live="polite" aria-relevant="additions" role="log">
+            <div class="live-feed-empty" aria-hidden="true">Waiting for packets…</div>
+          </div>
         </div>
         <button class="feed-show-btn hidden" id="feedShowBtn" title="Show feed">📋</button>
         <div id="nodeDetailBackdrop" class="node-detail-backdrop"></div>
@@ -928,8 +1012,16 @@
           <div class="vcr-scope-btns" role="radiogroup" aria-label="Timeline scope">
             <button class="vcr-scope-btn active" data-scope="3600000" role="radio" aria-checked="true" aria-label="Scope 1 hour">1h</button>
             <button class="vcr-scope-btn" data-scope="21600000" role="radio" aria-checked="false" aria-label="Scope 6 hours">6h</button>
-            <button class="vcr-scope-btn" data-scope="43200000" role="radio" aria-checked="false" aria-label="Scope 12 hours">12h</button>
-            <button class="vcr-scope-btn" data-scope="86400000" role="radio" aria-checked="false" aria-label="Scope 24 hours">24h</button>
+            <button class="vcr-scope-btn vcr-scope-btn--overflow" data-scope="43200000" role="radio" aria-checked="false" aria-label="Scope 12 hours">12h</button>
+            <button class="vcr-scope-btn vcr-scope-btn--overflow" data-scope="86400000" role="radio" aria-checked="false" aria-label="Scope 24 hours">24h</button>
+            <!-- #1234: at ≤640px buttons marked .vcr-scope-btn--overflow are
+                 hidden and surfaced via this More dropdown instead. -->
+            <div class="vcr-scope-more-wrap" data-vcr-scope-more-wrap>
+              <button type="button" class="vcr-scope-btn vcr-scope-more" data-vcr-scope-more
+                      aria-haspopup="true" aria-expanded="false" aria-controls="vcrScopeMoreMenu"
+                      aria-label="More timeline scopes">More ▾</button>
+              <div class="vcr-scope-more-menu" id="vcrScopeMoreMenu" role="menu" hidden></div>
+            </div>
           </div>
           <div class="vcr-timeline-container">
             <canvas id="vcrTimeline" class="vcr-timeline"></canvas>
@@ -993,6 +1085,7 @@
     showHeatMap();
     connectWS();
     initResizeHandler();
+    initVCRHeightTracker();
     startRateCounter();
 
     // Check for packet replay from packets page (single or array of observations)
@@ -1054,47 +1147,169 @@
     (function initLiveRegionFilter() {
       var rfEl = document.getElementById('liveRegionFilter');
       if (!rfEl || !window.RegionFilter) return;
-      // Fetch observer roster to build observer_id → IATA map
-      fetch('/api/observers').then(function(r) { return r.json(); }).then(function(list) {
-        var m = {};
-        if (Array.isArray(list)) {
-          for (var i = 0; i < list.length; i++) {
-            var o = list[i];
-            if (o && o.id != null && o.iata) m[o.id] = o.iata;
-          }
-        }
-        setObserverIataMap(m);
+      // Fetch observer roster to build observer_id → IATA map.
+      // /api/observers returns `{observers:[...], server_time:"..."}`
+      // (cmd/server/types.go ObserverListResponse) — NOT a top-level array.
+      // Bug #1136: previously parsed as array → map empty → region filter
+      // dropped every packet.
+      fetch('/api/observers').then(function(r) { return r.json(); }).then(function(data) {
+        setObserverIataMap(buildObserverIataMap(data));
       }).catch(function() { /* leave map empty; filter will hide all when active */ });
       RegionFilter.init(rfEl, { dropdown: true });
       regionFilterChangeHandler = RegionFilter.onChange(function() { /* selection persisted by RegionFilter; future packets reflect it */ });
     })();
 
-    // Node filter input
+    // Node filter input — autocomplete-as-you-type (#1110)
     const nodeFilterInput = document.getElementById('liveNodeFilterInput');
     const nodeFilterClear = document.getElementById('liveNodeFilterClear');
+    const nodeFilterDropdown = document.getElementById('liveNodeFilterDropdown');
     if (nodeFilterInput) {
       // Restore from URL param or localStorage
       const urlNode = getHashParams && getHashParams().get('node');
       if (urlNode) setNodeFilter(urlNode.split(',').map(s => s.trim()).filter(Boolean));
       else if (nodeFilterKeys.length) updateNodeFilterUI();
 
-      nodeFilterInput.addEventListener('change', (e) => {
-        const val = e.target.value.trim();
-        setNodeFilter(val ? val.split(',').map(s => s.trim()).filter(Boolean) : []);
+      let activeIdx = -1;
+
+      function hideDropdown() {
+        if (!nodeFilterDropdown) return;
+        nodeFilterDropdown.classList.add('hidden');
+        nodeFilterDropdown.innerHTML = '';
+        nodeFilterInput.setAttribute('aria-expanded', 'false');
+        nodeFilterInput.setAttribute('aria-activedescendant', '');
+        activeIdx = -1;
+      }
+
+      function applyFilterFromInput(rawValue) {
+        // Treat input as a single substring query rather than a list of pubkeys.
+        // setNodeFilter accepts pubkeys/prefixes/names; commit raw for live filtering.
+        const val = (rawValue || '').trim();
+        setNodeFilter(val ? [val] : []);
+        // Update URL without triggering hashchange (which would re-init the page).
         const params = getHashParams ? getHashParams() : new URLSearchParams();
-        if (nodeFilterKeys.length) params.set('node', nodeFilterKeys.join(','));
+        if (val) params.set('node', val);
         else params.delete('node');
-        const base = location.hash.split('?')[0];
+        const base = location.hash.split('?')[0] || '#/live';
         const qs = params.toString();
-        location.hash = base + (qs ? '?' + qs : '');
+        const newHash = base + (qs ? '?' + qs : '');
+        const newUrl = location.pathname + location.search + newHash;
+        try { history.replaceState(null, '', newUrl); } catch (_) {}
+      }
+
+      function selectSuggestion(opt) {
+        const key = opt.getAttribute('data-key') || '';
+        const name = opt.getAttribute('data-name') || key;
+        nodeFilterInput.value = name;
+        // Filter by pubkey prefix when available — most precise.
+        setNodeFilter(key ? [key] : (name ? [name] : []));
+        const params = getHashParams ? getHashParams() : new URLSearchParams();
+        if (key) params.set('node', key);
+        else params.delete('node');
+        const base = location.hash.split('?')[0] || '#/live';
+        const qs = params.toString();
+        const newUrl = location.pathname + location.search + base + (qs ? '?' + qs : '');
+        try { history.replaceState(null, '', newUrl); } catch (_) {}
+        hideDropdown();
+      }
+
+      const escapeHtmlLocal = (typeof escapeHtml === 'function') ? escapeHtml : function (s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+        });
+      };
+
+      async function fetchSuggestions(q) {
+        if (!nodeFilterDropdown) return;
+        if (!q || q.length < 1) { hideDropdown(); return; }
+        try {
+          const resp = await fetch('/api/nodes/search?q=' + encodeURIComponent(q));
+          if (!resp.ok) { hideDropdown(); return; }
+          const data = await resp.json();
+          const nodes = (data && data.nodes) || [];
+          if (!nodes.length) { hideDropdown(); return; }
+          nodeFilterDropdown.innerHTML = nodes.map(function (n, i) {
+            const name = n.name || (n.public_key ? n.public_key.slice(0, 8) : '?');
+            const pkShort = n.public_key ? n.public_key.slice(0, 8) : '';
+            return '<div class="live-node-filter-option" id="liveNodeFilterOpt-' + i +
+              '" role="option" data-key="' + escapeHtmlLocal(n.public_key || '') +
+              '" data-name="' + escapeHtmlLocal(name) + '">' +
+              escapeHtmlLocal(name) +
+              ' <span style="color:var(--text-muted);font-size:0.8em">' + escapeHtmlLocal(pkShort) + '</span></div>';
+          }).join('');
+          nodeFilterDropdown.classList.remove('hidden');
+          nodeFilterInput.setAttribute('aria-expanded', 'true');
+          nodeFilterDropdown.querySelectorAll('.live-node-filter-option').forEach(function (opt) {
+            opt.addEventListener('mousedown', function (ev) {
+              // Use mousedown so we run before blur hides the dropdown.
+              ev.preventDefault();
+              selectSuggestion(opt);
+            });
+          });
+        } catch (_) { hideDropdown(); }
+      }
+
+      const debouncedInput = debounce(function (e) {
+        const v = e.target.value.trim();
+        // Apply live filter immediately as user types (no Enter required).
+        applyFilterFromInput(v);
+        fetchSuggestions(v);
+      }, 200);
+
+      nodeFilterInput.addEventListener('input', debouncedInput);
+
+      nodeFilterInput.addEventListener('keydown', function (e) {
+        const opts = nodeFilterDropdown ? nodeFilterDropdown.querySelectorAll('.live-node-filter-option') : [];
+        if (e.key === 'Enter') {
+          // Critical: prevent any default form submission / navigation behavior.
+          e.preventDefault();
+          if (opts.length && activeIdx >= 0 && opts[activeIdx]) {
+            selectSuggestion(opts[activeIdx]);
+          } else {
+            // Just commit current text as a filter and close the dropdown.
+            applyFilterFromInput(nodeFilterInput.value);
+            hideDropdown();
+          }
+          return;
+        }
+        if (!opts.length || (nodeFilterDropdown && nodeFilterDropdown.classList.contains('hidden'))) return;
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          activeIdx = Math.min(activeIdx + 1, opts.length - 1);
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          activeIdx = Math.max(activeIdx - 1, 0);
+        } else if (e.key === 'Escape') {
+          hideDropdown();
+          return;
+        } else {
+          return;
+        }
+        opts.forEach(function (o, i) {
+          o.classList.toggle('live-node-filter-active', i === activeIdx);
+          o.setAttribute('aria-selected', i === activeIdx ? 'true' : 'false');
+        });
+        if (activeIdx >= 0 && opts[activeIdx]) {
+          nodeFilterInput.setAttribute('aria-activedescendant', opts[activeIdx].id);
+          opts[activeIdx].scrollIntoView({ block: 'nearest' });
+        }
+      });
+
+      nodeFilterInput.addEventListener('blur', function () {
+        // Slight delay so click on a suggestion can register first.
+        setTimeout(hideDropdown, 150);
       });
     }
     if (nodeFilterClear) {
       nodeFilterClear.addEventListener('click', () => {
         if (nodeFilterInput) nodeFilterInput.value = '';
         setNodeFilter([]);
-        const base = location.hash.split('?')[0];
-        location.hash = base;
+        // Drop the ?node param without re-running the SPA route handler.
+        const params = getHashParams ? getHashParams() : new URLSearchParams();
+        params.delete('node');
+        const base = location.hash.split('?')[0] || '#/live';
+        const qs = params.toString();
+        const newUrl = location.pathname + location.search + base + (qs ? '?' + qs : '');
+        try { history.replaceState(null, '', newUrl); } catch (_) {}
       });
     }
 
@@ -1266,6 +1481,78 @@
     // Legend toggle for mobile (#60)
     const legendEl = document.getElementById('liveLegend');
     const legendToggleBtn = document.getElementById('legendToggleBtn');
+
+    // ── Live header / controls toggles (#1178, #1179) ──────────────────────
+    // At narrow viewports (≤768px) the header collapses to a single
+    // toggle button revealing the stats body, and the controls collapse
+    // to a single toggle button revealing the toggles list. CSS gates
+    // visibility of the toggle buttons; JS only flips classes and the
+    // hidden attribute. At wide viewports the bodies are always shown.
+    (function wireLiveCollapseToggles() {
+      var pairs = [
+        { rootId: 'liveHeader',   togId: 'liveHeaderToggle',   bodyId: 'liveHeaderBody',
+          showLabel: 'Show live stats',   hideLabel: 'Hide live stats' },
+        { rootId: 'liveControls', togId: 'liveControlsToggle', bodyId: 'liveControlsBody',
+          showLabel: 'Show live controls', hideLabel: 'Hide live controls' },
+      ];
+      var narrowMql = window.matchMedia('(max-width: 768px)');
+      function setExpanded(p, expanded) {
+        var root = document.getElementById(p.rootId);
+        var tog  = document.getElementById(p.togId);
+        var body = document.getElementById(p.bodyId);
+        if (!root || !tog || !body) return;
+        if (expanded) {
+          root.classList.add('is-expanded'); root.classList.remove('is-collapsed');
+          body.removeAttribute('hidden');
+          tog.setAttribute('aria-expanded', 'true');
+          tog.setAttribute('aria-label', p.hideLabel);
+        } else {
+          root.classList.add('is-collapsed'); root.classList.remove('is-expanded');
+          body.setAttribute('hidden', '');
+          tog.setAttribute('aria-expanded', 'false');
+          tog.setAttribute('aria-label', p.showLabel);
+        }
+      }
+      function applyForViewport() {
+        for (var i = 0; i < pairs.length; i++) {
+          var p = pairs[i];
+          if (narrowMql.matches) {
+            // Default collapsed at narrow viewports
+            setExpanded(p, false);
+          } else {
+            // Always expanded; no hidden attr; no collapse class
+            var root = document.getElementById(p.rootId);
+            var body = document.getElementById(p.bodyId);
+            var tog  = document.getElementById(p.togId);
+            if (body) body.removeAttribute('hidden');
+            if (root) { root.classList.remove('is-collapsed'); root.classList.remove('is-expanded'); }
+            if (tog)  { tog.setAttribute('aria-expanded', 'true'); }
+          }
+        }
+      }
+      pairs.forEach(function (p) {
+        var tog = document.getElementById(p.togId);
+        if (!tog) return;
+        tog.addEventListener('click', function () {
+          var root = document.getElementById(p.rootId);
+          var nowExpanded = !(root && root.classList.contains('is-expanded'));
+          setExpanded(p, nowExpanded);
+        });
+      });
+      applyForViewport();
+      // #1180 — bind once across SPA re-mounts. MQL is process-global per
+      // query string; per-init binds accumulate handlers without bound.
+      if (!_liveNarrowMqlBound) {
+        if (narrowMql.addEventListener) narrowMql.addEventListener('change', applyForViewport);
+        else if (narrowMql.addListener) narrowMql.addListener(applyForViewport);
+        _liveNarrowMqlBound = true;
+        try {
+          window.__liveMQLBindCount = (window.__liveMQLBindCount || 0) + 1;
+        } catch (_) { /* sealed window */ }
+      }
+    })();
+    // ───────────────────────────────────────────────────────────────────────
+
     if (legendToggleBtn && legendEl) {
       // Restore legend collapsed state from localStorage (#279)
       try {
@@ -1394,16 +1681,59 @@
       vcrRewind(VCR.timelineScope);
     });
 
-    // Scope buttons
-    document.querySelectorAll('.vcr-scope-btn').forEach(btn => {
+    // Scope buttons (#1234: exclude .vcr-scope-more which is the dropdown trigger)
+    document.querySelectorAll('.vcr-scope-btn[data-scope]').forEach(btn => {
       btn.addEventListener('click', () => {
-        document.querySelectorAll('.vcr-scope-btn').forEach(b => { b.classList.remove('active'); b.setAttribute('aria-checked', 'false'); });
+        document.querySelectorAll('.vcr-scope-btn[data-scope]').forEach(b => { b.classList.remove('active'); b.setAttribute('aria-checked', 'false'); });
         btn.classList.add('active');
         btn.setAttribute('aria-checked', 'true');
         VCR.timelineScope = parseInt(btn.dataset.scope);
         fetchTimelineTimestamps().then(() => updateTimeline());
       });
     });
+
+    // #1234: VCR scope "More ▾" overflow dropdown. At ≤640px, scope buttons
+    // tagged .vcr-scope-btn--overflow (12h, 24h) are hidden via CSS and
+    // surfaced through this menu. Clicking a menu item proxies the click
+    // to the underlying hidden button so the existing scope handler runs.
+    (function wireVcrScopeMore() {
+      var moreBtn = document.querySelector('[data-vcr-scope-more]');
+      var menu = document.getElementById('vcrScopeMoreMenu');
+      if (!moreBtn || !menu) return;
+      var overflowBtns = Array.from(document.querySelectorAll('.vcr-scope-btn--overflow'));
+      // Populate menu from overflow buttons (preserves label + scope).
+      menu.innerHTML = '';
+      overflowBtns.forEach(function (src) {
+        var item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'vcr-scope-more-item';
+        item.setAttribute('role', 'menuitem');
+        item.setAttribute('data-scope', src.dataset.scope);
+        item.textContent = src.textContent;
+        item.addEventListener('click', function () {
+          src.click(); // delegate to original handler — keeps single source of truth
+          menu.setAttribute('hidden', '');
+          moreBtn.setAttribute('aria-expanded', 'false');
+          // Reflect the chosen scope on the More button label so the user sees feedback.
+          moreBtn.textContent = item.textContent + ' ▾';
+        });
+        menu.appendChild(item);
+      });
+      moreBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var open = !menu.hasAttribute('hidden');
+        if (open) { menu.setAttribute('hidden', ''); moreBtn.setAttribute('aria-expanded', 'false'); }
+        else      { menu.removeAttribute('hidden');  moreBtn.setAttribute('aria-expanded', 'true');  }
+      });
+      // Click outside closes the menu.
+      document.addEventListener('click', function (e) {
+        if (menu.hasAttribute('hidden')) return;
+        if (e.target === moreBtn || moreBtn.contains(e.target) ||
+            e.target === menu   || menu.contains(e.target)) return;
+        menu.setAttribute('hidden', '');
+        moreBtn.setAttribute('aria-expanded', 'false');
+      });
+    })();
 
     // Timeline click to scrub
     // Timeline click handled by drag (mousedown+mouseup)
@@ -1830,6 +2160,15 @@
     if (!feedContent) return;
     feedContent.querySelectorAll('.live-feed-item').forEach(el => el.remove());
     feedDedup.clear();
+    // #1207: ensure empty-state placeholder is present (re-add if a prior
+    // rebuild wiped everything). CSS hides it when items exist.
+    if (!feedContent.querySelector('.live-feed-empty')) {
+      var _ph = document.createElement('div');
+      _ph.className = 'live-feed-empty';
+      _ph.setAttribute('aria-hidden', 'true');
+      _ph.textContent = 'Waiting for packets…';
+      feedContent.appendChild(_ph);
+    }
 
     // Aggregate VCR buffer by hash, then create one feed item per unique hash
     const byHash = new Map();
@@ -2033,6 +2372,8 @@
   window._liveGetNodeFilterKeys = function() { return nodeFilterKeys; };
   window._livePacketMatchesRegion = packetMatchesRegion;
   window._liveSetObserverIataMap = setObserverIataMap;
+  window._liveBuildObserverIataMap = buildObserverIataMap;
+  window._liveGetObserverIataMap = function() { return observerIataMap; };
   window._liveSetNodeFilter = setNodeFilter;
   window._liveFormatLiveTimestampHtml = formatLiveTimestampHtml;
   window._liveResolveHopPositions = resolveHopPositions;
@@ -2040,6 +2381,12 @@
   window._liveVcrPause = vcrPause;
   window._liveVcrResumeLive = vcrResumeLive;
   window._liveVcrSetMode = vcrSetMode;
+  // #1207 test seams: expose production feed mutators so E2E can exercise
+  // the real eviction guard / placeholder re-add path (not a test-local copy).
+  window._liveAddFeedItem = function(icon, typeName, payload, hops, color, pkt) {
+    return addFeedItem(icon, typeName, payload, hops, color, pkt);
+  };
+  window._liveRebuildFeedList = function() { return rebuildFeedList(); };
 
   async function replayRecent() {
     try {
@@ -3049,7 +3396,11 @@
     item.addEventListener('click', () => showFeedCard(item, pkt, color));
     feed.prepend(item);
     requestAnimationFrame(() => requestAnimationFrame(() => item.classList.remove('live-feed-enter')));
-    while (feed.children.length > 25) feed.removeChild(feed.lastChild);
+    // #1207: trim to 25 items, but never evict the empty-state placeholder.
+    while (feed.querySelectorAll('.live-feed-item').length > 25) {
+      var _items = feed.querySelectorAll('.live-feed-item');
+      feed.removeChild(_items[_items.length - 1]);
+    }
 
     // Register
     if (hash) {
@@ -3133,6 +3484,7 @@
       window.removeEventListener('orientationchange', _onResize);
       if (window.visualViewport) window.visualViewport.removeEventListener('resize', _onResize);
     }
+    if (_vcrHeightCleanup) { try { _vcrHeightCleanup(); } catch (_) {} _vcrHeightCleanup = null; }
     // Restore #app height to CSS default
     const appEl = document.getElementById('app');
     if (appEl) appEl.style.height = '';
@@ -3162,6 +3514,14 @@
   }
 
   let _themeRefreshHandler = null;
+
+  // #1180 — singleton guard for the wireLiveCollapseToggles() narrow-viewport
+  // MQL listener. MediaQueryList is process-global per query string; without
+  // this gate, every SPA re-mount of /live registers a new 'change' handler.
+  // The handler reads from current DOM each time, so a one-shot bind is safe
+  // across re-mounts. window.__liveMQLBindCount is a debug seam consumed by
+  // test-live-mql-leak-1180-e2e.js and otherwise unused.
+  var _liveNarrowMqlBound = false;
 
   registerPage('live', {
     init: function(app, routeParam) {

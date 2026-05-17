@@ -128,6 +128,9 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/health", s.handleHealth).Methods("GET")
 	r.HandleFunc("/api/stats", s.handleStats).Methods("GET")
 	r.HandleFunc("/api/perf", s.handlePerf).Methods("GET")
+	r.HandleFunc("/api/perf/io", s.handlePerfIO).Methods("GET")
+	r.HandleFunc("/api/perf/sqlite", s.handlePerfSqlite).Methods("GET")
+	r.HandleFunc("/api/perf/write-sources", s.handlePerfWriteSources).Methods("GET")
 	r.Handle("/api/perf/reset", s.requireAPIKey(http.HandlerFunc(s.handlePerfReset))).Methods("POST")
 	r.Handle("/api/admin/prune", s.requireAPIKey(http.HandlerFunc(s.handleAdminPrune))).Methods("POST")
 	r.Handle("/api/debug/affinity", s.requireAPIKey(http.HandlerFunc(s.handleDebugAffinity))).Methods("GET")
@@ -1233,11 +1236,9 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	name := ""
-	if n, ok := node["name"]; ok && n != nil {
-		name = fmt.Sprintf("%v", n)
-	}
-	recentAdverts, _ := s.db.GetRecentTransmissionsForNode(pubkey, name, 20)
+	// #1143: GetRecentTransmissionsForNode no longer accepts a name fallback;
+	// attribution is strict exact-match on the indexed from_pubkey column.
+	recentAdverts, _ := s.db.GetRecentTransmissionsForNode(pubkey, 20)
 
 	writeJSON(w, NodeDetailResponse{
 		Node:          node,
@@ -1420,11 +1421,17 @@ func (s *Server) handleNodePaths(w http.ResponseWriter, r *http.Request) {
 	pathGroups := map[string]*pathAgg{}
 	totalTransmissions := 0
 	hopCache := make(map[string]*nodeInfo)
+	// Anchor the resolver with the node being queried so tier-1/2 hop-context
+	// resolution lights up when a hop prefix matches the destination node
+	// (handleNodePaths aggregates paths terminating at lowerPK). Passing nil
+	// here re-introduced regression #1197 in production. See
+	// resolve_context_callsites_test.go.
+	hopContext := []string{lowerPK}
 	resolveHop := func(hop string) *nodeInfo {
 		if cached, ok := hopCache[hop]; ok {
 			return cached
 		}
-		r, _, _ := pm.resolveWithContext(hop, nil, s.store.graph)
+		r, _, _ := pm.resolveWithContext(hop, hopContext, s.store.graph.Load())
 		hopCache[hop] = r
 		return r
 	}
@@ -1942,7 +1949,7 @@ func (s *Server) handleResolveHops(w http.ResponseWriter, r *http.Request) {
 				pk := best.PublicKey
 				hr.BestCandidate = &pk
 				hr.Confidence = "neighbor_affinity"
-			} else if (confidence == "geo_proximity" || confidence == "gps_preference" || confidence == "first_match") && best != nil {
+			} else if (confidence == "geo_proximity" || confidence == "gps_preference" || confidence == "observation_count_fallback") && best != nil {
 				// Propagate lower-priority tiers so the API reflects the actual
 				// resolution strategy used, rather than collapsing everything to "ambiguous".
 				hr.Confidence = confidence

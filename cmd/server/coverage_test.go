@@ -42,7 +42,7 @@ func setupTestDBv2(t *testing.T) *DB {
 			id INTEGER PRIMARY KEY AUTOINCREMENT, raw_hex TEXT NOT NULL,
 			hash TEXT NOT NULL UNIQUE, first_seen TEXT NOT NULL,
 			route_type INTEGER, payload_type INTEGER, payload_version INTEGER,
-			decoded_json TEXT, channel_hash TEXT DEFAULT NULL, created_at TEXT DEFAULT (datetime('now'))
+			decoded_json TEXT, channel_hash TEXT DEFAULT NULL, from_pubkey TEXT DEFAULT NULL, created_at TEXT DEFAULT (datetime('now'))
 		);
 		CREATE TABLE observations (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,6 +50,18 @@ func setupTestDBv2(t *testing.T) *DB {
 			observer_id TEXT, observer_name TEXT, direction TEXT,
 			snr REAL, rssi REAL, score INTEGER, path_json TEXT, timestamp INTEGER NOT NULL, raw_hex TEXT
 		);
+		CREATE TRIGGER IF NOT EXISTS test_from_pubkey_advert
+		AFTER INSERT ON transmissions
+		FOR EACH ROW
+		WHEN NEW.from_pubkey IS NULL AND NEW.payload_type = 4 AND NEW.decoded_json IS NOT NULL
+			AND json_extract(NEW.decoded_json, '$.pubKey') IS NOT NULL
+			AND json_extract(NEW.decoded_json, '$.pubKey') <> ''
+		BEGIN
+			UPDATE transmissions
+			SET from_pubkey = json_extract(NEW.decoded_json, '$.pubKey')
+			WHERE id = NEW.id;
+		END;
+		CREATE INDEX IF NOT EXISTS idx_transmissions_from_pubkey ON transmissions(from_pubkey);
 	`
 	if _, err := conn.Exec(schema); err != nil {
 		t.Fatal(err)
@@ -1322,8 +1334,11 @@ func TestBuildTransmissionWhereRFC3339(t *testing.T) {
 		if len(args) != 1 {
 			t.Errorf("expected 1 arg, got %d", len(args))
 		}
-		if !strings.Contains(where[0], "observations") {
-			t.Error("expected observations subquery for RFC3339 since")
+		// PR #1187 r2: RFC3339 since/until MUST use observations.timestamp
+		// subquery so re-observed packets (older first_seen but recent
+		// observation) are still included. Anything else breaks semantics.
+		if !strings.Contains(where[0], "observations") || !strings.Contains(where[0], "timestamp >= ?") {
+			t.Errorf("expected observations.timestamp subquery for RFC3339 since, got %q", where[0])
 		}
 	})
 
@@ -1336,6 +1351,9 @@ func TestBuildTransmissionWhereRFC3339(t *testing.T) {
 		if len(args) != 1 {
 			t.Errorf("expected 1 arg, got %d", len(args))
 		}
+		if !strings.Contains(where[0], "observations") || !strings.Contains(where[0], "timestamp <= ?") {
+			t.Errorf("expected observations.timestamp subquery for RFC3339 until, got %q", where[0])
+		}
 	})
 
 	t.Run("non-RFC3339 since", func(t *testing.T) {
@@ -1344,8 +1362,8 @@ func TestBuildTransmissionWhereRFC3339(t *testing.T) {
 		if len(where) != 1 {
 			t.Errorf("expected 1 clause, got %d", len(where))
 		}
-		if strings.Contains(where[0], "observations") {
-			t.Error("expected direct first_seen comparison for non-RFC3339")
+		if !strings.Contains(where[0], "first_seen") {
+			t.Error("expected first_seen comparison for non-RFC3339 since")
 		}
 	})
 

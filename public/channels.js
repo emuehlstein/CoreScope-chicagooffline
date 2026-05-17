@@ -673,13 +673,13 @@
       <div class="ch-sidebar" aria-label="Channel list">
         <div class="ch-sidebar-header">
           <div class="ch-sidebar-title"><span class="ch-icon">💬</span> Channels</div>
+          <div id="chRegionFilter" class="region-filter-container ch-header-region"></div>
           <button type="button" id="chAddChannelBtn" class="ch-add-channel-btn"
-                  aria-label="Add channel" title="Add a channel — generate, paste a key, or monitor a hashtag">+ Add Channel</button>
+                  aria-label="Add channel" title="Add a channel — generate, paste a key, or monitor a hashtag">+ Add</button>
+          <a href="#/analytics" class="ch-analytics-link"
+             title="Open the Analytics page to see channel activity stats" aria-label="Channel Analytics">📊</a>
         </div>
-        <a href="#/analytics" class="ch-analytics-link"
-           title="Open the Analytics page to see channel activity stats">📊 Channel Analytics →</a>
         <div id="chAddStatus" class="ch-add-status" style="display:none"></div>
-        <div id="chRegionFilter" class="region-filter-container" style="padding:0 8px"></div>
         <div class="ch-channel-list" id="chList" role="listbox" aria-label="Channels">
           <div class="ch-loading">Loading channels…</div>
         </div>
@@ -1066,8 +1066,14 @@
 
     loadObserverRegions();
     loadChannels().then(async function () {
-      // Also load user-added encrypted channels into the sidebar
+      // Also load user-added encrypted channels into the sidebar.
+      // mergeUserChannels() mutates `channels` (marks userAdded, appends
+      // PSK-only entries) AFTER loadChannels() already rendered — so we
+      // MUST re-render here, otherwise the My Channels section never
+      // appears on first load when the route has no specific channel
+      // hash (regression caught by test-channel-issue-1111-e2e.js, case 2).
       mergeUserChannels();
+      renderChannelList();
       if (routeParam) await selectChannel(routeParam);
       if (_pendingNode && _pendingNode.length < 200) await showNodeDetail(_pendingNode);
     });
@@ -1664,12 +1670,14 @@
     const collapsed = localStorage.getItem('ch-encrypted-collapsed') !== 'false';
 
     const sections = [];
-    sections.push(
-      `<div class="ch-section ch-section-mychannels" data-section="mychannels">
+    if (mine.length > 0) {
+      sections.push(
+        `<div class="ch-section ch-section-mychannels" data-section="mychannels">
         <div class="ch-section-header">My Channels <span class="ch-section-locality" title="Saved only in this browser on this device">🖥️ (this browser)</span></div>
-        ${mine.length ? mine.map(renderChannelRow).join('') : '<div class="ch-section-empty">No channels yet — click [+ Add Channel] to add one.</div>'}
+        ${mine.map(renderChannelRow).join('')}
       </div>`
-    );
+      );
+    }
     sections.push(
       `<div class="ch-section ch-section-network" data-section="network">
         <div class="ch-section-header">Network</div>

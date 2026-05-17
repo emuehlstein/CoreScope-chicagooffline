@@ -1,5 +1,51 @@
 /* === CoreScope — style.css === */
 
+/* Aldrich webfont — used by the navbar logo SVG (issue #1137 follow-up).
+ * Self-hosted woff2 (latin subset from Google Fonts, ~16KB). Only weight
+ * available is 400; the SVG's font-weight="700" synthesizes bold. */
+@font-face {
+  font-family: 'Aldrich';
+  src: url('/fonts/aldrich-regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ============================================================
+ * Z-INDEX SCALE (single source of truth — issues #1128, #1131, #1128 followup)
+ * ------------------------------------------------------------
+ * Use these tokens for ANY new stacking context. Raw z-index
+ * literals are legacy and being migrated. When touching a rule
+ * with a literal z-index, replace it with the appropriate token
+ * below.
+ *
+ *   --z-base            0     document base, table cells
+ *   --z-dropdown        100   in-flow dropdowns anchored to a
+ *                             toolbar control (multi-select,
+ *                             saved-filter, column-toggle,
+ *                             autocomplete, region dropdown,
+ *                             node-filter dropdown)
+ *   --z-popover         300   popovers anchored to a dropdown
+ *                             or table cell (path-overflow +N,
+ *                             hop-conflict, autocomplete row
+ *                             detail). Sits ABOVE dropdowns
+ *                             but BELOW modals.
+ *   --z-modal-backdrop  9000  full-viewport modal scrim
+ *   --z-modal           9100  modal panels themselves
+ *   --z-tooltip         9200  tooltips, ctx menus, hover popovers
+ *                             that must float above modals
+ *
+ * Lint: scripts/check-css-vars.js asserts every var(--name)
+ * reference resolves; CI will fail on undefined custom properties
+ * (see #1128 Bug 4 root cause — `--surface` shipped undefined
+ * and 8 dropdowns rendered transparent).
+ *
+ * Migration policy: legacy literal z-index values that work are
+ * left in place to avoid behavioural risk; new code MUST use
+ * the tokens. The 10 highest-traffic dropdowns/popovers in the
+ * packets toolbar were renumbered in the #1128 followup.
+ * ============================================================ */
+
 /* ============================================================
  * FLUID SCAFFOLDING (issue #1054)
  * ------------------------------------------------------------
@@ -81,14 +127,73 @@
   --mono: 'SF Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
   --input-bg: #fff;
   --selected-bg: #dbeafe;
+
+  /* --- Logo theme tokens (PR #1137 + brand-default follow-up) -----------
+   * The CoreScope SVG logos are inlined into the DOM (navbar +
+   * home hero), so they inherit page CSS custom properties. The
+   * legacy --logo-* names are kept so existing themes / brand
+   * customizations that override them still work.
+   *   --logo-text   → wordmark "CORE" / "SCOPE" / labels
+   *   --logo-accent → primary node + left-side arcs   (default sage)
+   *   --logo-accent-hi → secondary node + right-side arcs (default teal)
+   *   --logo-muted  → tagline + sine wave
+   * Sage (#cfd9c9 — fog) and teal (#2c8c8c — water) are the OUT-OF-BOX
+   * brand identity. They are NOT cascaded from --accent any more, so
+   * changing the app accent color via dev tools alone will NOT recolor
+   * the logo. The customizer (public/customize-v2.js) mirrors --accent
+   * and --accent-hover into --logo-accent / --logo-accent-hi when an
+   * operator picks a theme, preserving full theme-driven recoloring.
+   * No --logo-bg here on purpose — the inlined SVGs MUST be transparent
+   * so they sit on whatever bg the page paints. --logo-text defaults to
+   * --text (the page foreground) so the hero wordmark is readable on
+   * any theme; the navbar scopes it to --nav-text below so it stays
+   * white on the dark navbar. */
+  --logo-text: var(--text);
+  --logo-accent: #cfd9c9;
+  --logo-accent-hi: #2c8c8c;
+  --logo-muted: var(--text-muted);
+
   --surface-0: #f4f5f7;
   --surface-1: #ffffff;
   --surface-2: #ffffff;
   --surface-3: #ffffff;
+  /* #1128 (Bug 4): `--surface` was referenced in 8+ rules (.fux-saved-menu,
+   * .fux-popover, .path-popover, .fux-ac-dropdown, .fux-ctx-menu, ...) but
+   * never defined → backgrounds resolved transparent → row content bled
+   * through dropdowns. Alias it to the opaque card surface. */
+  --surface: var(--surface-1);
   --content-bg: var(--surface-0);
   --card-bg: var(--surface-1);
   --hover-bg: rgba(0,0,0, 0.04);
+  /* #1128 followup: caught by scripts/check-css-vars.js — these were
+   * referenced without a fallback in .rf-detail-meta, .rf-detail-close
+   * and .tools-card and would resolve transparent / inherit. Alias them
+   * to existing tokens. */
+  --text-primary: var(--text);
+  --bg-hover: var(--hover-bg);
+  --primary: var(--accent);
+  /* #1128 followup M3: extended check-css-vars.js to scan JS/HTML inline
+   * styles (analytics.js, nodes.js) caught these undefined refs.
+   * Aliased to existing tokens — same pattern as --text-primary above. */
+  --bg-secondary: var(--surface-2);
+  --text-secondary: var(--text-muted);
+  --bg: var(--surface);
   --trace-ghost-color: #94a3b8;
+
+  /* #1128: documented z-index scale. Use these custom props for any new
+   * stacking context decision. Existing legacy z-index values that work are
+   * left in place to avoid behavioural risk; new code must use these tokens.
+   *   --z-base       0   document base, table cells
+   *   --z-dropdown   100 in-flow dropdowns (multi-select, saved, columns)
+   *   --z-popover    300 popovers anchored to dropdowns / cells
+   *   --z-modal-backdrop 9000 / --z-modal 9100 / --z-tooltip 9200
+   */
+  --z-base: 0;
+  --z-dropdown: 100;
+  --z-popover: 300;
+  --z-modal-backdrop: 9000;
+  --z-modal: 9100;
+  --z-tooltip: 9200;
 }
 
 /* ⚠️ DARK THEME VARIABLES — KEEP BOTH BLOCKS IN SYNC
@@ -109,6 +214,7 @@
     --surface-1: #1a1a2e;
     --surface-2: #232340;
     --surface-3: #2d2d50;
+    --surface: var(--surface-1);
     --content-bg: var(--surface-0);
     --card-bg: var(--surface-1);
     --text: #e2e8f0;
@@ -138,6 +244,7 @@
   --surface-1: #1a1a2e;
   --surface-2: #232340;
   --surface-3: #2d2d50;
+  --surface: var(--surface-1);
   --content-bg: var(--surface-0);
   --card-bg: var(--surface-1);
   --text: #e2e8f0;
@@ -389,16 +496,89 @@ input[type="week"] {
 .nav-left { display: flex; align-items: center; gap: var(--space-lg); min-width: 0; flex-shrink: 1; overflow-x: hidden; overflow-y: visible; }
 .nav-brand { display: flex; align-items: center; gap: var(--space-sm); text-decoration: none; color: var(--nav-text); font-weight: 700; font-size: var(--fs-md); }
 .brand-icon { font-size: 20px; }
-.live-dot {
-  width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted);
-  display: inline-block; margin-left: 4px; transition: background .3s;
+.brand-logo {
+  display: block;
+  height: 36px;
+  /* Width matches the inline SVG's effective content aspect (~3.08:1)
+     after cropping to the wordmark+nodes region in the navbar viewBox.
+       /* Pinned to match the SVG intrinsic width (#1141 followup: viewBox
+     widened to 150 10 970 280 to fit CORE/SCOPE wordmark; intrinsic
+     width 125 keeps the text legible at the same ~36px height). */
+  width: 125px;
+  max-height: 36px;
+  /* The logo is inlined into the DOM (PR #1137) so it inherits page
+     CSS variables; theme via --logo-text / --logo-accent / etc. defined
+     in :root above. The .top-nav scope below overrides --logo-text to
+     --nav-text so the wordmark stays readable on the dark navbar even
+     when the page theme is Light. */
 }
-@keyframes pulse-ring {
-  0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6); }
-  70% { box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+.top-nav {
+  /* Navbar lives on --nav-bg (typically dark), so the brand wordmark
+     must use --nav-text rather than the page --text default. */
+  --logo-text: var(--nav-text);
 }
-.live-dot.connected { background: var(--status-green); animation: pulse-ring 2s ease-out infinite; }
+/* Mark-only navbar logo: hidden by default, swapped in for the full
+   wordmark logo at narrow viewports where SCOPE would otherwise clip
+   (#1137 mobile width pin was 99px → SCOPE→SCOF at ≤390px). */
+.brand-mark-only {
+  display: none;
+  height: 32px;
+  width: auto;
+}
+/* #1173: legacy navbar `.live-dot` indicator removed — WS state is now
+   encoded in the brand-logo itself (.logo-disconnected + packet-driven
+   .logo-pulse-active). The navbar element is gone from index.html, so we
+   don't ship a `display: none` shell here — `live.js` reuses `.live-dot`
+   for legend bullets (styled by live.css) and a global no-op rule would
+   wipe those out. If a stale extension/customizer ever injects a navbar
+   `.live-dot`, it's a harmless 0×0 unstyled span. */
+/* #1173: brand-logo packet-pulse animation.
+   - Class toggles only — pure CSS animation. JS adds/removes:
+     .logo-pulse-active (chained ping, source then destination)
+     .logo-pulse-blip   (reduced-motion fallback, destination only)
+     .logo-disconnected (sustained desaturate while WS down)
+   - All color comes from --logo-accent / --logo-accent-hi tokens.
+     Animation only tweaks filter: brightness() + transform: scale(). */
+.brand-logo circle.logo-node-a,
+.brand-logo circle.logo-node-b,
+.brand-mark-only circle.logo-node-a,
+.brand-mark-only circle.logo-node-b {
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: filter .12s ease-out;
+  will-change: filter, transform;
+}
+@keyframes logo-pulse-step {
+  0%   { filter: brightness(1);   transform: scale(1); }
+  40%  { filter: brightness(1.6); transform: scale(1.18); }
+  100% { filter: brightness(1);   transform: scale(1); }
+}
+.brand-logo circle.logo-pulse-active,
+.brand-mark-only circle.logo-pulse-active {
+  animation: logo-pulse-step 80ms ease-out;
+}
+@keyframes logo-pulse-blip-step {
+  0%   { opacity: 1; }
+  50%  { opacity: 0.55; }
+  100% { opacity: 1; }
+}
+.brand-logo circle.logo-pulse-blip,
+.brand-mark-only circle.logo-pulse-blip {
+  animation: logo-pulse-blip-step 140ms linear;
+}
+.brand-logo.logo-disconnected,
+.brand-mark-only.logo-disconnected {
+  filter: grayscale(0.6) opacity(0.7);
+  transition: filter .25s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-logo circle.logo-pulse-active,
+  .brand-mark-only circle.logo-pulse-active {
+    /* Defensive: in case anything mistakenly toggles the chained class
+       under reduced-motion, neutralize the scale animation. */
+    animation: none;
+  }
+}
 
 .nav-links { display: flex; align-items: center; gap: var(--space-xs); }
 .nav-link {
@@ -512,7 +692,11 @@ input[type="week"] {
    a fixed-height container (maps, virtual-scroll, split-panels) add
    .app-fixed via the router so their children can use height:100%. */
 #app { min-height: calc(100vh - 52px); min-height: calc(100dvh - 52px); }
-#app.app-fixed { height: calc(100vh - 52px); height: calc(100dvh - 52px); min-height: 0; overflow: hidden; }
+/* #1174 mesh-op review: subtract --bottom-nav-reserve so /map and the
+ * other fixed-height pages (packets, nodes, channels, audio-lab) do not
+ * have their last 56px covered by the bottom-nav at ≤768. The token is
+ * 0px at desktop so wide-viewport behavior is unchanged. */
+#app.app-fixed { height: calc(100vh - 52px - var(--bottom-nav-reserve, 0px)); height: calc(100dvh - 52px - var(--bottom-nav-reserve, 0px)); min-height: 0; overflow: hidden; }
 
 .split-layout {
   display: flex; height: 100%; overflow: hidden;
@@ -555,8 +739,17 @@ input[type="week"] {
 .page-header .count { color: var(--text-muted); font-weight: 400; font-size: 14px; margin-left: 8px; }
 
 /* === Filter Bar === */
+/* === Filter toolbar (#1122)
+ * Toolbar layout is composed of fenced .filter-group clusters:
+ *   1. Quick filters       — text inputs (hash, node, observer, region, type, channel)
+ *   2. Toggles             — Group by Hash, ★ My Nodes
+ *   3. Time window         — last-N selector
+ *   4. Sort & view options — observer sort, columns toggle, hex paths
+ * Adjacent .filter-group + .filter-group siblings get a left divider + padding
+ * so the visual seam between groups stays readable even when wrapped. */
 .filter-bar {
-  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; align-items: center;
+  display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; align-items: center;
+  row-gap: 12px;
 }
 .filter-bar input, .filter-bar select {
   padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px;
@@ -571,6 +764,9 @@ input[type="week"] {
   font-family: var(--font); color: var(--text); height: 34px; box-sizing: border-box; line-height: 1;
 }
 .filter-group { display: flex; gap: 6px; align-items: center; }
+/* #1124 (MAJOR-3): each grouped cluster wraps as a single unit at narrow
+ * widths instead of letting individual controls reflow across categories. */
+.filter-bar .filter-group { flex-wrap: nowrap; }
 .filter-group .btn { padding: 4px 10px; font-size: 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); cursor: pointer; transition: background 0.15s, color 0.15s; }
 .filter-group .btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .filter-group .btn:hover:not(.active) { background: var(--surface-2); }
@@ -645,6 +841,68 @@ input[type="week"] {
 /* MAJOR-2: when user-resizable columns push total width past container,
  * fall back to horizontal scroll on the wrap rather than overflowing the page. */
 .table-fluid-wrap { width: 100%; overflow-x: auto; }
+
+/* === #1056 AC#4: Slide-over row-detail overlay (narrow viewports) ========
+ * Singleton .slide-over-backdrop + .slide-over-panel injected into <body>
+ * by SlideOver helper in packets.js. Used by Packets/Nodes/Observers row
+ * clicks at viewport <=1023 instead of routing to a separate page.
+ * Reuses the existing slideInRight keyframe defined later in this file.
+ */
+
+/* #1168 Munger #3: ref-counted scroll-lock. Multiple modal surfaces
+ * (SlideOver, ChannelColorPicker, future modals) acquire/release a
+ * shared count via window.__scrollLock; the class is added on first
+ * acquire and removed on last release. Replaces the previous
+ * body.style.overflow capture-and-restore string approach which
+ * corrupted overflow under last-writer-wins races. */
+body.scroll-locked { overflow: hidden; }
+.slide-over-backdrop {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+}
+.slide-over-backdrop[hidden] { display: none; }
+.slide-over-panel {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: min(480px, 90vw);
+  z-index: 1001;
+  background: var(--detail-bg, var(--card-bg, #1f2937));
+  color: var(--text, inherit);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.35);
+  overflow-y: auto; overflow-x: hidden;
+  display: flex; flex-direction: column;
+  animation: slideInRight 200ms ease-out;
+}
+.slide-over-panel[hidden] { display: none; }
+.slide-over-header {
+  position: sticky; top: 0; z-index: 2;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 10px 12px;
+  background: var(--card-bg, var(--detail-bg));
+  border-bottom: 1px solid var(--border);
+}
+.slide-over-title {
+  margin: 0; font-size: 14px; font-weight: 600;
+  color: var(--text, inherit);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.slide-over-close {
+  background: none; border: none; cursor: pointer;
+  font-size: 18px; line-height: 1;
+  color: var(--text-muted, #94a3b8);
+  padding: 4px 8px; border-radius: 4px;
+  /* WCAG 2.5.5 / Apple HIG — 48px tap target on touch devices. */
+  min-width: 44px; min-height: 44px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.slide-over-close:hover { color: var(--text, inherit); background: var(--row-hover); }
+.slide-over-close:focus-visible { outline: 2px solid var(--accent, #60a5fa); outline-offset: 2px; }
+.slide-over-content { flex: 1; min-height: 0; padding: 12px; }
+@media (prefers-reduced-motion: reduce) {
+  .slide-over-panel { animation: none; }
+}
+
 .timestamp-future-icon { margin-left: 4px; cursor: help; }
 .data-table tbody tr:nth-child(even) { background: var(--row-stripe); }
 .data-table tbody tr:hover { background: var(--row-hover); cursor: pointer; }
@@ -748,10 +1006,22 @@ input[type="week"] {
 /* === Path display === */
 .path-hops {
   display: inline-flex; align-items: center; gap: 2px; font-family: var(--mono); font-size: 11px;
+  /* #1122: never wrap; clip so a long hop chain cannot spill into the next row */
+  flex-wrap: nowrap;
+  max-width: 100%;
+  max-height: 22px;
+  overflow: hidden;
+  vertical-align: middle;
 }
-.path-hops .hop { color: var(--accent); }
-.path-hops .hop-named { color: #fff; background: var(--accent); padding: 1px 6px; border-radius: 3px; font-family: var(--font); font-weight: 600; cursor: default; }
-.path-hops .arrow { color: var(--text-muted); }
+.path-hops .hop { color: var(--accent); line-height: 18px; }
+.path-hops .hop-named { color: #fff; background: var(--accent); padding: 1px 6px; border-radius: 3px; font-family: var(--font); font-weight: 600; cursor: default; flex: 0 0 auto; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 18px; }
+.path-hops .arrow { color: var(--text-muted); flex: 0 0 auto; line-height: 18px; }
+/* #1122/#1128: bound the row height contributed by the path column.
+ * `max-height` on a <td> is widely ignored by browsers (table layout
+ * overrides it), so use `height` — table cells respect `height` as
+ * min-height, locking the row to a single line of chip content
+ * regardless of hop count. */
+.data-table td.col-path { height: 28px; line-height: 22px; overflow: hidden; }
 
 /* === Modal === */
 .modal-overlay {
@@ -840,8 +1110,24 @@ input[type="week"] {
   max-width: calc(100vw - 24px);
   font-size: 13px;
   max-height: calc(100% - 24px); overflow-y: auto;
+  /* #1236: keep the scrollbar gutter reserved so the scroll affordance is
+     visible even when content briefly fits — users get a consistent visual
+     cue that the panel is scrollable. */
+  scrollbar-gutter: stable;
 }
-.map-controls h3 { font-size: 15px; margin-bottom: 10px; }
+/* #1236: sticky panel title so the scroll affordance is always visible at the
+   top of the scroll container when content overflows on small viewports. */
+.map-controls h3 {
+  font-size: 15px;
+  margin: -14px -16px 10px -16px;
+  padding: 10px 16px;
+  position: sticky;
+  top: -14px;
+  background: var(--card-bg);
+  z-index: 2;
+  border-bottom: 1px solid var(--border);
+  border-radius: 10px 10px 0 0;
+}
 .mc-section { margin-bottom: 10px; }
 .mc-label { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .3px; color: var(--text-muted); margin-bottom: 4px; }
 .mc-section label { display: block; padding: 2px 0; cursor: pointer; }
@@ -883,11 +1169,17 @@ fieldset.mc-section legend.mc-label { padding: 0; }
   border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden;
 }
 .ch-sidebar-header {
-  padding: 14px 16px; border-bottom: 1px solid var(--border);
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
 }
 .ch-sidebar-title {
-  display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 700; margin-bottom: 8px;
+  display: flex; align-items: center; gap: 6px;
+  font-size: 15px; font-weight: 700;
+  flex: 1 1 auto; min-width: 0;
+  /* Name dominates; no longer push other controls onto a new row */
+  margin: 0;
 }
+.ch-header-region { margin: 0; padding: 0; flex: 0 0 auto; }
 .ch-encrypted-toggle {
   display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-muted);
   cursor: pointer; user-select: none; margin-bottom: 4px;
@@ -1117,6 +1409,20 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 .node-detail-section .data-table td a,
 .node-full-card .data-table td a {
   color: var(--accent);
+}
+/* #1146: "Paths Through This Node" entries render as <div> blocks, not
+   tables, so the rule above doesn't reach them. Without this, the path-hop
+   <a> elements inherit the UA-default rgb(0,0,238) blue, which on the dark
+   card surface (--card-bg: #1a1a2e) computes to ~1.8-3.0:1 — well below
+   the 4.5:1 WCAG AA body-text minimum. Use --accent so the link tracks the
+   active theme (and customizer overrides) like the data-table links do. */
+.node-detail-section #pathsContent a,
+.node-full-card #fullPathsContent a {
+  color: var(--accent);
+}
+.node-detail-section #pathsContent a:hover,
+.node-full-card #fullPathsContent a:hover {
+  color: var(--accent-hover);
 }
 .node-detail-section h4 {
   font-size: 12px; text-transform: uppercase; letter-spacing: .5px;
@@ -1356,9 +1662,18 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 @media (max-width: 900px) {
   .panel-right { width: 320px; min-width: 320px; }
   .nav-stats { display: none; }
-  .brand-text { font-size: 14px; }
+  .brand-logo { height: 32px; width: 112px; }
   .nav-link { padding: 14px 8px; font-size: 13px; }
   .map-controls { width: 180px; font-size: 12px; }
+}
+
+/* === Responsive — Mobile (≤400px) ===
+   At narrow viewports the inline wordmark SVG (intrinsic 111px content)
+   clips when squeezed into the 99px tablet pin (#1137 → SCOPE→SCOF).
+   Swap to the dedicated .brand-mark-only inline SVG (arcs+dots only). */
+@media (max-width: 400px) {
+  .brand-logo { display: none; }
+  .brand-mark-only { display: block; }
 }
 
 /* #1057: Container query — stack the channels layout when the channels
@@ -1426,7 +1741,15 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   .hamburger { display: inline-flex; }
   .nav-more-wrap { display: none !important; }
   .nav-links {
-    display: none; position: absolute; top: 52px; left: 0; right: 0;
+    /* Issue #1109: was position:absolute. The containing block becomes
+       .top-nav (the nearest positioned ancestor: position:sticky), which
+       has `overflow:hidden; height:52px` since #1066 to guard against
+       horizontal overflow during the Priority+ measurement pass. That
+       guard clipped this dropdown invisibly below the navbar. Switching
+       to position:fixed escapes any overflow:hidden ancestor (containing
+       block becomes the viewport) without relaxing the #1066 desktop
+       overflow guard. */
+    display: none; position: fixed; top: 52px; left: 0; right: 0;
     background: var(--nav-bg); flex-direction: column; padding: 8px 0;
     box-shadow: 0 8px 24px rgba(0,0,0,.4); z-index: 1100;
     max-height: calc(100dvh - 52px); overflow-y: auto;
@@ -1441,7 +1764,6 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 
 /* === Responsive — Mobile (≤640px) === */
 @media (max-width: 640px) {
-  .brand-text { display: none; }
   .nav-right { gap: 4px; }
 
   /* Layouts: stack instead of side-by-side */
@@ -1469,6 +1791,39 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   }
   .ch-back-btn { display: flex; }
   .ch-main-header { display: flex; align-items: center; gap: 8px; }
+
+  /* #1224 Channels mobile UX: compact header, dominant channel name,
+     icon-only row actions, smaller empty state. */
+  .ch-sidebar-header {
+    padding: 6px 10px; gap: 6px;
+    max-height: 56px;
+  }
+  .ch-sidebar-title { font-size: 14px; }
+  .ch-sidebar-title .ch-icon { font-size: 16px; }
+  .ch-add-channel-btn { padding: 4px 8px; font-size: 12px; }
+  .ch-analytics-link { padding: 3px 7px; font-size: 13px; }
+  /* Region filter shows just its compact pills/dropdown trigger in the header. */
+  .ch-header-region .region-filter-bar { padding: 0; gap: 4px; }
+  .ch-header-region .region-pill { padding: 2px 6px; font-size: 11px; }
+  .ch-header-region .region-dropdown-trigger { padding: 3px 6px; font-size: 11px; }
+
+  /* Channel list row: name must dominate. The inline share/remove icons
+     were eating >88px because of their 44x44 touch target — push them
+     onto a per-row reveal pattern: show a single ⋮ trigger that toggles
+     the action set. Until then, shrink them to icon-only and let the
+     name grow via flex:1. */
+  #chList .ch-item { padding: 10px 12px; gap: 10px; }
+  #chList .ch-item-name { flex: 1 1 auto; min-width: 0; }
+  #chList .ch-item-top { gap: 6px; }
+  #chList .ch-icon-btn { min-width: 32px; min-height: 32px; padding: 2px 4px; }
+  #chList .ch-share-btn { font-size: 0; }
+  #chList .ch-share-btn::before { content: '📤'; font-size: 13px; }
+  #chList .ch-remove-btn { font-size: 12px; padding: 2px 6px; }
+  /* Hide the analytics-style time on mobile rows to free width for the name. */
+  #chList .ch-item-time { font-size: 10px; }
+
+  /* Empty state must not dominate. */
+  .ch-empty { padding: 12px; font-size: 13px; max-height: 30vh; }
 
   /* Tables: smaller text for mobile */
   .data-table { font-size: 11px; min-width: 0; }
@@ -1662,12 +2017,14 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .ch-add-hint { font-size: 11px; color: var(--text-muted); margin-top: 4px; line-height: 1.3; }
 .ch-add-status { font-size: 12px; margin-top: 4px; padding: 4px 6px; border-radius: 4px; }
 .ch-analytics-link {
-  display: block;
-  padding: 6px 8px;
-  font-size: 12px;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 4px 8px;
+  font-size: 14px;
   text-decoration: none;
   color: var(--text-muted);
-  border-bottom: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  flex: 0 0 auto;
 }
 .ch-analytics-link:hover { color: var(--accent); }
 .ch-add-status--loading { color: var(--text-muted); }
@@ -1763,7 +2120,7 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .hash-cell-possible { background: var(--status-yellow); color: #fff; }
 .hash-cell-collision { color: #fff; }
 .hash-matrix-tooltip {
-  position: fixed; z-index: 9999; background: var(--surface-1); border: 1px solid var(--border);
+  position: fixed; z-index: var(--z-tooltip); background: var(--surface-1); border: 1px solid var(--border);
   border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); padding: 8px 12px;
   font-size: 12px; min-width: 160px; max-width: 260px; pointer-events: none;
 }
@@ -1804,8 +2161,19 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .stat-label { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
 .stat-detail { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 .stat-spark { margin-top: 6px; display: flex; justify-content: center; }
-.analytics-row { display: flex; gap: 16px; margin-bottom: 16px; }
-.analytics-row .flex-1 { flex: 1; min-width: 0; }
+/* #1058 — Analytics rows: fluid + auto-stacking via CSS Grid `auto-fit`.
+   Cards stack automatically when the row can't fit two columns at the
+   400px-floor minimum (avoids cramped charts), and otherwise lay out
+   side-by-side. Replaces the prior `flex` + `@media (max-width:640px)`
+   approach so behavior is driven by available width — not viewport —
+   matching #1050's fluid-everywhere mandate. `min(100%, 400px)` keeps
+   the track from overflowing at very narrow widths. */
+.analytics-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
 .rf-stats { display: flex; gap: 16px; flex-wrap: wrap; padding-top: 8px; font-size: 13px; }
 .payload-bars { display: flex; flex-direction: column; gap: 6px; }
 .payload-bar-row { display: flex; align-items: center; gap: 8px; }
@@ -1822,7 +2190,6 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .reach-nodes { flex: 1; font-size: 12px; line-height: 1.6; }
 .reach-count { min-width: 70px; text-align: right; font-size: 12px; color: var(--text-muted); }
 @media (max-width: 640px) {
-  .analytics-row { flex-direction: column; }
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
   .repeater-name { min-width: 80px; }
   .reach-ring { flex-wrap: wrap; }
@@ -1870,7 +2237,7 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
   border-radius: 6px;
   max-height: 200px;
   overflow-y: auto;
-  z-index: 100;
+  z-index: var(--z-dropdown);
   box-shadow: 0 4px 12px rgba(0,0,0,0.4);
 }
 .node-filter-dropdown.hidden { display: none; }
@@ -1940,7 +2307,7 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .hop-conflict-btn { background: var(--status-yellow, #f59e0b); color: #000; border: none; border-radius: 4px; font-size: 11px;
   font-weight: 700; padding: 1px 5px; cursor: pointer; vertical-align: middle; margin-left: 3px; line-height: 1.2; }
 .hop-conflict-btn:hover { background: var(--status-yellow, #d97706); filter: brightness(0.85); }
-.hop-conflict-popover { position: absolute; z-index: 9999; background: var(--surface-1); border: 1px solid var(--border);
+.hop-conflict-popover { position: absolute; z-index: var(--z-popover); background: var(--surface-1); border: 1px solid var(--border);
   border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); width: 260px; max-height: 300px; overflow-y: auto; }
 .hop-conflict-header { padding: 10px 12px; font-size: 12px; font-weight: 700; border-bottom: 1px solid var(--border);
   color: var(--text-muted); }
@@ -2018,7 +2385,7 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 /* #71 — Column visibility toggle */
 .col-toggle-wrap { position: relative; display: inline-block; }
 .col-toggle-btn { font-size: 13px; padding: 6px 10px; cursor: pointer; background: var(--input-bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); height: 34px; box-sizing: border-box; line-height: 1; }
-.col-toggle-menu { display: none; position: absolute; top: 100%; left: 0; z-index: 50; background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 0; min-width: 150px; box-shadow: 0 4px 12px rgba(0,0,0,.15); }
+.col-toggle-menu { display: none; position: absolute; top: 100%; left: 0; z-index: var(--z-dropdown); background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 0; min-width: 150px; box-shadow: 0 4px 12px rgba(0,0,0,.15); }
 .col-toggle-menu.open { display: block; }
 .col-toggle-menu label { display: flex; align-items: center; gap: 6px; padding: 4px 12px; font-size: .82rem; cursor: pointer; color: var(--text); }
 .col-toggle-menu label input[type="checkbox"] { width: 14px; height: 14px; margin: 0; flex-shrink: 0; }
@@ -2277,7 +2644,7 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 }
 .region-dropdown-trigger:hover { border-color: var(--accent); color: var(--accent); }
 .region-dropdown-menu {
-  position: absolute; top: 100%; left: 0; z-index: 90;
+  position: absolute; top: 100%; left: 0; z-index: var(--z-dropdown);
   min-width: 220px; width: max-content; max-height: 260px; overflow-y: auto;
   background: var(--card-bg, #fff); border: 1px solid var(--border); border-radius: 8px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.12); padding: 4px 0;
@@ -2299,10 +2666,16 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
   font-size: 13px; font-weight: 500; cursor: pointer; border: 1px solid var(--border);
   background: var(--input-bg); color: var(--text); transition: all 0.15s;
   height: 34px; box-sizing: border-box; white-space: nowrap; line-height: 1;
+  /* #1128 (Bug 3): cap trigger width so a long selection like
+   * "TRACE,MULTIPART,GRP_TXT" doesn't balloon the row and overlap toolbar
+   * buttons. The full label remains accessible via the title tooltip.
+   * #1131 MAJOR-4: use clamp() so the cap scales with viewport width
+   * instead of being a hard 180px on every screen size. */
+  max-width: clamp(120px, 18vw, 280px); overflow: hidden; text-overflow: ellipsis;
 }
 .multi-select-trigger:hover { border-color: var(--accent); color: var(--accent); }
 .multi-select-menu {
-  position: absolute; top: 100%; left: 0; z-index: 90;
+  position: absolute; top: 100%; left: 0; z-index: var(--z-dropdown);
   min-width: 220px; max-height: 260px; overflow-y: auto;
   background: var(--card-bg, #fff); border: 1px solid var(--border); border-radius: 8px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.12); padding: 4px 0; display: none;
@@ -2356,10 +2729,14 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 .matrix-theme .live-feed .live-feed-item:hover { background: rgba(0,255,65,0.08) !important; }
 .matrix-theme .live-feed .feed-hide-btn { color: #00ff41 !important; }
 
-/* Controls in matrix mode */
+/* Controls in matrix mode (#1205 R1) — keep matrix text/accent color
+   only. Background + border are owned by the parent #liveHeader (MESH
+   LIVE panel) now that .live-controls is in-flow and transparent;
+   re-painting an opaque box here would orphan a nested chrome rect
+   inside the header for matrix-theme users. */
 .matrix-theme .live-controls {
-  background: rgba(0, 10, 0, 0.9) !important;
-  border-color: #00ff4130 !important;
+  background: transparent !important;
+  border: 0 !important;
   color: #00ff41 !important;
 }
 .matrix-theme .live-controls label,
@@ -2433,7 +2810,7 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 .audio-unlock-overlay {
   position: fixed;
   inset: 0;
-  z-index: 10000;
+  z-index: var(--z-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2661,7 +3038,7 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 /* === Channel Color Picker (#674) === */
 .cc-picker-popover {
   position: fixed;
-  z-index: 9999;
+  z-index: var(--z-tooltip);
   background: var(--bg-secondary, #1e1e1e);
   border: 1px solid var(--border-color, #333);
   border-radius: 8px;
@@ -2885,6 +3262,13 @@ th.sort-active { color: var(--accent, #60a5fa); }
 .map-side-pane .pane-toggle { cursor: pointer; padding: 8px; font-size: 14px; text-align: center; }
 .map-side-pane .pane-content { display: none; }
 .map-side-pane.expanded .pane-content { display: block; }
+/* #1236: on mobile the path-inspector side pane was eating 32px of horizontal
+   width (flex:0 0 32px) inside #map-wrap, leaving an unused gutter on the
+   right of the leaflet canvas. Path Inspector is a desktop-only convenience;
+   hide the pane on narrow viewports so the map fills 100% of the viewport. */
+@media (max-width: 640px) {
+  .map-side-pane { display: none; }
+}
 
 /* Tools landing page */
 .tools-landing { padding: 24px; max-width: 600px; }
@@ -3076,7 +3460,43 @@ th.sort-active { color: var(--accent, #60a5fa); }
 .fux-help-btn:hover,
 .fux-saved-trigger:hover { background: var(--bg-hover, var(--surface)); }
 
-.fux-popover { position: fixed; top: 60px; right: 24px; width: min(720px, 92vw); max-height: 80vh; overflow: auto; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 10px 40px rgba(0,0,0,0.35); z-index: 10000; padding: 0; }
+.fux-popover { position: fixed; top: 60px; right: 24px; width: min(720px, 92vw); max-height: 80vh; overflow: auto; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 10px 40px rgba(0,0,0,0.35); z-index: var(--z-modal); padding: 0; }
+/* #1122: when help is opened inside .modal-overlay (real modal/backdrop),
+   reset the absolute positioning so the flex-centered overlay places it.
+   Also neutralise .modal default padding so the sticky header sits flush. */
+.modal-overlay > .fux-popover { position: relative; top: auto; right: auto; left: auto; bottom: auto; padding: 0; max-width: min(720px, 92vw); width: min(720px, 92vw); }
+.modal.fux-popover { padding: 0; }
+.fux-help-overlay { z-index: var(--z-modal); }
+/* #1124: keep the help modal inside the viewport. The backdrop alone is
+ * enough visual separation; rows underneath stay rendered. */
+.modal-overlay > .fux-popover { max-height: 80vh; overflow-y: auto; }
+
+/* #1124 (MAJOR-1): overflow pill rendered when path chips exceed the
+ * row's height cap. Visual style mirrors the #1056 TableResponsive pill. */
+.path-overflow-pill {
+  display: inline-flex; align-items: center;
+  flex: 0 0 auto;
+  margin-left: 4px;
+  padding: 1px 6px;
+  font-family: var(--mono); font-size: 10px; font-weight: 600;
+  color: var(--text-muted);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+.path-overflow-pill:hover { color: var(--text); background: var(--bg-hover, var(--surface)); }
+.path-popover {
+  position: absolute; z-index: var(--z-popover);
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+  padding: 8px 10px; max-width: min(360px, calc(100vw - 32px)); max-height: 240px; overflow: auto;
+  font-family: var(--mono); font-size: 12px;
+}
+.path-popover .path-popover-title { font-family: var(--font); font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
+.path-popover .hop, .path-popover .hop-named { white-space: nowrap; }
 .fux-popover-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--surface); }
 .fux-popover-close { background: transparent; border: none; color: var(--text-muted); font-size: 16px; cursor: pointer; padding: 0 4px; }
 .fux-popover-close:hover { color: var(--text); }
@@ -3091,18 +3511,18 @@ th.sort-active { color: var(--accent, #60a5fa); }
 .fux-examples { margin: 4px 0; padding-left: 20px; }
 .fux-examples li { margin: 2px 0; }
 
-.fux-ac-dropdown { position: absolute; left: 0; right: 0; top: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; max-height: 280px; overflow-y: auto; z-index: 9999; box-shadow: 0 4px 12px rgba(0,0,0,0.25); margin-top: 2px; }
+.fux-ac-dropdown { position: absolute; left: 0; right: 0; top: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; max-height: 280px; overflow-y: auto; z-index: var(--z-dropdown); box-shadow: 0 4px 12px rgba(0,0,0,0.25); margin-top: 2px; }
 .fux-ac-item { padding: 4px 10px; display: flex; justify-content: space-between; gap: 12px; cursor: pointer; font-size: 12px; }
 .fux-ac-item:hover,
 .fux-ac-item.active { background: var(--bg-hover, rgba(120,160,255,0.12)); }
 .fux-ac-val { font-family: var(--mono); color: var(--text); }
 .fux-ac-desc { color: var(--text-muted); font-size: 11px; max-width: 60%; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.fux-ctx-menu { position: absolute; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; box-shadow: 0 4px 14px rgba(0,0,0,0.35); z-index: 10001; min-width: 200px; padding: 4px 0; }
+.fux-ctx-menu { position: absolute; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; box-shadow: 0 4px 14px rgba(0,0,0,0.35); z-index: var(--z-tooltip); min-width: 200px; padding: 4px 0; }
 .fux-ctx-item { display: block; width: 100%; text-align: left; background: transparent; border: none; color: var(--text); padding: 5px 12px; font-size: 12px; cursor: pointer; font-family: var(--mono); }
 .fux-ctx-item:hover { background: var(--bg-hover, rgba(120,160,255,0.12)); }
 
-.fux-saved-menu { position: absolute; top: 100%; left: 0; min-width: 320px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; z-index: 9999; box-shadow: 0 4px 14px rgba(0,0,0,0.3); margin-top: 4px; padding: 4px 0; }
+.fux-saved-menu { position: absolute; top: 100%; left: 0; min-width: 320px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; z-index: var(--z-dropdown); box-shadow: 0 4px 14px rgba(0,0,0,0.3); margin-top: 4px; padding: 4px 0; }
 .fux-saved-menu.hidden { display: none; }
 .fux-saved-header { padding: 6px 10px; font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border); }
 .fux-saved-item { display: flex; align-items: center; gap: 8px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
@@ -3117,3 +3537,270 @@ th.sort-active { color: var(--accent, #60a5fa); }
 
 td[data-filter-field] { cursor: context-menu; }
 
+/* === Issue #1064 — Edge-swipe nav drawer ============================
+ * Slide-over from the LEFT edge. Z-index sits ABOVE bottom-nav (1200)
+ * but BELOW modal (var(--z-modal) = 9100). Fenced for parallel-PR
+ * coordination with #1062 (gesture handlers / swipe-affordance section).
+ * --------------------------------------------------------------------- */
+
+/* `pan-y` lets vertical scroll work everywhere; the drawer claims
+ * horizontal swipes inside our viewport. iOS browser back-swipe (system
+ * left-edge gesture) still works — it's at the OS layer, above the page.
+ *
+ * Mesh-Op review (PR #1184): scope this to wide viewports only. At
+ * ≤768px the drawer is `display:none` (Option A), so this rule does
+ * nothing useful and would block horizontal panning gestures the future
+ * gesture system (#1185) might want to claim. */
+@media (min-width: 769px) {
+  body { touch-action: pan-y; }
+}
+
+.nav-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 1250; /* above bottom-nav (1200), below modal-backdrop (9000) */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease;
+}
+.nav-drawer-backdrop.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.nav-drawer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: min(320px, 86vw);
+  max-width: 360px;
+  background: var(--surface);
+  color: var(--text);
+  border-right: 1px solid var(--border);
+  box-shadow: 4px 0 18px rgba(0, 0, 0, 0.35);
+  z-index: 1260; /* above its backdrop, still below modal */
+  transform: translateX(-100%);
+  transition: transform 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  outline: none;
+}
+.nav-drawer.is-open { transform: translateX(0); }
+
+.nav-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2, var(--surface));
+}
+.nav-drawer-title {
+  font-weight: 700;
+  font-size: var(--fs-md);
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+.nav-drawer-close {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 22px;
+  line-height: 1;
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.nav-drawer-close:hover,
+.nav-drawer-close:focus-visible {
+  background: var(--bg-hover, rgba(120, 160, 255, 0.12));
+  outline: none;
+}
+
+.nav-drawer-list {
+  display: flex;
+  flex-direction: column;
+  padding: 6px 0;
+  overflow-y: auto;
+  flex: 1;
+}
+.nav-drawer-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 18px;
+  color: var(--text);
+  text-decoration: none;
+  font-size: var(--fs-md);
+  min-height: 48px;
+  touch-action: manipulation;
+}
+.nav-drawer-item:hover,
+.nav-drawer-item:focus-visible {
+  background: var(--bg-hover, rgba(120, 160, 255, 0.12));
+  outline: none;
+}
+.nav-drawer-icon {
+  font-size: 18px;
+  line-height: 1;
+  width: 24px;
+  text-align: center;
+  flex: none;
+}
+.nav-drawer-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Option A: drawer is wide-only (>768px). At ≤768px the bottom-nav has
+ * the More tab (PR #1174) — drawer is hidden + script bails on open(). */
+@media (max-width: 768px) {
+  .nav-drawer,
+  .nav-drawer-backdrop { display: none !important; }
+}
+
+/* Reduced motion: instant snap, no transition. */
+@media (prefers-reduced-motion: reduce) {
+  .nav-drawer { transition: none; }
+  .nav-drawer-backdrop { transition: none; }
+}
+/* === end #1064 ====================================================== */
+
+/* === #1062 Touch Gestures ============================================
+ * Visual affordances for touch-gestures.js. CSS variables only — no
+ * hardcoded colors. body owns vertical scroll natively (touch-action: pan-y);
+ * the bottom-nav opts out so we manage horizontal swipes on it.
+ * ==================================================================== */
+body { touch-action: pan-y; }
+[data-bottom-nav] { touch-action: none; }
+
+.row-swiping { transition: transform 180ms ease-out; }
+.row-action-overlay {
+  position: fixed;
+  z-index: 1500;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  background: var(--card-bg, #1a1a1a);
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  opacity: 0;
+  transform: translateX(40px);
+  transition: opacity 180ms ease-out, transform 180ms ease-out;
+  pointer-events: auto;
+}
+.row-action-overlay.row-action-overlay-open {
+  opacity: 1;
+  transform: translateX(0);
+}
+.row-action-overlay[hidden] { display: none; }
+.row-action-btn {
+  flex: 1 1 auto;
+  background: transparent;
+  border: none;
+  color: var(--text, #e7e7e7);
+  padding: 0 12px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  min-height: 48px;
+  border-right: 1px solid var(--border, #333);
+}
+.row-action-btn:last-child { border-right: none; }
+.row-action-btn:hover { background: var(--bg-hover, rgba(120, 160, 255, 0.12)); }
+.row-action-btn:active { background: var(--accent-bg, rgba(0, 122, 255, 0.18)); }
+
+@media (prefers-reduced-motion: reduce) {
+  .row-swiping,
+  .row-action-overlay { transition: none !important; }
+}
+/* === end #1062 ====================================================== */ (feat(#1062): green — implement gesture system)
+
+/* === Issue #1065 — Gesture discoverability hints =================== */
+.gesture-hint {
+  position: fixed;
+  z-index: 9999;
+  max-width: 360px;
+  /* !important guards against any layered cascade enabling pointer-events
+   * (e.g., a future overlay class with higher specificity). The hint
+   * wrapper MUST never capture clicks — only its inner button does. */
+  pointer-events: none !important;
+  opacity: 1;
+  animation-name: gesture-hint-slide-in;
+  animation-duration: 240ms;
+  animation-timing-function: ease-out;
+  animation-fill-mode: both;
+  transition: opacity 320ms ease-out;
+}
+.gesture-hint-bottom {
+  left: 50%;
+  bottom: 80px;
+  transform: translateX(-50%);
+}
+.gesture-hint-top {
+  left: 50%;
+  top: 16px;
+  transform: translateX(-50%);
+}
+.gesture-hint-top-left {
+  left: 16px;
+  top: 80px;
+}
+.gesture-hint-inner {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--surface-2, #1a1a1a);
+  color: var(--text, #e7e7e7);
+  border: 1px solid var(--border, #333);
+  border-radius: 999px;
+  padding: 8px 8px 8px 16px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  font-size: 13px;
+  line-height: 1.3;
+}
+.gesture-hint-text {
+  white-space: normal;
+}
+.gesture-hint-dismiss {
+  pointer-events: auto;
+  background: var(--accent, #4a9eff);
+  color: var(--accent-fg, #fff);
+  border: none;
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.gesture-hint-dismiss:hover { filter: brightness(1.1); }
+.gesture-hint-fading { opacity: 0; }
+
+@keyframes gesture-hint-slide-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(8px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+.gesture-hint-top-left { animation-name: gesture-hint-fade-in; }
+@keyframes gesture-hint-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gesture-hint {
+    animation-name: none !important;
+    animation-duration: 0s !important;
+  }
+}
+/* === end #1065 ====================================================== */

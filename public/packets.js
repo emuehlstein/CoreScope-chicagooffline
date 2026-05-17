@@ -128,20 +128,37 @@
   }
 
   // Track tables we've wired up so resize triggers re-apply.
-  const wired = new Set();
+  // Map<table, ResizeObserver|null> — we need the RO ref so SPA remounts can
+  // disconnect the orphaned observer when its <table> leaves the DOM.
+  // Pre-#1213 fix this was a Set and each /nodes (or /packets/observers)
+  // remount registered a fresh RO against a freshly-rendered table while the
+  // previous table+RO sat detached but observed → 1 leaked RO per remount.
+  const wired = new Map();
   // Track last-seen wrap width per table so we only treat ACTUAL container
   // resizes as a reason to drop the user's reveal state. Hiding/showing
   // columns and removing the pill mutate layout and re-trigger ResizeObserver,
   // which would otherwise immediately stomp on the reveal the user just asked for.
   const lastWrapW = new WeakMap();
+  // Sweep tables that have been detached from the DOM (e.g. SPA destroyed
+  // their page) and release their ResizeObserver. Called opportunistically on
+  // every register() — cheap O(n) over wired tables, n is tiny in practice.
+  function sweepDetached() {
+    wired.forEach((ro, t) => {
+      if (!t || !t.isConnected) {
+        if (ro) { try { ro.disconnect(); } catch (_) {} }
+        wired.delete(t);
+      }
+    });
+  }
   function register(table) {
+    sweepDetached();
     if (!table || wired.has(table)) { apply(table); return; }
-    wired.add(table);
+    let ro = null;
     if (typeof ResizeObserver !== 'undefined') {
       const wrap = table.closest('.table-fluid-wrap, .obs-table-scroll, .table-scroll-wrap') || table.parentElement;
       if (wrap) {
         lastWrapW.set(table, wrap.clientWidth || 0);
-        const ro = new ResizeObserver(() => {
+        ro = new ResizeObserver(() => {
           const prev = lastWrapW.get(table) || 0;
           const cur = wrap.clientWidth || 0;
           // Ignore self-induced layout reflows from apply()/clearHidden() —
@@ -155,6 +172,7 @@
         ro.observe(wrap);
       }
     }
+    wired.set(table, ro);
     apply(table);
   }
 
@@ -162,16 +180,279 @@
   window.addEventListener('resize', function () {
     clearTimeout(_winTimer);
     _winTimer = setTimeout(() => {
-      wired.forEach(t => {
-        if (!t.isConnected) { wired.delete(t); return; }
+      wired.forEach((ro, t) => {
+        if (!t.isConnected) {
+          if (ro) { try { ro.disconnect(); } catch (_) {} }
+          wired.delete(t);
+          return;
+        }
         t[REVEAL_FLAG] = false;
         apply(t);
       });
     }, 120);
   });
 
-  window.TableResponsive = { apply, register };
+  window.TableResponsive = { apply, register, sweep: sweepDetached };
 })();
+
+/* === #1056 AC#4: SlideOver — narrow-viewport row-detail overlay ============
+ * Singleton backdrop + right-anchored panel injected into <body>. Used by
+ * packets/nodes/observers when window.innerWidth <= SLIDE_OVER_BP (1023,
+ * matching the data-priority="3" breakpoint reused by TableResponsive).
+ *
+ *   SlideOver.shouldUse()   → boolean (current viewport <= breakpoint)
+ *   SlideOver.open(opts)    → returns the inner content element. opts:
+ *     { title?: string, onClose?: function, restoreFocus?: () => Element|null }
+ *     `restoreFocus` (optional) overrides the auto-captured
+ *     `document.activeElement` and is invoked at close time to look up the
+ *     element to focus. Use this when the caller re-renders the originating
+ *     row before/after opening (which would otherwise detach the focused
+ *     row from the DOM and leave nothing for auto-restore to find).
+ *   SlideOver.close()       → close + dispatch onClose
+ *   SlideOver.isOpen()      → boolean
+ *
+ * Close affordances: X button (.slide-over-close), backdrop click, Escape.
+ * Reuses `slideInRight` keyframe in style.css.
+ */
+(function () {
+  if (window.SlideOver) return;
+
+  // #1168 Munger #3: shared, ref-counted scroll-lock helper. Multiple
+  // modal surfaces (SlideOver, ChannelColorPicker, future modals) call
+  // acquire()/release() with their own token; the body keeps the
+  // `scroll-locked` class (CSS supplies overflow:hidden in style.css)
+  // for as long as the count > 0. Last release removes the class.
+  // This replaces the previous capture-and-restore-string approach
+  // which corrupted body.style.overflow under last-writer-wins races.
+  if (!window.__scrollLock) {
+    let count = 0;
+    let next = 1;
+    const live = new Set();
+    function acquire() {
+      const token = next++;
+      live.add(token);
+      count++;
+      if (count === 1) document.body.classList.add('scroll-locked');
+      return token;
+    }
+    function release(token) {
+      if (token == null || !live.has(token)) return;
+      live.delete(token);
+      count--;
+      if (count <= 0) {
+        count = 0;
+        document.body.classList.remove('scroll-locked');
+      }
+    }
+    window.__scrollLock = { acquire: acquire, release: release };
+  }
+
+  const BP = 1023;
+  let backdrop = null, panel = null, content = null, closeCb = null;
+  let prevFocus = null, prevFocusResolver = null;
+  // #1168 Munger #1: openSeq counter so a stale rAF from close() can
+  // detect a newer open() happened in between and skip its focus call.
+  let openSeq = 0;
+  // #1168 Munger #3: ref-counted scroll-lock token held by THIS surface
+  // (multiple SlideOver opens reuse the same token; only paired with a
+  // matching release on close).
+  let scrollLockToken = null;
+
+  function ensureNodes() {
+    if (panel && backdrop) return;
+    backdrop = document.createElement('div');
+    backdrop.className = 'slide-over-backdrop';
+    backdrop.hidden = true;
+    // Backdrop is decorative — assistive tech should not announce it.
+    backdrop.setAttribute('aria-hidden', 'true');
+    backdrop.addEventListener('click', function () { close(); });
+
+    panel = document.createElement('aside');
+    panel.className = 'slide-over-panel';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    // #1168 must-fix #4: a static aria-label="Detail" would override the
+    // meaningful <h3 id="slideOverTitle"> (e.g. "Packet ab12cd…", node name)
+    // for screen-reader users. Use aria-labelledby so the announced name
+    // is the actual title rendered into the panel.
+    panel.setAttribute('aria-labelledby', 'slideOverTitle');
+    panel.hidden = true;
+    panel.tabIndex = -1;
+    panel.innerHTML =
+      '<div class="slide-over-header">' +
+        '<h3 class="slide-over-title" id="slideOverTitle"></h3>' +
+        '<button type="button" class="slide-over-close" aria-label="Close detail (Esc)" title="Close">✕</button>' +
+      '</div>' +
+      '<div class="slide-over-content"></div>';
+    panel.querySelector('.slide-over-close').addEventListener('mousedown', function (e) {
+      // Prevent the X from stealing focus on pointer-press. Without this,
+      // Chromium focuses the button on mousedown → close() runs while X has
+      // focus → hiding the panel triggers an implicit blur to <body> that
+      // races with (and clobbers) our row-focus-restore. With this guard,
+      // the originating row keeps focus throughout the click → the post-
+      // close rAF restore runs unopposed.
+      e.preventDefault();
+    });
+    panel.querySelector('.slide-over-close').addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    });
+    // Focus trap: keep Tab cycling inside the panel while open.
+    panel.addEventListener('keydown', function (e) {
+      if (e.key !== 'Tab' || !isOpen()) return;
+      const focusables = panel.querySelectorAll(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      if (!focusables.length) return;
+      const first = focusables[0], last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey && (active === first || active === panel)) {
+        e.preventDefault();
+        try { last.focus(); } catch {}
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        try { first.focus(); } catch {}
+      }
+    });
+    document.body.appendChild(backdrop);
+    document.body.appendChild(panel);
+
+    // Single Escape handler shared across all uses.
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && isOpen()) {
+        e.stopPropagation();
+        close();
+      }
+    });
+
+    // #1168 Munger #2: hashchange cleanup. Without this, navigating from
+    // /#/packets to /#/nodes via location.hash leaves panel + backdrop +
+    // scroll-lock dangling across pages. Registered once with the other
+    // singleton listeners.
+    //
+    // Scope: only close on PAGE-route changes (first hash segment), not
+    // on within-page detail navigation. Observers (and others) write
+    // /#/observers/<id> when opening a row; that hashchange must NOT
+    // close the slide-over we just opened.
+    window.addEventListener('hashchange', function (e) {
+      if (!isOpen()) return;
+      function pageOf(hash) {
+        var m = String(hash || '').match(/^#?\/?([^\/?#]+)/);
+        return m ? m[1] : '';
+      }
+      var oldPage = pageOf(e && e.oldURL ? e.oldURL.split('#')[1] || '' : '');
+      var newPage = pageOf(e && e.newURL ? e.newURL.split('#')[1] || '' : location.hash);
+      if (oldPage !== newPage) close();
+    });
+  }
+
+  function shouldUse() {
+    return (window.innerWidth || document.documentElement.clientWidth) <= BP;
+  }
+
+  function isOpen() {
+    return !!(panel && !panel.hidden);
+  }
+
+  function open(opts) {
+    // If already open, properly close the prior caller first so its onClose
+    // (which clears `selectedKey`/hash state) fires before we replace it.
+    if (isOpen()) close();
+    ensureNodes();
+    opts = opts || {};
+    // #1168 Munger #1: bump open sequence so any pending rAF from a
+    // prior close() can detect that a newer open has happened and skip
+    // its stale focus-restore.
+    openSeq++;
+    closeCb = typeof opts.onClose === 'function' ? opts.onClose : null;
+    // If the caller passes restoreFocus(), it owns lookup at close-time —
+    // useful when the caller re-renders the row table (which would detach
+    // any auto-captured prevFocus DOM node).
+    prevFocusResolver = typeof opts.restoreFocus === 'function' ? opts.restoreFocus : null;
+    // Remember what was focused so we can restore on close.
+    prevFocus = (document.activeElement && document.activeElement !== document.body)
+      ? document.activeElement : null;
+    // #1168 Munger #3: ref-counted scroll-lock — class-based, not value-restore.
+    // Survives interleaved lockers (other modals can also acquire/release).
+    if (scrollLockToken == null) {
+      scrollLockToken = window.__scrollLock.acquire();
+    }
+    const title = panel.querySelector('.slide-over-title');
+    title.textContent = opts.title || 'Detail';
+    content = panel.querySelector('.slide-over-content');
+    content.innerHTML = '';
+    backdrop.hidden = false;
+    panel.hidden = false;
+    // Focus the close button so Esc/Enter works without an extra tab.
+    const x = panel.querySelector('.slide-over-close');
+    if (x) try { x.focus(); } catch {}
+    return content;
+  }
+
+  function close() {
+    if (!panel || panel.hidden) return;
+    panel.hidden = true;
+    if (backdrop) backdrop.hidden = true;
+    // #1168 Munger #3: release the ref-counted scroll-lock token.
+    if (scrollLockToken != null) {
+      window.__scrollLock.release(scrollLockToken);
+      scrollLockToken = null;
+    }
+    const cb = closeCb;
+    closeCb = null;
+    if (content) content.innerHTML = '';
+    // Restore focus to whatever opened us (typically the table row), so
+    // keyboard users don't get dumped at the top of the document.
+    let toFocus = prevFocus;
+    const resolver = prevFocusResolver;
+    prevFocus = null;
+    prevFocusResolver = null;
+    // #1168 Munger #1: capture the open-sequence at close-time. If a NEW
+    // open() happens before our deferred rAF fires, openSeq will have
+    // advanced past this value and the stale rAF must no-op (otherwise
+    // it would steal focus back to row A's originating row AFTER row B
+    // is open — clobbering B's focus).
+    const seqAtClose = openSeq;
+    if (cb) try { cb(); } catch {}
+    // Resolver runs AFTER cb (cb may re-render the table and reattach the row).
+    if (resolver) {
+      try {
+        const resolved = resolver();
+        if (resolved) toFocus = resolved;
+      } catch {}
+    }
+    if (toFocus && typeof toFocus.focus === 'function' && document.body.contains(toFocus)) {
+      // Defer to next microtask + rAF so the focus call lands AFTER any
+      // event-handler bookkeeping (e.g. an Escape keydown chain that would
+      // otherwise see focus snap back to <body> as the key event unwinds).
+      const target = toFocus;
+      const tryFocus = function () {
+        // Munger #1: bail if a newer open() has happened since close-time.
+        if (openSeq !== seqAtClose) return;
+        if (document.body.contains(target)) {
+          try { target.focus(); } catch {}
+        }
+      };
+      tryFocus();
+      requestAnimationFrame(tryFocus);
+    }
+  }
+
+  // If the viewport grows past the breakpoint while open, close the slide-over
+  // so callers can re-route into the wide-viewport side panel.
+  let _resizeT = null;
+  window.addEventListener('resize', function () {
+    if (!isOpen()) return;
+    clearTimeout(_resizeT);
+    _resizeT = setTimeout(function () {
+      if (isOpen() && !shouldUse()) close();
+    }, 120);
+  });
+
+  window.SlideOver = { open: open, close: close, isOpen: isOpen, shouldUse: shouldUse, BP: BP };
+})();
+
 
 (function () {
   let packets = [];
@@ -987,33 +1268,25 @@
       </div>
       <div class="filter-bar" id="pktFilters">
         <button class="btn filter-toggle-btn" id="filterToggleBtn">Filters ▾</button>
-        <button class="btn btn-clear-filters" id="clearFiltersBtn" title="Clear all filters" style="display:none;font-size:12px;padding:2px 8px;color:var(--text-muted);border:1px solid var(--border);border-radius:4px;background:transparent;cursor:pointer">✕ Clear</button>
-        <div class="filter-group">
+        <!-- #1124 (MAJOR-3) Group 1: Filter input + Clear -->
+        <div class="filter-group filter-group-clear">
+          <button class="btn btn-clear-filters" id="clearFiltersBtn" title="Clear all filters" style="display:none;font-size:12px;padding:2px 8px;color:var(--text-muted);border:1px solid var(--border);border-radius:4px;background:transparent;cursor:pointer">✕ Clear</button>
+        </div>
+        <!-- Group 2: Quick filters (hash, node name) -->
+        <div class="filter-group filter-group-quick">
           <input type="text" placeholder="Packet hash…" id="fHash" aria-label="Filter by packet hash" title="Filter packets by hex hash prefix">
           <div class="node-filter-wrap" style="position:relative">
             <input type="text" placeholder="Node name…" id="fNode" autocomplete="off" role="combobox" aria-expanded="false" aria-owns="fNodeDropdown" aria-activedescendant="" aria-autocomplete="list" title="Filter packets involving this node (sender or path)">
             <div class="node-filter-dropdown hidden" id="fNodeDropdown" role="listbox"></div>
           </div>
-          <div class="multi-select-wrap" id="observerFilterWrap">
-            <button class="multi-select-trigger" id="observerTrigger" title="Show only packets seen by selected observer stations">All Observers ▾</button>
-            <div class="multi-select-menu" id="observerMenu"></div>
-          </div>
-          <div id="packetsRegionFilter" class="region-filter-container" style="display:inline-block;vertical-align:middle"></div>
-          <div class="multi-select-wrap" id="typeFilterWrap">
-            <button class="multi-select-trigger" id="typeTrigger" title="Filter by packet type">All Types ▾</button>
-            <div class="multi-select-menu" id="typeMenu"></div>
-          </div>
-          <div class="filter-group" style="display:inline-flex;align-items:center;gap:4px">
-            <select id="fChannel" class="filter-select" aria-label="Filter by channel" title="Filter Channel Messages (GRP_TXT) by channel">
-              <option value="">All Channels</option>
-            </select>
-          </div>
         </div>
-        <div class="filter-group">
+        <!-- Group 3: Quick toggles (time range, Group by Hash, ★ My Nodes)
+             — #1128 Bug 5: placed BEFORE the Observer/Region/Type/Channel
+             dropdowns so the most-frequently-used controls sit next to
+             the search input where the eye lands first. -->
+        <div class="filter-group filter-group-toggles">
           <button class="btn ${groupByHash ? 'active' : ''}" id="fGroup" title="Collapse duplicate observations of the same packet into expandable groups">Group by Hash</button>
           <button class="btn" id="fMyNodes" title="Show only packets from your favorited/claimed nodes">★ My Nodes</button>
-        </div>
-        <div class="filter-group">
           <select id="fTimeWindow" class="filter-select" aria-label="Time window filter">
             <option value="15">Last 15 min</option>
             <option value="30">Last 30 min</option>
@@ -1025,7 +1298,23 @@
             ${isMobile ? '' : '<option value="0">All time</option>'}
           </select>
         </div>
-        <div class="filter-group">
+        <!-- Group 4: Dropdowns (observers, regions, types, channels) -->
+        <div class="filter-group filter-group-dropdowns">
+          <div class="multi-select-wrap" id="observerFilterWrap">
+            <button class="multi-select-trigger" id="observerTrigger" title="Show only packets seen by selected observer stations">All Observers ▾</button>
+            <div class="multi-select-menu" id="observerMenu"></div>
+          </div>
+          <div id="packetsRegionFilter" class="region-filter-container" style="display:inline-block;vertical-align:middle"></div>
+          <div class="multi-select-wrap" id="typeFilterWrap">
+            <button class="multi-select-trigger" id="typeTrigger" title="Filter by packet type">All Types ▾</button>
+            <div class="multi-select-menu" id="typeMenu"></div>
+          </div>
+          <select id="fChannel" class="filter-select" aria-label="Filter by channel" title="Filter Channel Messages (GRP_TXT) by channel">
+            <option value="">All Channels</option>
+          </select>
+        </div>
+        <!-- Group 5: Sort + Columns -->
+        <div class="filter-group filter-group-sort">
           <select id="fObsSort" aria-label="Observation sort order" title="Controls how observations are ordered within packet groups and which observation appears in the header row. Observer: Groups by observer station, earliest first. Path: Orders by hop count. Time: Orders by observation timestamp.">
             <option value="observer">Sort: Observer</option>
             <option value="path-asc">Sort: Path ↑ (shortest)</option>
@@ -1034,8 +1323,6 @@
             <option value="chrono-desc">Sort: Time ↓ (latest)</option>
           </select>
           <span class="sort-help" id="sortHelpIcon" tabindex="0" role="button" aria-label="Sort help">ⓘ</span>
-        </div>
-        <div class="filter-group">
           <div class="col-toggle-wrap">
             <button class="col-toggle-btn" id="colToggleBtn" title="Show/hide table columns">Columns ▾</button>
             <div class="col-toggle-menu" id="colToggleMenu"></div>
@@ -1117,6 +1404,8 @@
     if (window.FilterUX && typeof window.FilterUX.init === 'function') {
       window.FilterUX.init();
     }
+    // #1124 (MAJOR-1): wire the path overflow popover (delegated; idempotent).
+    _wirePathOverflowPopover();
 
     // --- Observer multi-select ---
     const obsMenu = document.getElementById('observerMenu');
@@ -1176,13 +1465,20 @@
     }
     function updateTypeTrigger() {
       const total = Object.keys(typeMap).length;
+      // #1128 (Bug 3): trigger has bounded max-width so long selections like
+      // "TRACE,MULTIPART,GRP_TXT" get ellipsised. Always set the full label
+      // as the `title` attribute so the user can recover it via tooltip.
+      const fullList = [...selectedTypes].map(k => typeMap[k] || k).join(', ');
       if (selectedTypes.size === 0 || selectedTypes.size === total) {
         typeTrigger.textContent = 'All Types ▾';
+        typeTrigger.title = 'Filter by packet type';
       } else if (selectedTypes.size === 1) {
         const k = [...selectedTypes][0];
         typeTrigger.textContent = (typeMap[k] || k) + ' ▾';
+        typeTrigger.title = 'Selected: ' + fullList;
       } else {
         typeTrigger.textContent = selectedTypes.size + ' Types ▾';
+        typeTrigger.title = 'Selected: ' + fullList;
       }
     }
     buildTypeMenu();
@@ -1847,6 +2143,13 @@
         }
       }
       if (window.__PERF_LOG_RENDER) console.log('[perf] renderVisibleRows: full rebuild %d entries, %.2fms', endIdx - startIdx, performance.now() - _rvr_t0);
+      _finalizePathOverflow(tbody);
+      // #1128 (Bug 1): hop-resolver mutates chip text from hex prefix to a
+      // longer node name AFTER the initial finalize pass — chips that fit at
+      // first measurement overflow once names resolve, but no `+N` pill gets
+      // appended. Cheapest correct fix: re-measure on a delayed pass, after
+      // clearing the per-host `overflowChecked` guard so the recheck runs.
+      _scheduleReFinalizePathOverflow(tbody);
       return;
     }
 
@@ -1880,6 +2183,150 @@
       bottomSpacer.insertAdjacentHTML('beforebegin', html);
     }
     if (window.__PERF_LOG_RENDER) console.log('[perf] renderVisibleRows: incremental head=%d tail=%d, %.2fms', headRowCount, tailRowCount, performance.now() - _rvr_t0);
+    _finalizePathOverflow(tbody);
+    _scheduleReFinalizePathOverflow(tbody);
+  }
+
+  // #1124 (MAJOR-1): when path chips overflow `.path-hops` (capped at 22px /
+  // overflow:hidden in CSS), append a `<span class="path-overflow-pill">+N</span>`
+  // showing how many hops are hidden. Click opens a popover listing all hops.
+  function _finalizePathOverflow(tbody) {
+    if (!tbody) return;
+    var hosts = tbody.querySelectorAll('.path-hops');
+    for (var i = 0; i < hosts.length; i++) {
+      var host = hosts[i];
+      // Skip if already finalized for this content
+      if (host.dataset.overflowChecked === '1') continue;
+      var children = Array.prototype.slice.call(host.children);
+      // Strip any leftover pill before measuring
+      var existingPill = host.querySelector('.path-overflow-pill');
+      if (existingPill) existingPill.remove();
+      var hostRight = host.getBoundingClientRect().right;
+      if (!hostRight) continue;
+      var hidden = 0;
+      // Walk pairs of chip + arrow; count chips (not arrows) whose right edge
+      // is past the host's right edge.
+      for (var j = 0; j < children.length; j++) {
+        var ch = children[j];
+        if (ch.classList.contains('arrow')) continue;
+        var r = ch.getBoundingClientRect();
+        if (r.left >= hostRight || r.right > hostRight + 0.5) hidden++;
+      }
+      if (hidden > 0) {
+        var pill = document.createElement('span');
+        pill.className = 'path-overflow-pill';
+        pill.textContent = '+' + hidden;
+        pill.title = hidden + ' more hop' + (hidden === 1 ? '' : 's') + ' — click to view';
+        pill.setAttribute('role', 'button');
+        pill.setAttribute('tabindex', '0');
+        pill.setAttribute('aria-label', hidden + ' more hops');
+        host.appendChild(pill);
+      }
+      host.dataset.overflowChecked = '1';
+    }
+  }
+
+  // #1128 (Bug 1): re-run overflow finalize after hop-resolver async pass has
+  // had a chance to mutate chip text. Per-tbody so concurrent renders in
+  // different tbodies don't cancel each other (#1131 BLOCKER-2). Uses a
+  // MutationObserver bonded to the tbody to detect when hop-resolver finishes
+  // mutating .path-hops chip text, then runs finalize once mutations settle
+  // for 50ms — replaces the previous 120ms blind timeout, which regressed on
+  // slow networks where the resolver took longer than 120ms (#1131 MAJOR-1).
+  function _scheduleReFinalizePathOverflow(tbody) {
+    if (!tbody) return;
+    // If a quiesce timer is already armed for this tbody, leave it; new
+    // mutations will keep extending it. If an observer is already wired,
+    // we're done — it'll fire again on the next mutation.
+    if (tbody._rePathOverflowObserver) return;
+    var quiesceTimer = null;
+    var stopTimer = null;
+    function finalize() {
+      if (tbody._rePathOverflowObserver) {
+        try { tbody._rePathOverflowObserver.disconnect(); } catch (_e) {}
+        tbody._rePathOverflowObserver = null;
+      }
+      if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
+      var hosts = tbody.querySelectorAll('.path-hops');
+      for (var i = 0; i < hosts.length; i++) hosts[i].dataset.overflowChecked = '';
+      _finalizePathOverflow(tbody);
+    }
+    if (typeof MutationObserver === 'function') {
+      var obs = new MutationObserver(function () {
+        if (quiesceTimer) clearTimeout(quiesceTimer);
+        quiesceTimer = setTimeout(finalize, 50);
+      });
+      obs.observe(tbody, { subtree: true, childList: true, characterData: true });
+      tbody._rePathOverflowObserver = obs;
+      // Hard upper bound — if hop-resolver never mutates (e.g. all chips
+      // already final), still run finalize once after a short delay so the
+      // overflow pill appears.
+      stopTimer = setTimeout(finalize, 1000);
+    } else {
+      // Fallback for environments without MutationObserver.
+      setTimeout(finalize, 120);
+    }
+  }
+
+  // Delegated click for path overflow pills — show popover of full path.
+  function _wirePathOverflowPopover() {
+    if (window.__pathOverflowWired) return;
+    window.__pathOverflowWired = true;
+    var existing = null;
+    function dismiss() {
+      if (existing) { existing.remove(); existing = null; }
+      document.removeEventListener('mousedown', onDoc, true);
+      document.removeEventListener('keydown', onKey, true);
+    }
+    function onDoc(ev) {
+      if (existing && !existing.contains(ev.target) && !ev.target.classList.contains('path-overflow-pill')) dismiss();
+    }
+    function onKey(ev) { if (ev.key === 'Escape') dismiss(); }
+    document.addEventListener('click', function(ev) {
+      var pill = ev.target.closest && ev.target.closest('.path-overflow-pill');
+      if (!pill) return;
+      ev.stopPropagation();
+      var host = pill.closest('.path-hops');
+      if (!host) return;
+      dismiss();
+      var pop = document.createElement('div');
+      pop.className = 'path-popover';
+      // Clone all children except the pill, preserving rendered chips/arrows.
+      var inner = '<div class="path-popover-title">Full path (' + (host.children.length) + ' items)</div><div>';
+      var kids = Array.prototype.slice.call(host.children);
+      for (var i = 0; i < kids.length; i++) {
+        if (kids[i].classList.contains('path-overflow-pill')) continue;
+        inner += kids[i].outerHTML;
+      }
+      inner += '</div>';
+      pop.innerHTML = inner;
+      document.body.appendChild(pop);
+      var r = pill.getBoundingClientRect();
+      // #1128 (Bug 2): position below by default, but flip ABOVE when there
+      // isn't enough room — keeps the popover anchored to the pill instead of
+      // hanging arbitrarily over adjacent rows / off-screen.
+      var pr0 = pop.getBoundingClientRect();
+      var popH = pr0.height;
+      var roomBelow = window.innerHeight - r.bottom;
+      var top;
+      if (roomBelow < popH + 12 && r.top > popH + 12) {
+        top = window.scrollY + r.top - popH - 4;
+      } else {
+        top = window.scrollY + r.bottom + 4;
+      }
+      var left = window.scrollX + r.left;
+      pop.style.top = top + 'px';
+      pop.style.left = left + 'px';
+      var pr = pop.getBoundingClientRect();
+      if (pr.right > window.innerWidth - 8) {
+        pop.style.left = Math.max(8, window.scrollX + window.innerWidth - pr.width - 8) + 'px';
+      }
+      existing = pop;
+      setTimeout(function() {
+        document.addEventListener('mousedown', onDoc, true);
+        document.addEventListener('keydown', onKey, true);
+      }, 0);
+    });
   }
 
   // Attach/detach scroll listener for virtual scrolling
@@ -2102,8 +2549,42 @@
     }
     renderTableRows();
     const isMobileNow = window.innerWidth <= 640;
+    // #1168 review note: this branch is intentionally narrower than nodes.js /
+    // observers.js. On packets, ≤640 falls through to the legacy mobile bottom
+    // sheet (`isMobileNow` short-circuits before SlideOver), and SlideOver is
+    // used only for the 641–1023 range. nodes.js and observers.js route into
+    // SlideOver across the full ≤1023 range. Both satisfy AC#4 ("not a
+    // separate page"); the per-page split is deliberate — the packets table
+    // has heavier per-row affordances (hex breakdown, observations grid)
+    // that the bottom sheet handles better at very narrow widths than a
+    // side-anchored slide-over. Do NOT "fix" the inconsistency without
+    // discussing with the issue author.
+    const useSlideOver = !isMobileNow && window.SlideOver && window.SlideOver.shouldUse();
     let panel;
-    if (isMobileNow) {
+    if (useSlideOver) {
+      // #1056 AC#4: narrow viewports (641–1023) — open detail in slide-over
+      // overlay rather than the side panel.
+      panel = window.SlideOver.open({
+        title: hash ? ('Packet ' + String(hash).slice(0, 12)) : 'Packet detail',
+        // After close, the rows are re-rendered (see onClose). Use a resolver
+        // to look up the originating row in the post-render DOM by data-hash
+        // / data-id, so keyboard focus restores to the actual table row.
+        restoreFocus: function () {
+          const lookup = hash || id;
+          if (!lookup) return null;
+          const esc = (window.CSS && CSS.escape) ? CSS.escape(String(lookup)) : String(lookup);
+          return document.querySelector('#pktTable tbody tr[data-hash="' + esc + '"]')
+              || document.querySelector('#pktTable tbody tr[data-id="' + esc + '"]');
+        },
+        onClose: function () {
+          selectedId = null;
+          selectedObservationId = null;
+          history.replaceState(null, '', '#/packets');
+          renderTableRows();
+        }
+      });
+      panel.innerHTML = '<div class="text-center text-muted" style="padding:40px">Loading…</div>';
+    } else if (isMobileNow) {
       // Use mobile bottom sheet
       let sheet = document.getElementById('mobileDetailSheet');
       if (!sheet) {
@@ -2140,11 +2621,11 @@
         const newHops = hops.filter(h => !(h in hopNameCache));
         if (newHops.length) await resolveHops(newHops);
       } catch {}
-      panel.innerHTML = isMobileNow ? '' : '<div class="panel-resize-handle" id="pktResizeHandle"></div>' + PANEL_CLOSE_HTML;
+      panel.innerHTML = isMobileNow ? '' : (useSlideOver ? '' : ('<div class="panel-resize-handle" id="pktResizeHandle"></div>' + PANEL_CLOSE_HTML));
       const content = document.createElement('div');
       panel.appendChild(content);
       await renderDetail(content, data, selectedObservationId);
-      if (!isMobileNow) initPanelResize();
+      if (!isMobileNow && !useSlideOver) initPanelResize();
     } catch (e) {
       panel.innerHTML = `<div class="text-muted">Error: ${e.message}</div>`;
     }

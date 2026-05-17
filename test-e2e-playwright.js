@@ -31,6 +31,20 @@ function assert(condition, msg) {
   if (!condition) throw new Error(msg || 'Assertion failed');
 }
 
+// Use this instead of page.goto(BASE + '#/packets') for any test that waits on packet rows.
+// A bare hash-change goto keeps the prior test's open detail pane in the DOM (hidden rows),
+// which causes waitForSelector('table tbody tr:not([id^=vscroll])') to time out in CI.
+// This helper always does a full reload so SPA state is clean before the test body runs.
+async function gotoPackets(page) {
+  await page.evaluate(() => {
+    localStorage.removeItem('meshcore-groupbyhash');
+    localStorage.setItem('meshcore-time-window', '525600');
+  });
+  await page.goto(`${BASE}/#/packets`, { waitUntil: 'domcontentloaded' });
+  await page.reload({ waitUntil: 'load' });
+  await page.waitForSelector('table tbody tr[data-hash]', { timeout: 15000 });
+}
+
 async function run() {
   console.log('Launching Chromium...');
   const browser = await chromium.launch({
@@ -54,6 +68,28 @@ async function run() {
     assert(title.toLowerCase().includes('corescope'), `Title "${title}" doesn't contain CoreScope`);
     const nav = await page.$('nav, .navbar, .nav, [class*="nav"]');
     assert(nav, 'Nav bar not found');
+  });
+
+  // #1137 follow-up: Aldrich webfont must actually load so the navbar logo SVG
+  // renders in the intended typeface (not the silent monospace fallback).
+  await test('#1137 Aldrich webfont is loaded for navbar logo SVG', async () => {
+    await page.goto(BASE, { waitUntil: 'domcontentloaded' });
+    // Explicitly request the font (waits for download). On the broken state
+    // there is no @font-face for Aldrich, so no FontFace matches and check()
+    // stays false — the assertion below fails on behavior, not infra.
+    const aldrichLoaded = await page.evaluate(async () => {
+      try { await document.fonts.load('1em Aldrich'); } catch (_) {}
+      await document.fonts.ready;
+      return document.fonts.check('1em Aldrich');
+    });
+    assert(aldrichLoaded, 'document.fonts.check("1em Aldrich") returned false — Aldrich is not loaded');
+    // Sanity: the inline SVG <text> still declares Aldrich in its font-family.
+    const fontFamily = await page.evaluate(() => {
+      const t = document.querySelector('nav svg text, .navbar svg text, header svg text');
+      return t ? (t.getAttribute('font-family') || getComputedStyle(t).fontFamily) : null;
+    });
+    assert(fontFamily && /aldrich/i.test(fontFamily),
+      `Navbar SVG <text> font-family should include Aldrich, got: ${fontFamily}`);
   });
 
   // Test 6: Theme customizer opens (reuses home page from test 1)
@@ -264,23 +300,33 @@ async function run() {
   await test('Nodes page has WebSocket auto-update', async () => {
     await page.goto(`${BASE}/#/nodes`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('[data-loaded="true"]', { timeout: 15000 });
-    // The live dot in navbar indicates WS connection status
-    const liveDot = await page.$('#liveDot');
-    assert(liveDot, 'Live dot WebSocket indicator (#liveDot) not found');
+    // #1173: #liveDot was replaced by the brand-logo packet-pulse animation.
+    // WS connectivity is now reflected by the .logo-disconnected class on the
+    // SVG (added on close, removed on open). Verify the Logo state machine and
+    // the WS infra exist; actual connection is best-effort.
+    const logoExists = await page.$('.brand-logo');
+    assert(logoExists, 'Brand logo (.brand-logo) not found — needed for WS state surface');
     // Verify WS infrastructure exists (onWS/offWS globals from app.js)
     const hasWsInfra = await page.evaluate(() => {
       return typeof onWS === 'function' && typeof offWS === 'function';
     });
     assert(hasWsInfra, 'WebSocket listener infrastructure (onWS/offWS) should be available');
-    // Best-effort: if WS connects within 5s, verify connected state. Don't fail otherwise —
-    // CI may not have a live MQTT feed. Infra-existence assertions above are the contract.
+    // Verify the Logo connection-state hook exists (#1173). The seam at
+    // window.__corescopeLogo.setConnected exposes the state-toggle for tests.
+    const hasLogoSeam = await page.evaluate(() => {
+      return !!(window.__corescopeLogo && typeof window.__corescopeLogo.setConnected === 'function');
+    });
+    assert(hasLogoSeam, 'Logo state seam (window.__corescopeLogo.setConnected) should be available');
+    // Best-effort: if WS connects within 5s, verify the .logo-disconnected
+    // class is absent. Don't fail otherwise — CI may not have a live MQTT
+    // feed. Infra-existence assertions above are the contract.
     try {
       await page.waitForFunction(() => {
-        const dot = document.getElementById('liveDot');
-        return dot && dot.classList.contains('connected');
+        const lg = document.querySelector('.brand-logo');
+        return lg && !lg.classList.contains('logo-disconnected');
       }, { timeout: 5000 });
     } catch (_) {
-      // WS may not connect against remote — liveDot existence is sufficient
+      // WS may not connect against remote — Logo seam existence is sufficient
     }
   });
 
@@ -918,6 +964,215 @@ async function run() {
     assert(wsConnected, 'WebSocket connection indicators should be present');
   });
 
+
+  // Issue #1207: Live Feed panel (bottom-left) must NOT render as orphan
+  // chrome (only header buttons ✕ + ◫) when there are no feed items yet.
+  // Either content (live-feed-item) renders, or an explicit empty-state
+  // placeholder with the "Waiting for packets…" copy fills the panel-content
+  // body. The bug is the panel showing its header chrome with an empty body
+  // on first paint / cold load.
+  await test('#1207 Live Feed panel never renders as empty chrome', async () => {
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveFeed', { timeout: 10000 });
+    // Force the empty state: clear any feed items that may have arrived,
+    // then verify the placeholder copy is rendered in the panel body.
+    const state = await page.evaluate(() => {
+      const feed = document.getElementById('liveFeed');
+      if (!feed) return { found: false };
+      const content = feed.querySelector('.panel-content');
+      if (!content) return { found: true, hasContent: false };
+      // Wipe item children to simulate first-paint / no-traffic state.
+      content.querySelectorAll('.live-feed-item').forEach((el) => el.remove());
+      const visibleText = (content.innerText || '').trim();
+      return {
+        found: true,
+        hasContent: true,
+        feedHidden: feed.classList.contains('hidden'),
+        visibleText,
+      };
+    });
+    assert(state.found, '#liveFeed should be present on Live page');
+    assert(state.hasContent, '#liveFeed must have a .panel-content body');
+    if (state.feedHidden) return; // user hid the feed → header chrome gone too
+    // Pin to the actual placeholder copy — a non-empty div with no recognisable
+    // text would still be orphan chrome.
+    assert(
+      /Waiting for packets/i.test(state.visibleText),
+      `#1207: Live Feed body must contain placeholder copy "Waiting for packets…". ` +
+        `Got: ${JSON.stringify(state.visibleText)}`,
+    );
+  });
+
+  // Issue #1207 (kent #2): the eviction loop in addFeedItem must use
+  // querySelectorAll('.live-feed-item').length, NOT feed.children.length —
+  // otherwise the placeholder div counts as a "child" and gets trimmed
+  // (or items are under-evicted) once the feed is full. Fill the feed with
+  // synthetic items, run the eviction guard, then strip items back to zero
+  // and assert the placeholder survives.
+  await test('#1207 eviction loop never trims the empty-state placeholder', async () => {
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveFeed .panel-content', { timeout: 10000 });
+    // Drive the REAL production addFeedItem (exposed as window._liveAddFeedItem)
+    // 30 times so the production eviction guard inside addFeedItem fires past
+    // the cap of 25. If production reverts to feed.children.length, the
+    // placeholder counts as a child and either under-evicts (26 items) or
+    // gets trimmed itself — both observable failures below.
+    const result = await page.evaluate(() => {
+      if (typeof window._liveAddFeedItem !== 'function') {
+        return { ok: false, reason: 'window._liveAddFeedItem not exposed (test seam missing)' };
+      }
+      const feed = document.querySelector('#liveFeed .panel-content');
+      if (!feed) return { ok: false, reason: 'no .panel-content' };
+      // Clean slate: remove any pre-existing items the page may have rendered.
+      feed.querySelectorAll('.live-feed-item').forEach((el) => el.remove());
+      // Re-add placeholder if a prior packet wiped it.
+      if (!feed.querySelector('.live-feed-empty')) {
+        const ph = document.createElement('div');
+        ph.className = 'live-feed-empty';
+        ph.setAttribute('aria-hidden', 'true');
+        ph.textContent = 'Waiting for packets…';
+        feed.appendChild(ph);
+      }
+      const placeholderBefore = !!feed.querySelector('.live-feed-empty');
+
+      // Fire 30 distinct packets through PRODUCTION addFeedItem.
+      // Unique hashes prevent dedup; minimal pkt shape mirrors what
+      // renderPacketTree passes through.
+      for (let i = 0; i < 30; i++) {
+        const hash = 'evict-test-' + i.toString(16).padStart(8, '0');
+        const pkt = {
+          hash,
+          _ts: Date.now() + i,
+          route_type: 0,
+          observation_count: 1,
+          decoded: { header: { payloadTypeName: 'TXT_MSG' }, payload: { text: 'evict-' + i }, path: { hops: [] } },
+        };
+        window._liveAddFeedItem('💬', 'TXT_MSG', { text: 'evict-' + i }, [], '#888', pkt);
+      }
+      const itemsAfterEvict = feed.querySelectorAll('.live-feed-item').length;
+      const placeholderAfterEvict = !!feed.querySelector('.live-feed-empty');
+      const childrenAfterEvict = feed.children.length;
+      return {
+        ok: true,
+        placeholderBefore,
+        itemsAfterEvict,
+        placeholderAfterEvict,
+        childrenAfterEvict,
+      };
+    });
+    assert(result.ok, `setup failed: ${result.reason || ''}`);
+    assert(result.placeholderBefore, 'placeholder must be present before firing packets');
+    // The production guard `while (feed.querySelectorAll('.live-feed-item').length > 25)`
+    // MUST cap items at exactly 25. A buggy `feed.children.length` form caps at 25
+    // total children (24 items + 1 placeholder) → itemsAfterEvict === 24 → fails here.
+    assert(
+      result.itemsAfterEvict === 25,
+      `eviction guard must cap at 25 .live-feed-item (got ${result.itemsAfterEvict}). ` +
+        `If 24: production is using feed.children.length (placeholder counted as child).`,
+    );
+    // And the placeholder must SURVIVE the eviction loop. A buggy form that
+    // does removeChild on the last child would yank the placeholder once it's
+    // appended last.
+    assert(
+      result.placeholderAfterEvict,
+      'eviction must NOT remove .live-feed-empty placeholder',
+    );
+    // Total children == 25 items + 1 placeholder.
+    assert(
+      result.childrenAfterEvict === 26,
+      `feed.children.length should be 26 (25 items + 1 placeholder), got ${result.childrenAfterEvict}`,
+    );
+  });
+
+  // Issue #1207 (kent #3): CSS rule
+  //   .live-feed .panel-content:has(.live-feed-item) .live-feed-empty { display: none }
+  // must hide the placeholder when at least one item is present. Inject an
+  // item and assert getComputedStyle(empty).display === 'none'.
+  await test('#1207 :has() rule hides placeholder when items present', async () => {
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveFeed .panel-content', { timeout: 10000 });
+    const result = await page.evaluate(() => {
+      const feed = document.querySelector('#liveFeed .panel-content');
+      if (!feed) return { ok: false, reason: 'no .panel-content' };
+      // Strip any pre-existing items to isolate the test.
+      feed.querySelectorAll('.live-feed-item').forEach((el) => el.remove());
+      // Ensure placeholder exists.
+      if (!feed.querySelector('.live-feed-empty')) {
+        const ph = document.createElement('div');
+        ph.className = 'live-feed-empty';
+        ph.textContent = 'Waiting for packets…';
+        feed.appendChild(ph);
+      }
+      const ph = feed.querySelector('.live-feed-empty');
+      const displayBefore = getComputedStyle(ph).display;
+      // Inject a real .live-feed-item child of .panel-content (sibling of ph).
+      const item = document.createElement('div');
+      item.className = 'live-feed-item';
+      item.textContent = 'injected';
+      feed.prepend(item);
+      const displayAfter = getComputedStyle(ph).display;
+      return { ok: true, displayBefore, displayAfter };
+    });
+    assert(result.ok, `setup failed: ${result.reason || ''}`);
+    assert(
+      result.displayBefore !== 'none',
+      `placeholder must be visible with no items (got display=${result.displayBefore})`,
+    );
+    assert(
+      result.displayAfter === 'none',
+      `:has(.live-feed-item) rule must hide placeholder (got display=${result.displayAfter})`,
+    );
+  });
+
+  // Issue #1207 (kent #4): rebuildFeedList() must re-add the empty-state
+  // placeholder when it was previously removed. Without this, a sequence of
+  // (live packets render → user navigates / state rebuilds → placeholder gone)
+  // leaves the panel as orphan chrome. Drive the REAL production
+  // rebuildFeedList (via window._liveRebuildFeedList) AFTER explicitly
+  // removing the placeholder; assert it comes back.
+  await test('#1207 rebuildFeedList re-adds placeholder when missing', async () => {
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveFeed .panel-content', { timeout: 10000 });
+    const result = await page.evaluate(() => {
+      if (typeof window._liveRebuildFeedList !== 'function') {
+        return { ok: false, reason: 'window._liveRebuildFeedList not exposed (test seam missing)' };
+      }
+      const feed = document.querySelector('#liveFeed .panel-content');
+      if (!feed) return { ok: false, reason: 'no .panel-content' };
+      // Simulate: ingest wiped the placeholder out (e.g. innerHTML replace,
+      // or a future code path that forgot to preserve it).
+      feed.querySelectorAll('.live-feed-empty').forEach((el) => el.remove());
+      feed.querySelectorAll('.live-feed-item').forEach((el) => el.remove());
+      const placeholderBefore = !!feed.querySelector('.live-feed-empty');
+      // Call production rebuild.
+      window._liveRebuildFeedList();
+      const placeholderAfter = feed.querySelector('.live-feed-empty');
+      return {
+        ok: true,
+        placeholderBefore,
+        placeholderPresent: !!placeholderAfter,
+        placeholderText: placeholderAfter ? (placeholderAfter.textContent || '').trim() : '',
+        ariaHidden: placeholderAfter ? placeholderAfter.getAttribute('aria-hidden') : null,
+      };
+    });
+    assert(result.ok, `setup failed: ${result.reason || ''}`);
+    assert(
+      result.placeholderBefore === false,
+      'precondition: placeholder must be removed before rebuildFeedList()',
+    );
+    assert(
+      result.placeholderPresent,
+      'rebuildFeedList MUST re-add .live-feed-empty placeholder when missing',
+    );
+    assert(
+      /Waiting for packets/i.test(result.placeholderText),
+      `re-added placeholder copy must match. Got: ${JSON.stringify(result.placeholderText)}`,
+    );
+    assert(
+      result.ariaHidden === 'true',
+      `re-added placeholder must have aria-hidden="true" (got ${JSON.stringify(result.ariaHidden)})`,
+    );
+  });
 
   // Test 11: Live page heat checkbox disabled by matrix/ghosts mode
   await test('Live heat disabled when ghosts mode active', async () => {
@@ -1940,14 +2195,7 @@ async function run() {
 
   // Test: Expanded group children have unique observation ids (#866)
   await test('Expanded group children update detail pane per-observation', async () => {
-    await page.goto(`${BASE}/#/packets`, { waitUntil: 'domcontentloaded' });
-    // Ensure grouped mode and wide time window
-    await page.evaluate(() => {
-      localStorage.setItem('meshcore-time-window', '525600');
-      localStorage.setItem('meshcore-groupbyhash', 'true');
-    });
-    await page.reload({ waitUntil: 'load' });
-    await page.waitForSelector('table tbody tr:not([id^=vscroll])', { timeout: 15000 });
+    await gotoPackets(page);
 
     // Find a group row with observation_count > 1 (has expand button)
     const expandBtn = await page.$('table tbody tr .expand-btn, table tbody tr [data-expand]');
@@ -2020,8 +2268,7 @@ async function run() {
 
   // Test: per-observation raw_hex — hex pane updates when switching observations (#881)
   await test('Packet detail hex pane updates per observation', async () => {
-    await page.goto(BASE + '#/packets', { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('table tbody tr:not([id^=vscroll])', { timeout: 15000 });
+    await gotoPackets(page);
     await page.waitForTimeout(500);
 
     // Try clicking packet rows to find one with multiple observations
@@ -2062,8 +2309,7 @@ async function run() {
   // Test: path pill (top) and byte breakdown (bottom) agree on hop count
   // Regression for visual mismatch where badge said "1 hop" but path text listed N names
   await test('Packet detail path pill and byte breakdown agree on hop count', async () => {
-    await page.goto(BASE + '#/packets', { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('table tbody tr:not([id^=vscroll])', { timeout: 15000 });
+    await gotoPackets(page);
     await page.waitForTimeout(500);
 
     // Click rows until we find one whose detail pane renders a multi-hop path
@@ -2143,8 +2389,7 @@ async function run() {
   // Regression #891: server-supplied breakdown was computed once from top-level
   // raw_hex, so per-observation rendering had off-by-N highlights vs the labels.
   await test('Packet detail hex strip Path range matches hop row count', async () => {
-    await page.goto(BASE + '#/packets', { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('table tbody tr:not([id^=vscroll])', { timeout: 15000 });
+    await gotoPackets(page);
     await page.waitForTimeout(500);
 
     const rows = await page.$$('table tbody tr[data-action]');
@@ -2192,8 +2437,7 @@ async function run() {
   // Regression: observations of the same packet hash have different raw_hex (#882),
   // so picking a different obs must recompute the byte ranges, not reuse the old ones.
   await test('Packet detail switches consistently across observations', async () => {
-    await page.goto(BASE + '#/packets?groupByHash=1', { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('table tbody tr:not([id^=vscroll])', { timeout: 15000 });
+    await gotoPackets(page);
     await page.waitForTimeout(500);
 
     let opened = false;
@@ -2298,18 +2542,32 @@ async function run() {
   });
 
   await test('Packets table rows have border-left stripe when toggle ON', async () => {
+    // Set toggle before gotoPackets so the SPA picks it up on the reload.
     await page.evaluate(() => localStorage.setItem('meshcore-color-packets-by-hash', 'true'));
-    // Hard reload to re-init page handler with the new toggle state.
-    // page.goto with same hash URL is a no-op for re-rendering.
-    await page.goto(BASE + '#/packets', { waitUntil: 'domcontentloaded' });
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('table tbody tr[data-hash]', { timeout: 15000 });
+    await gotoPackets(page);  // full reload from scratch; waits for visible rows
+    // Diagnostic: capture actual DOM/LS state before asserting.
+    const stripeDebug = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('table tbody tr[data-hash]')];
+      return {
+        rowCount: rows.length,
+        hashColorDefined: !!window.HashColor,
+        colorLS: localStorage.getItem('meshcore-color-packets-by-hash'),
+        timeWindowLS: localStorage.getItem('meshcore-time-window'),
+        sampleRows: rows.slice(0, 3).map(r => ({
+          dataHash: r.getAttribute('data-hash'),
+          styleAttr: r.getAttribute('style') || '',
+          borderLeftWidth: r.style.borderLeftWidth,
+        })),
+      };
+    });
+    console.log('  [stripe-debug]', JSON.stringify(stripeDebug));
     // Wait for hash stripe to be applied (inline style set during render).
-    // Assert specifically 4px (per spec §2.10) so we don't false-pass on the
-    // 3px channel-color highlight which is independent of this toggle.
+    // Use style.borderLeftWidth (parsed value) not getAttribute('style') — Chromium
+    // normalizes the raw attribute string (e.g. adds spaces) making string-match unreliable.
+    // Check ALL rows, not just the first, since a row with empty data-hash has no stripe.
     const hasStripe = await page.waitForFunction(() => {
-      const row = document.querySelector('table tbody tr[data-hash]');
-      return row && (row.getAttribute('style') || '').includes('border-left:4px');
+      const rows = document.querySelectorAll('table tbody tr[data-hash]');
+      return Array.from(rows).some(r => r.style.borderLeftWidth === '4px');
     }, { timeout: 5000 }).then(() => true).catch(() => false);
     assert(hasStripe, 'At least one <tr> should have hash-color border-left:4px stripe when toggle ON');
   });
@@ -2325,13 +2583,11 @@ async function run() {
     await page.waitForTimeout(500);
     const noStripe = await page.evaluate(() => {
       const rows = document.querySelectorAll('table tbody tr[data-hash]');
-      for (const r of rows) {
-        // Hash stripe is 4px (per spec §2.10). Channel-color highlight uses
-        // 3px and is independent of the hash-color toggle. Only assert no
-        // 4px hash stripe is present.
-        if ((r.getAttribute('style') || '').includes('border-left:4px')) return false;
-      }
-      return true;
+      // Hash stripe is 4px (per spec §2.10). Channel-color highlight uses
+      // 3px and is independent of the hash-color toggle. Only assert no
+      // 4px hash stripe is present. Use style.borderLeftWidth (parsed value)
+      // not getAttribute('style') — Chromium normalizes the attribute string.
+      return !Array.from(rows).some(r => r.style.borderLeftWidth === '4px');
     });
     assert(noStripe, 'No <tr> should have hash-color border-left:4px stripe when toggle OFF');
     // Reset
@@ -2630,6 +2886,164 @@ async function run() {
       }
     }
   }
+
+  // === Live page node filter (#1110) ===
+  // Bug: filter input was oversized, white background ignoring dark mode,
+  // no autocomplete dropdown, required Enter to apply, and Enter triggered
+  // a full page reload. Fix wires it to /api/nodes/search with a 200ms
+  // debounce, prevents form submission, and styles via CSS variables.
+
+  await test('#1110 Live node filter input matches toolbar styling (theme-aware bg)', async () => {
+    await page.goto(BASE + '#/live', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveNodeFilterInput', { timeout: 10000 });
+    // Force dark theme so we catch the "ignored dark mode" regression.
+    await page.evaluate(() => {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    });
+    const bg = await page.$eval('#liveNodeFilterInput', el => getComputedStyle(el).backgroundColor);
+    // Bright white (255,255,255) is the bug. Anything else (transparent,
+    // dark surface, or color-mix from CSS variables) is acceptable.
+    assert(bg !== 'rgb(255, 255, 255)' && bg !== '#ffffff' && bg !== 'white',
+      `Filter bg should not be hardcoded white in dark mode, got ${bg}`);
+    // And it should not be vastly larger than the toolbar's label row
+    // (the global a11y rule enforces 48px min-height on text inputs, so we
+    // allow some slop and just guard against the "way too big" regression).
+    const inputH = await page.$eval('#liveNodeFilterInput', el => el.getBoundingClientRect().height);
+    const labelH = await page.$eval('.live-toggles label', el => el.getBoundingClientRect().height);
+    assert(inputH > 0 && labelH > 0,
+      `expected non-zero heights (input=${inputH}, label=${labelH})`);
+    assert(inputH <= Math.max(labelH + 40, 56),
+      `Filter input height (${inputH}) should not be vastly larger than toolbar label (${labelH})`);
+  });
+
+  await test('#1110 Live node filter shows autocomplete dropdown on input', async () => {
+    await page.goto(BASE + '#/live', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveNodeFilterInput', { timeout: 10000 });
+    // Clear any persisted filter from prior runs.
+    await page.evaluate(() => { try { localStorage.removeItem('live-node-filter'); } catch (_) {} });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveNodeFilterInput', { timeout: 10000 });
+    const input = await page.$('#liveNodeFilterInput');
+    await input.click();
+    await input.type('te', { delay: 30 });
+    // Wait for dropdown of suggestions (the new feature).
+    await page.waitForSelector('#liveNodeFilterDropdown:not(.hidden) .live-node-filter-option', { timeout: 5000 });
+    const count = await page.$$eval('#liveNodeFilterDropdown .live-node-filter-option', els => els.length);
+    assert(count >= 1, `Expected at least 1 suggestion, got ${count}`);
+  });
+
+  await test('#1110 Live node filter applies on suggestion click without page reload', async () => {
+    await page.goto(BASE + '#/live', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveNodeFilterInput', { timeout: 10000 });
+    await page.evaluate(() => { try { localStorage.removeItem('live-node-filter'); } catch (_) {} });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveNodeFilterInput', { timeout: 10000 });
+    // Tag the window so we can detect a full page reload.
+    await page.evaluate(() => { window.__live1110Marker = 'still-here'; });
+    const urlBefore = page.url();
+    await page.fill('#liveNodeFilterInput', '');
+    await page.type('#liveNodeFilterInput', 'te', { delay: 30 });
+    await page.waitForSelector('#liveNodeFilterDropdown:not(.hidden) .live-node-filter-option', { timeout: 5000 });
+    await page.click('#liveNodeFilterDropdown .live-node-filter-option');
+    // Window marker must survive (no reload).
+    const marker = await page.evaluate(() => window.__live1110Marker);
+    assert(marker === 'still-here', 'Page should not have reloaded after selecting a suggestion');
+    // URL should not have navigated away from the live page.
+    const urlAfter = page.url();
+    assert(urlAfter.includes('#/live'), `URL should still target #/live, got ${urlAfter}`);
+    // Filter should be active.
+    const keys = await page.evaluate(() => (window._liveGetNodeFilterKeys ? window._liveGetNodeFilterKeys() : []));
+    assert(Array.isArray(keys) && keys.length >= 1, `Expected an active filter key after click, got ${JSON.stringify(keys)}`);
+  });
+
+  await test('#1110 Live node filter does not navigate or reload on Enter', async () => {
+    await page.goto(BASE + '#/live', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveNodeFilterInput', { timeout: 10000 });
+    await page.evaluate(() => { try { localStorage.removeItem('live-node-filter'); } catch (_) {} });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveNodeFilterInput', { timeout: 10000 });
+    await page.evaluate(() => { window.__live1110Marker2 = 'still-here'; });
+    const urlBefore = page.url();
+    await page.fill('#liveNodeFilterInput', 'te');
+    await page.focus('#liveNodeFilterInput');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(200);
+    const marker = await page.evaluate(() => window.__live1110Marker2);
+    assert(marker === 'still-here', 'Enter on filter input must not reload the page');
+    assert(page.url() === urlBefore || page.url().includes('#/live'),
+      `URL should not navigate away, got ${page.url()} (was ${urlBefore})`);
+  });
+
+  // Issue #1221: VCR LED clock must sit in-row with VCR playback controls
+  // (same flex container) and must be fully visible — not clipped — on a
+  // 375x800 mobile viewport. It must also be visibly smaller than desktop.
+  await test('#1221 VCR LED clock in-row with controls and unclipped on mobile', async () => {
+    await page.setViewportSize({ width: 375, height: 800 });
+    await page.goto(BASE + '/#/live', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#vcrBar', { timeout: 10000 });
+    await page.waitForSelector('#vcrLcdCanvas', { timeout: 10000 });
+    const m = await page.evaluate(() => {
+      const bar  = document.getElementById('vcrBar');
+      const lcd  = document.querySelector('.vcr-lcd');
+      const ctrl = document.querySelector('.vcr-controls');
+      const lcdR = lcd.getBoundingClientRect();
+      const ctrlR = ctrl.getBoundingClientRect();
+      return {
+        lcdInBar: bar.contains(lcd),
+        sharedParent: lcd.parentElement === ctrl.parentElement,
+        lcd:  { left: lcdR.left, right: lcdR.right, top: lcdR.top, bottom: lcdR.bottom, width: lcdR.width },
+        ctrl: { top: ctrlR.top, bottom: ctrlR.bottom },
+        vw: window.innerWidth, vh: window.innerHeight,
+      };
+    });
+    assert(m.lcdInBar, '#1221: LCD clock must live inside .vcr-bar');
+    assert(m.sharedParent, '#1221: LCD clock and .vcr-controls must share a parent (one flex row container)');
+    assert(m.lcd.left >= 0, `#1221: LCD clipped on left (left=${m.lcd.left})`);
+    assert(m.lcd.right <= m.vw, `#1221: LCD clipped on right (right=${m.lcd.right}, vw=${m.vw})`);
+    assert(m.lcd.top  >= 0, `#1221: LCD clipped on top (top=${m.lcd.top})`);
+    assert(m.lcd.bottom <= m.vh, `#1221: LCD clipped on bottom (bottom=${m.lcd.bottom}, vh=${m.vh})`);
+    // In-row check: LCD and controls must vertically overlap (same row in the flex layout).
+    const overlaps = !(m.lcd.bottom <= m.ctrl.top || m.lcd.top >= m.ctrl.bottom);
+    assert(overlaps, `#1221: LCD not in same row as controls (lcd y=[${m.lcd.top},${m.lcd.bottom}], ctrl y=[${m.ctrl.top},${m.ctrl.bottom}])`);
+    // Mobile scale: LCD must be smaller than desktop baseline (.vcr-lcd min-width is 110px on desktop).
+    assert(m.lcd.width < 100, `#1221: LCD should be scaled down on mobile (got ${m.lcd.width}px, expected <100)`);
+    await page.setViewportSize({ width: 1280, height: 800 });
+  });
+
+  // Issue #1220: On mobile (≤640px), the MESH LIVE panel must NOT render
+  // as ~200px of empty chrome. When the body+controls are collapsed it
+  // should be a compact strip (≤ 60px tall) sharing one row with the
+  // count badge + toggle buttons. When the body is expanded it must
+  // contain actual feed/stat content (header ≥ 100px). The bug state
+  // (panel 100–200px tall while both bodies are display:none) is what
+  // we forbid.
+  await test('#1220 Live header is not ~200px of empty chrome on mobile (collapsed = ≤60px)', async () => {
+    await page.setViewportSize({ width: 375, height: 800 });
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#liveHeader', { timeout: 10000 });
+    await page.waitForTimeout(600);
+    const m = await page.evaluate(() => {
+      const header = document.getElementById('liveHeader');
+      const body = document.getElementById('liveHeaderBody');
+      const ctrlsBody = document.getElementById('liveControlsBody');
+      const r = header.getBoundingClientRect();
+      const bodyVisible = body && getComputedStyle(body).display !== 'none';
+      const ctrlsVisible = ctrlsBody && getComputedStyle(ctrlsBody).display !== 'none';
+      return { height: r.height, bodyVisible, ctrlsVisible };
+    });
+    // Cleanup viewport for downstream tests.
+    await page.setViewportSize({ width: 1280, height: 720 });
+    const anyBodyOpen = m.bodyVisible || m.ctrlsVisible;
+    if (anyBodyOpen) {
+      // Expanded state: chrome is justified by visible content.
+      assert(m.height >= 60,
+        `#1220: when a panel body is expanded the header must show content (got ${m.height}px)`);
+    } else {
+      // Collapsed state: must NOT be the empty-chrome middle state.
+      assert(m.height <= 60,
+        `#1220: collapsed mobile header must be ≤60px (got ${m.height}px of empty chrome)`);
+    }
+  });
 
   await browser.close();
 

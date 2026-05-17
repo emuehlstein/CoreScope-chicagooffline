@@ -25,6 +25,38 @@ type DBStats struct {
 	ObserverUpserts        atomic.Int64
 	WriteErrors            atomic.Int64
 	SignatureDrops         atomic.Int64
+	// WALCommits tracks every successful tx.Commit() that may have flushed
+	// WAL pages.
+	WALCommits atomic.Int64
+	// BackfillUpdates tracks per-named-backfill row write counts so an
+	// infinite-loop backfill (cf #1119) is obvious from the perf page.
+	BackfillUpdates sync.Map // name (string) -> *atomic.Int64
+}
+
+// IncBackfill increments the backfill counter for the given name, allocating
+// the counter on first use.
+func (s *DBStats) IncBackfill(name string) {
+	v, ok := s.BackfillUpdates.Load(name)
+	if !ok {
+		nc := new(atomic.Int64)
+		actual, loaded := s.BackfillUpdates.LoadOrStore(name, nc)
+		if loaded {
+			v = actual
+		} else {
+			v = nc
+		}
+	}
+	v.(*atomic.Int64).Add(1)
+}
+
+// SnapshotBackfills returns a name->count copy of all backfill counters.
+func (s *DBStats) SnapshotBackfills() map[string]int64 {
+	out := make(map[string]int64)
+	s.BackfillUpdates.Range(func(k, v interface{}) bool {
+		out[k.(string)] = v.(*atomic.Int64).Load()
+		return true
+	})
+	return out
 }
 
 // Store wraps the SQLite database for packet ingestion.
@@ -151,12 +183,15 @@ func applySchema(db *sql.DB) error {
 			payload_type INTEGER,
 			payload_version INTEGER,
 			decoded_json TEXT,
+			from_pubkey TEXT,
 			created_at TEXT DEFAULT (datetime('now'))
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_transmissions_hash ON transmissions(hash);
 		CREATE INDEX IF NOT EXISTS idx_transmissions_first_seen ON transmissions(first_seen);
 		CREATE INDEX IF NOT EXISTS idx_transmissions_payload_type ON transmissions(payload_type);
+		-- idx_transmissions_from_pubkey is created by the from_pubkey_v1
+		-- migration after the column is added on legacy DBs (#1143).
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("base schema: %w", err)
@@ -218,11 +253,16 @@ func applySchema(db *sql.DB) error {
 	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'advert_count_unique_v1'")
 	if row.Scan(&migDone) != nil {
 		log.Println("[migration] Recalculating advert_count (unique transmissions only)...")
+		// Note: this migration is gated on a one-shot _migrations row, so it
+		// runs at most once per DB. The historical version used a LIKE-on-JSON
+		// substring match (#1143). Switching to from_pubkey here is safe even
+		// though the column may not yet be backfilled on legacy DBs: the
+		// migration is already marked done on those DBs and won't re-run.
 		db.Exec(`
 			UPDATE nodes SET advert_count = (
 				SELECT COUNT(*) FROM transmissions t
 				WHERE t.payload_type = 4
-				  AND t.decoded_json LIKE '%' || nodes.public_key || '%'
+				  AND t.from_pubkey = nodes.public_key
 			)
 		`)
 		db.Exec(`INSERT INTO _migrations (name) VALUES ('advert_count_unique_v1')`)
@@ -484,6 +524,24 @@ func applySchema(db *sql.DB) error {
 		log.Println("[migration] foreign_advert column added")
 	}
 
+	// Migration: from_pubkey column on transmissions (#1143).
+	// Replaces the unsound `decoded_json LIKE '%pubkey%'` attribution path with
+	// an exact-match indexed column. Synchronously adds the column + index;
+	// row-level backfill is run by the SERVER asynchronously
+	// (cmd/server/from_pubkey_migration.go) so we don't block ingestor boot.
+	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'from_pubkey_v1'")
+	if row.Scan(&migDone) != nil {
+		log.Println("[migration] Adding from_pubkey column + index to transmissions (#1143)...")
+		if _, err := db.Exec(`ALTER TABLE transmissions ADD COLUMN from_pubkey TEXT`); err != nil {
+			log.Printf("[migration] transmissions.from_pubkey: %v (may already exist)", err)
+		}
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_transmissions_from_pubkey ON transmissions(from_pubkey)`); err != nil {
+			log.Printf("[migration] idx_transmissions_from_pubkey: %v", err)
+		}
+		db.Exec(`INSERT INTO _migrations (name) VALUES ('from_pubkey_v1')`)
+		log.Println("[migration] from_pubkey column + index added")
+	}
+
 	return nil
 }
 
@@ -496,8 +554,8 @@ func (s *Store) prepareStatements() error {
 	}
 
 	s.stmtInsertTransmission, err = s.db.Prepare(`
-		INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, payload_version, decoded_json, channel_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, payload_version, decoded_json, channel_hash, from_pubkey)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -626,6 +684,7 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 			data.RawHex, hash, now,
 			data.RouteType, data.PayloadType, data.PayloadVersion,
 			data.DecodedJSON, nilIfEmpty(data.ChannelHash),
+			nilIfEmpty(data.FromPubkey),
 		)
 		if err != nil {
 			s.Stats.WriteErrors.Add(1)
@@ -669,6 +728,10 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 	} else {
 		s.Stats.ObservationsInserted.Add(1)
 	}
+
+	// Each prepared-stmt Exec auto-commits. Count one WAL commit per
+	// successful InsertTransmission so the perf page sees commit pressure.
+	s.Stats.WALCommits.Add(1)
 
 	return isNew, nil
 }
@@ -964,7 +1027,9 @@ func (s *Store) BackfillPathJSONAsync() {
 				FROM observations o
 				JOIN transmissions t ON o.transmission_id = t.id
 				WHERE o.raw_hex IS NOT NULL AND o.raw_hex != ''
-				AND (o.path_json IS NULL OR o.path_json = '' OR o.path_json = '[]')
+				-- NB: '[]' is the "already attempted, no hops" sentinel; excluded
+				-- to prevent the infinite re-UPDATE loop fixed in #1119.
+				AND (o.path_json IS NULL OR o.path_json = '')
 				AND t.payload_type != 9
 				LIMIT ?`, batchSize)
 			if err != nil {
@@ -992,6 +1057,8 @@ func (s *Store) BackfillPathJSONAsync() {
 				if err != nil || len(hops) == 0 {
 					if _, execErr := s.db.Exec(`UPDATE observations SET path_json = '[]' WHERE id = ?`, r.id); execErr != nil {
 						log.Printf("[backfill] write error (id=%d): %v", r.id, execErr)
+					} else {
+						s.Stats.IncBackfill("path_json")
 					}
 					continue
 				}
@@ -1000,6 +1067,7 @@ func (s *Store) BackfillPathJSONAsync() {
 					log.Printf("[backfill] write error (id=%d): %v", r.id, execErr)
 				} else {
 					updated++
+					s.Stats.IncBackfill("path_json")
 				}
 			}
 			batchNum++
@@ -1143,6 +1211,7 @@ type PacketData struct {
 	ChannelHash    string // grouping key for channel queries (#762)
 	Region         string // observer region: payload > topic > source config (#788)
 	Foreign        bool   // true when ADVERT GPS lies outside configured geofilter (#730)
+	FromPubkey     string // pubkey of the originating node, for exact-match attribution (#1143)
 }
 
 // nilIfEmpty returns nil for empty strings (for nullable DB columns).
@@ -1215,6 +1284,13 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 		} else if decoded.Payload.Type == "GRP_TXT" && decoded.Payload.ChannelHashHex != "" {
 			pd.ChannelHash = "enc_" + decoded.Payload.ChannelHashHex
 		}
+	}
+
+	// Populate from_pubkey at write time (#1143). ADVERTs carry the
+	// originating node's pubkey directly; other packet types stay NULL
+	// (downstream attribution queries handle NULL gracefully).
+	if decoded.Header.PayloadType == PayloadADVERT && decoded.Payload.PubKey != "" {
+		pd.FromPubkey = decoded.Payload.PubKey
 	}
 
 	return pd

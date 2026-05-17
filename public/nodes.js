@@ -556,7 +556,38 @@
           <tr><td>Hash Prefix</td><td>${n.hash_size ? '<code style="font-family:var(--mono);font-weight:700">' + n.public_key.slice(0, n.hash_size * 2).toUpperCase() + '</code> (' + n.hash_size + '-byte)' : 'Unknown'}${n.hash_size_inconsistent ? ' <span style="color:var(--status-yellow);cursor:help" title="Seen: ' + (Array.isArray(n.hash_sizes_seen) ? n.hash_sizes_seen : []).join(', ') + '-byte">⚠️ varies</span>' : ''}</td></tr>
         </table>
 
-        <div class="node-full-card skew-detail-section" id="node-clock-skew" style="display:none"></div>
+        <div class="node-full-card" id="node-packets">
+          ${(() => { const validPackets = adverts.filter(p => p.hash && p.timestamp); return `
+          <h4>Recent Packets (${validPackets.length})</h4>
+          <div class="node-activity-list">
+            ${validPackets.length ? validPackets.map(p => {
+              let decoded; try { decoded = JSON.parse(p.decoded_json); } catch {}
+              const typeLabel = p.payload_type === 4 ? '📡 Advert' : p.payload_type === 5 ? '💬 Channel' : p.payload_type === 2 ? '✉️ DM' : '📦 Packet';
+              const detail = decoded?.text ? ': ' + escapeHtml(truncate(decoded.text, 50)) : decoded?.name ? ' — ' + escapeHtml(decoded.name) : '';
+              const obs = p.observer_name || p.observer_id;
+              const snr = p.snr != null ? ` · SNR ${p.snr}dB` : '';
+              const rssi = p.rssi != null ? ` · RSSI ${p.rssi}dBm` : '';
+              const obsBadge = p.observation_count > 1 ? ` <span class="badge badge-obs" title="Seen ${p.observation_count} times">👁 ${p.observation_count}</span>` : '';
+              // Show hash size per advert if inconsistent
+              let hashSizeBadge = '';
+              if (n.hash_size_inconsistent && p.payload_type === 4 && p.raw_hex) {
+                const pb = parseInt(p.raw_hex.slice(2, 4), 16);
+                if ((pb & 0x3F) !== 0) {
+                  const hs = ((pb >> 6) & 0x3) + 1;
+                  const hsColor = hs >= 3 ? '#16a34a' : hs === 2 ? '#86efac' : '#f97316';
+                  const hsFg = hs === 2 ? '#064e3b' : '#fff';
+                  hashSizeBadge = ` <span class="badge" style="background:${hsColor};color:${hsFg};font-size:9px;font-family:var(--mono)">${hs}B</span>`;
+                }
+              }
+              return `<div class="node-activity-item">
+                <span class="node-activity-time">${renderNodeTimestampHtml(p.timestamp)}</span>
+                <span>${typeLabel}${detail}${hashSizeBadge}${obsBadge}${obs ? ' via ' + escapeHtml(obs) : ''}${snr}${rssi}</span>
+                <a href="#/packets/${p.hash}" class="ch-analyze-link" style="margin-left:8px;font-size:0.8em">Analyze →</a>
+              </div>`;
+            }).join('') : '<div class="text-muted">No recent packets</div>'}
+          </div>
+        `; })()}
+        </div>
 
         ${observers.length ? `<div class="node-full-card" id="node-observers">
           ${(() => { const regions = [...new Set(observers.map(o => o.iata).filter(Boolean))]; return regions.length ? `<div style="margin-bottom:8px"><strong>Regions:</strong> ${regions.map(r => '<span class="badge" style="margin:0 2px">' + escapeHtml(r) + '</span>').join(' ')}</div>` : ''; })()}
@@ -598,38 +629,7 @@
           <div id="fullPathsContent"><div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading paths…</div></div>
         </div>
 
-        <div class="node-full-card" id="node-packets">
-          ${(() => { const validPackets = adverts.filter(p => p.hash && p.timestamp); return `
-          <h4>Recent Packets (${validPackets.length})</h4>
-          <div class="node-activity-list">
-            ${validPackets.length ? validPackets.map(p => {
-              let decoded; try { decoded = JSON.parse(p.decoded_json); } catch {}
-              const typeLabel = p.payload_type === 4 ? '📡 Advert' : p.payload_type === 5 ? '💬 Channel' : p.payload_type === 2 ? '✉️ DM' : '📦 Packet';
-              const detail = decoded?.text ? ': ' + escapeHtml(truncate(decoded.text, 50)) : decoded?.name ? ' — ' + escapeHtml(decoded.name) : '';
-              const obs = p.observer_name || p.observer_id;
-              const snr = p.snr != null ? ` · SNR ${p.snr}dB` : '';
-              const rssi = p.rssi != null ? ` · RSSI ${p.rssi}dBm` : '';
-              const obsBadge = p.observation_count > 1 ? ` <span class="badge badge-obs" title="Seen ${p.observation_count} times">👁 ${p.observation_count}</span>` : '';
-              // Show hash size per advert if inconsistent
-              let hashSizeBadge = '';
-              if (n.hash_size_inconsistent && p.payload_type === 4 && p.raw_hex) {
-                const pb = parseInt(p.raw_hex.slice(2, 4), 16);
-                if ((pb & 0x3F) !== 0) {
-                  const hs = ((pb >> 6) & 0x3) + 1;
-                  const hsColor = hs >= 3 ? '#16a34a' : hs === 2 ? '#86efac' : '#f97316';
-                  const hsFg = hs === 2 ? '#064e3b' : '#fff';
-                  hashSizeBadge = ` <span class="badge" style="background:${hsColor};color:${hsFg};font-size:9px;font-family:var(--mono)">${hs}B</span>`;
-                }
-              }
-              return `<div class="node-activity-item">
-                <span class="node-activity-time">${renderNodeTimestampHtml(p.timestamp)}</span>
-                <span>${typeLabel}${detail}${hashSizeBadge}${obsBadge}${obs ? ' via ' + escapeHtml(obs) : ''}${snr}${rssi}</span>
-                <a href="#/packets/${p.hash}" class="ch-analyze-link" style="margin-left:8px;font-size:0.8em">Analyze →</a>
-              </div>`;
-            }).join('') : '<div class="text-muted">No recent packets</div>'}
-          </div>
-        `; })()}
-        </div>`;
+        <div class="node-full-card skew-detail-section" id="node-clock-skew" style="display:none"></div>`;
 
       // Map
       if (hasLoc) {
@@ -842,7 +842,40 @@
       });
 
     } catch (e) {
-      body.innerHTML = `<div class="text-muted" style="padding:40px">Failed to load node: ${e.message}</div>`;
+      // #1150: surface a real error state in BOTH the back-row title and the body
+      // when /api/nodes/{pubkey} returns 404 (or any failure). Otherwise the title
+      // stays "Loading…" forever and there's no link back to the Nodes list.
+      const msg = (e && e.message) || '';
+      const is404 = /\b404\b/.test(msg) || /not\s*found/i.test(msg);
+      const titleEl = document.querySelector('.node-full-title');
+      if (titleEl) {
+        titleEl.textContent = is404
+          ? 'Node not found — ' + (pubkey || '').slice(0, 12) + '…'
+          : 'Failed to load node';
+      }
+      const safePubkey = escapeHtml(pubkey || '');
+      const headline = is404 ? 'Node not found' : 'Failed to load node';
+      const detail = is404
+        ? 'No node matched the requested public key on this instance. It may exist on another deployment, or it may have been evicted/blacklisted here.'
+        : 'The node detail API call failed: ' + escapeHtml(msg);
+      body.innerHTML =
+        '<div class="node-full-card" style="padding:24px;margin:16px auto;max-width:560px;text-align:center">' +
+          '<div style="font-size:18px;font-weight:600;margin-bottom:8px">' + headline + '</div>' +
+          '<div class="mono" style="font-size:11px;color:var(--text-muted);word-break:break-all;margin-bottom:12px">' + safePubkey + '</div>' +
+          '<div style="color:var(--text-muted);margin-bottom:16px">' + detail + '</div>' +
+          '<div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">' +
+            '<a href="#/nodes" class="btn-primary" style="text-decoration:none;padding:6px 14px">← Back to Nodes</a>' +
+            '<button id="nodeRetryBtn" class="btn-primary" style="padding:6px 14px">Try again</button>' +
+          '</div>' +
+        '</div>';
+      const retryBtn = document.getElementById('nodeRetryBtn');
+      if (retryBtn) {
+        retryBtn.addEventListener('click', function () {
+          if (titleEl) titleEl.textContent = 'Loading…';
+          body.innerHTML = '<div class="text-center text-muted" style="padding:40px">Loading…</div>';
+          loadFullNode(pubkey);
+        });
+      }
     }
   }
 
@@ -1259,6 +1292,49 @@
       location.hash = '#/nodes/' + encodeURIComponent(pubkey);
       return;
     }
+    // #1056 AC#4: narrow desktop/tablet (641–1023) — open detail in slide-over.
+    if (window.SlideOver && window.SlideOver.shouldUse()) {
+      selectedKey = pubkey;
+      history.replaceState(null, '', '#/nodes/' + encodeURIComponent(pubkey));
+      renderRows();
+      const so = window.SlideOver.open({
+        title: 'Node detail',
+        // Resolver runs after onClose re-renders rows, so look the row up
+        // by data-key after the new tbody is in place.
+        restoreFocus: function () {
+          return document.querySelector('#nodesTable tbody tr[data-key="'
+            + (window.CSS && CSS.escape ? CSS.escape(pubkey) : pubkey)
+            + '"]');
+        },
+        onClose: function () {
+          selectedKey = null;
+          history.replaceState(null, '', '#/nodes');
+          renderRows();
+        }
+      });
+      so.innerHTML = '<div class="text-center text-muted" style="padding:40px">Loading…</div>';
+      try {
+        const data = await fetchNodeDetail(pubkey);
+        if (selectedKey !== pubkey) return;
+        const n = (data && data.node) || data || {};
+        const titleEl = document.querySelector('.slide-over-title');
+        if (titleEl) titleEl.textContent = n.advert_name || (n.public_key ? n.public_key.slice(0, 10) : 'Node');
+        var role = (n.role || '').toString();
+        var lastHeard = n.last_heard || n.last_seen;
+        so.innerHTML =
+          '<dl style="margin:0;display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-size:13px">' +
+            '<dt>Name</dt><dd>' + escapeHtml(n.advert_name || '—') + '</dd>' +
+            '<dt>Role</dt><dd>' + escapeHtml(role || '—') + '</dd>' +
+            '<dt>Public key</dt><dd class="mono" style="word-break:break-all">' + escapeHtml(n.public_key || '—') + '</dd>' +
+            '<dt>Last heard</dt><dd>' + (lastHeard ? timeAgo(lastHeard) : '—') + '</dd>' +
+            '<dt>Adverts</dt><dd>' + (n.advert_count != null ? n.advert_count : '—') + '</dd>' +
+          '</dl>' +
+          '<p style="margin-top:14px"><a class="btn-primary" href="#/nodes/' + encodeURIComponent(pubkey) + '">Open full detail →</a></p>';
+      } catch (e) {
+        so.innerHTML = '<div class="text-muted">Error: ' + (e && e.message ? e.message : String(e)) + '</div>';
+      }
+      return;
+    }
     selectedKey = pubkey;
     history.replaceState(null, '', '#/nodes/' + encodeURIComponent(pubkey));
     renderRows();
@@ -1326,29 +1402,6 @@
           </dl>
         </div>
 
-        <div class="node-detail-section skew-detail-section" id="node-clock-skew" style="display:none"></div>
-
-        ${observers.length ? `<div class="node-detail-section">
-          ${(() => { const regions = [...new Set(observers.map(o => o.iata).filter(Boolean))]; return regions.length ? `<div style="margin-bottom:6px;font-size:12px"><strong>Regions:</strong> ${regions.join(', ')}</div>` : ''; })()}
-          <h4>Heard By (${observers.length} observer${observers.length > 1 ? 's' : ''})</h4>
-          <div class="observer-list">
-            ${observers.map(o => `<div class="observer-row" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
-              <span style="font-weight:600">${escapeHtml(o.observer_name || o.observer_id)}${o.iata ? ' <span class="badge" style="font-size:10px">' + escapeHtml(o.iata) + '</span>' : ''}</span>
-              <span style="color:var(--text-muted)">${o.packetCount} pkts · ${o.avgSnr != null ? 'SNR ' + Number(o.avgSnr).toFixed(1) + 'dB' : ''}${o.avgRssi != null ? ' · RSSI ' + Number(o.avgRssi).toFixed(0) : ''}</span>
-            </div>`).join('')}
-          </div>
-        </div>` : ''}
-
-        <div class="node-detail-section" id="panelNeighborsSection">
-          <h4 id="panelNeighborsHeader">Neighbors</h4>
-          <div id="panelNeighborsContent"><div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading neighbors…</div></div>
-        </div>
-
-        <div class="node-detail-section" id="pathsSection">
-          <h4>Paths Through This Node</h4>
-          <div id="pathsContent"><div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading paths…</div></div>
-        </div>
-
         <div class="node-detail-section">
           ${(() => { const validPackets = adverts.filter(a => a.hash && a.timestamp); return `
           <h4>Recent Packets (${validPackets.length})</h4>
@@ -1374,6 +1427,34 @@
           </div>
           `; })()}
         </div>
+
+        ${observers.length ? `<div class="node-detail-section">
+          ${(() => { const regions = [...new Set(observers.map(o => o.iata).filter(Boolean))]; return regions.length ? `<div style="margin-bottom:6px;font-size:12px"><strong>Regions:</strong> ${regions.join(', ')}</div>` : ''; })()}
+          <h4>Heard By (${observers.length} observer${observers.length > 1 ? 's' : ''})</h4>
+          <div class="observer-list">
+            ${observers.map(o => {
+              const stats = [`${o.packetCount} pkts`];
+              if (o.avgSnr != null) stats.push('SNR ' + Number(o.avgSnr).toFixed(1) + 'dB');
+              if (o.avgRssi != null) stats.push('RSSI ' + Number(o.avgRssi).toFixed(0));
+              return `<div class="observer-row" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
+              <span style="font-weight:600">${escapeHtml(o.observer_name || o.observer_id)}${o.iata ? ' <span class="badge" style="font-size:10px">' + escapeHtml(o.iata) + '</span>' : ''}</span>
+              <span style="color:var(--text-muted)">${stats.join(' · ')}</span>
+            </div>`;
+            }).join('')}
+          </div>
+        </div>` : ''}
+
+        <div class="node-detail-section" id="panelNeighborsSection">
+          <h4 id="panelNeighborsHeader">Neighbors</h4>
+          <div id="panelNeighborsContent"><div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading neighbors…</div></div>
+        </div>
+
+        <div class="node-detail-section" id="pathsSection">
+          <h4>Paths Through This Node</h4>
+          <div id="pathsContent"><div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading paths…</div></div>
+        </div>
+
+        <div class="node-detail-section skew-detail-section" id="node-clock-skew" style="display:none"></div>
       </div>`;
 
     // Init map

@@ -170,10 +170,21 @@ func main() {
 	// Check auto_vacuum mode and optionally migrate (#919)
 	checkAutoVacuum(database, cfg, resolvedDB)
 
+	// Ensure indexes the server's SQL fallback path depends on
+	// (mirrors ingestor schema for DBs created by old server-only builds).
+	if err := ensureServerIndexes(resolvedDB); err != nil {
+		log.Printf("[db] warning: could not ensure server indexes: %v", err)
+	}
+
 	// In-memory packet store
 	store := NewPacketStore(database, cfg.PacketStore, cfg.CacheTTL)
 	if err := store.Load(); err != nil {
 		log.Fatalf("[store] failed to load: %v", err)
+	}
+	if store.hotStartupHours > 0 {
+		log.Printf("[store] starting background load: filling retentionHours=%gh from hotStartupHours=%gh",
+			store.retentionHours, store.hotStartupHours)
+		go store.loadBackgroundChunks()
 	}
 
 	// Initialize persisted neighbor graph
@@ -212,6 +223,13 @@ func main() {
 		log.Printf("[store] warning: could not add nodes.foreign_advert column: %v", err)
 	}
 
+	// Ensure transmissions.from_pubkey column + index exists (#1143). Backfill
+	// for legacy NULL rows runs async after HTTP starts so it can't block boot
+	// even on prod-sized DBs (100K+ transmissions).
+	if err := ensureFromPubkeyColumn(dbPath); err != nil {
+		log.Printf("[store] warning: could not add transmissions.from_pubkey column: %v", err)
+	}
+
 	// Soft-delete observers that are in the blacklist (mark inactive=1) so
 	// historical data from a prior unblocked window is hidden too.
 	if len(cfg.ObserverBlacklist) > 0 {
@@ -223,11 +241,11 @@ func main() {
 
 	// Load or build neighbor graph
 	if neighborEdgesTableExists(database.conn) {
-		store.graph = loadNeighborEdgesFromDB(database.conn)
+		store.graph.Store(loadNeighborEdgesFromDB(database.conn))
 		log.Printf("[neighbor] loaded persisted neighbor graph")
 	} else {
 		log.Printf("[neighbor] no persisted edges found, will build in background...")
-		store.graph = NewNeighborGraph() // empty graph — gets populated by background goroutine
+		store.graph.Store(NewNeighborGraph()) // empty graph — gets populated by background goroutine
 		initWg.Add(1)
 		go func() {
 			defer initWg.Done()
@@ -242,9 +260,7 @@ func main() {
 				log.Printf("[neighbor] persisted %d edges", edgeCount)
 			}
 			built := BuildFromStore(store)
-			store.mu.Lock()
-			store.graph = built
-			store.mu.Unlock()
+			store.graph.Store(built)
 			log.Printf("[neighbor] graph build complete")
 		}()
 	}
@@ -455,17 +471,13 @@ func main() {
 				}
 			}()
 			time.Sleep(4 * time.Minute) // stagger after metrics prune
-			store.mu.RLock()
-			g := store.graph
-			store.mu.RUnlock()
+			g := store.graph.Load()
 			PruneNeighborEdges(dbPath, g, maxAgeDays)
 			runIncrementalVacuum(resolvedDB, vacuumPages)
 			for {
 				select {
 				case <-edgePruneTicker.C:
-					store.mu.RLock()
-					g := store.graph
-					store.mu.RUnlock()
+					g := store.graph.Load()
 					PruneNeighborEdges(dbPath, g, maxAgeDays)
 					runIncrementalVacuum(resolvedDB, vacuumPages)
 				case <-edgePruneDone:
@@ -529,6 +541,11 @@ func main() {
 
 	// Start async backfill in background — HTTP is now available.
 	go backfillResolvedPathsAsync(store, dbPath, 5000, 100*time.Millisecond, cfg.BackfillHours())
+	// #1143: backfill from_pubkey for legacy ADVERT rows. Async so even
+	// 100K+ rows can't block boot; queries handle NULL gracefully.
+	// startFromPubkeyBackfill wraps the goroutine dispatch so the async
+	// contract is testable (see TestBackfillFromPubkey_DoesNotBlockBoot).
+	startFromPubkeyBackfill(dbPath, 5000, 100*time.Millisecond)
 
 	// Migrate old content hashes in background (one-time, idempotent).
 	go migrateContentHashesAsync(store, 5000, 100*time.Millisecond)

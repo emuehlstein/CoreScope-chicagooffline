@@ -53,6 +53,52 @@
 
   var THEME_COLOR_KEYS = Object.keys(THEME_CSS_MAP).filter(function (k) { return k !== 'font' && k !== 'mono'; });
 
+  // ── Brand logo swap helper (PR #1137) ──
+  // The default navbar brand logo is an inline <svg class="brand-logo"> so it
+  // inherits page CSS vars (--logo-text / --logo-accent / etc.). When an
+  // operator overrides branding.logoUrl in the customizer they expect a
+  // remote image — swap the inline <svg> for an <img>. Going back to the
+  // default URL or clearing the override swaps the <img> back to the inline
+  // <svg>. Layout dimensions (width=111 height=36) are preserved either way.
+  function _setBrandLogoUrl(url, alt) {
+    var node = document.querySelector('.nav-brand .brand-logo');
+    if (!node) return;
+    if (url) {
+      if (node.tagName.toLowerCase() === 'img') {
+        node.setAttribute('src', url);
+        if (alt != null) node.setAttribute('alt', alt);
+        return;
+      }
+      // swap inline <svg> → <img>
+      var img = document.createElement('img');
+      img.className = 'brand-logo';
+      img.setAttribute('src', url);
+      img.setAttribute('alt', alt || node.getAttribute('aria-label') || 'Brand');
+      img.setAttribute('width', '125');
+      img.setAttribute('height', '36');
+      node.parentNode.replaceChild(img, node);
+    } else {
+      if (node.tagName.toLowerCase() !== 'img') {
+        if (alt != null) node.setAttribute('aria-label', alt);
+        return;
+      }
+      // swap <img> → inline <svg> by clearing the src; here we just keep the
+      // <img> in place because we don't have the SVG markup at runtime
+      // (it lives in index.html). The next page reload restores the inline
+      // SVG. Setting src to the default URL is a graceful intermediate.
+      node.setAttribute('src', 'img/corescope-logo.svg');
+      if (alt != null) node.setAttribute('alt', alt);
+    }
+  }
+  function _setBrandAlt(alt) {
+    var node = document.querySelector('.nav-brand .brand-logo');
+    if (!node) return;
+    if (node.tagName.toLowerCase() === 'img') node.setAttribute('alt', alt);
+    else node.setAttribute('aria-label', alt);
+    var brandLink = document.querySelector('.nav-brand');
+    if (brandLink) brandLink.setAttribute('aria-label', alt + ' home');
+  }
+
   // ── Presets (copied from v1 customize.js) ──
   var PRESETS = {
     default: {
@@ -468,7 +514,7 @@
     return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
   }
 
-  function applyCSS(effectiveConfig) {
+  function applyCSS(effectiveConfig, userOverrides) {
     var dark = isDarkMode();
     var themeSection = dark
       ? Object.assign({}, effectiveConfig.theme || {}, effectiveConfig.themeDark || {})
@@ -482,6 +528,19 @@
         root.setProperty(THEME_CSS_MAP[key], themeSection[key]);
       }
     }
+
+    // Logo brand colors mirror --accent / --accent-hover ONLY when an
+    // operator has actually overridden them via the customizer. We check
+    // userOverrides (not the merged effective config), so the server-default
+    // accent (#4a9eff) does NOT clobber the sage/teal :root brand defaults
+    // out-of-the-box. When an operator picks a theme, customizer writes the
+    // override to localStorage, the override flows through here, and the
+    // wordmark recolors to follow the chosen accent.
+    var ovTheme = (userOverrides && (dark
+      ? Object.assign({}, userOverrides.theme || {}, userOverrides.themeDark || {})
+      : (userOverrides.theme || {}))) || {};
+    if (ovTheme.accent) root.setProperty('--logo-accent', ovTheme.accent);
+    if (ovTheme.accentHover) root.setProperty('--logo-accent-hi', ovTheme.accentHover);
 
     // Derived vars
     if (themeSection.background) root.setProperty('--content-bg', themeSection.contentBg || themeSection.background);
@@ -544,10 +603,12 @@
     if (br) {
       if (br.siteName) {
         document.title = br.siteName;
+        _setBrandAlt(br.siteName);
         var brandEl = document.querySelector('.brand-text');
         if (brandEl) brandEl.textContent = br.siteName;
       }
       if (br.logoUrl) {
+        _setBrandLogoUrl(br.logoUrl, br.siteName || null);
         var iconEl = document.querySelector('.brand-icon');
         if (iconEl) iconEl.innerHTML = '<img src="' + br.logoUrl + '" style="height:24px" onerror="this.style.display=\'none\'">';
       }
@@ -566,7 +627,7 @@
     var overrides = readOverrides();
     var effective = computeEffective(_serverDefaults || {}, overrides);
     window.SITE_CONFIG = effective;
-    applyCSS(effective);
+    applyCSS(effective, overrides);
   }
 
   // ── setOverride / clearOverride ──
@@ -1141,6 +1202,9 @@
           '<option value="km"' + (distUnit === 'km' ? ' selected' : '') + '>Kilometers (km)</option>' +
           '<option value="mi"' + (distUnit === 'mi' ? ' selected' : '') + '>Miles (mi)</option>' +
         '</select></div>' +
+      '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Gesture Hints</p>' +
+      '<p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Re-show first-visit gesture discoverability hints (swipe rows, swipe tabs, edge-swipe drawer, pull-to-refresh).</p>' +
+      '<button type="button" class="cust-dl-btn" data-cv2-reset-hints data-reset-gesture-hints>↺ Reset gesture hints</button>' +
     '</div>';
   }
 
@@ -1344,6 +1408,9 @@
           // Optimistic CSS update (Decision #12)
           var cssVar = THEME_CSS_MAP[key];
           if (cssVar) document.documentElement.style.setProperty(cssVar, inp.value);
+          // Mirror to logo brand vars so the wordmark recolors live too.
+          if (key === 'accent') document.documentElement.style.setProperty('--logo-accent', inp.value);
+          if (key === 'accentHover') document.documentElement.style.setProperty('--logo-accent-hi', inp.value);
           // Update hex display
           var hex = inp.parentElement.querySelector('.cust-hex');
           if (hex) hex.textContent = inp.value;
@@ -1360,11 +1427,13 @@
           setOverride(section, key, inp.value);
           // Live branding updates
           if (section === 'branding' && key === 'siteName') {
+            _setBrandAlt(inp.value);
             var el = document.querySelector('.brand-text');
             if (el) el.textContent = inp.value;
             document.title = inp.value;
           }
           if (section === 'branding' && key === 'logoUrl') {
+            _setBrandLogoUrl(inp.value || '', null);
             var iconEl = document.querySelector('.brand-icon');
             if (iconEl) {
               if (inp.value) iconEl.innerHTML = '<img src="' + inp.value + '" style="height:24px" onerror="this.style.display=\'none\'">';
@@ -1543,6 +1612,19 @@
       _runPipeline();
       _renderPanel(container);
     });
+
+    // Reset gesture hints (#1065)
+    var hintsBtn = container.querySelector('[data-cv2-reset-hints]');
+    if (hintsBtn) hintsBtn.addEventListener('click', function () {
+      if (window.GestureHints && typeof window.GestureHints.reset === 'function') {
+        window.GestureHints.reset();
+      } else {
+        // Fallback: clear known keys directly.
+        ['row-swipe', 'tab-swipe', 'edge-drawer', 'pull-refresh'].forEach(function (k) {
+          try { localStorage.removeItem('meshcore-gesture-hints-' + k); } catch (_e) {}
+        });
+      }
+    });
   }
 
   // ── Panel toggle ──
@@ -1606,6 +1688,13 @@
     for (var key in THEME_CSS_MAP) {
       if (themeSection[key]) root.setProperty(THEME_CSS_MAP[key], themeSection[key]);
     }
+    // Mirror accent → logo brand vars ONLY when present in overrides (so the
+    // server-default accent never clobbers the sage/teal :root brand defaults).
+    var ovTheme = dark
+      ? Object.assign({}, earlyOverrides.theme || {}, earlyOverrides.themeDark || {})
+      : (earlyOverrides.theme || {});
+    if (ovTheme.accent) root.setProperty('--logo-accent', ovTheme.accent);
+    if (ovTheme.accentHover) root.setProperty('--logo-accent-hi', ovTheme.accentHover);
     if (themeSection.background) root.setProperty('--content-bg', themeSection.contentBg || themeSection.background);
     if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface1);
     // Apply node/type colors from overrides early
@@ -1632,11 +1721,13 @@
     var overrides = readOverrides();
     if (overrides.branding) {
       if (overrides.branding.siteName) {
+        _setBrandAlt(overrides.branding.siteName);
         var brandEl = document.querySelector('.brand-text');
         if (brandEl) brandEl.textContent = overrides.branding.siteName;
         document.title = overrides.branding.siteName;
       }
       if (overrides.branding.logoUrl) {
+        _setBrandLogoUrl(overrides.branding.logoUrl, overrides.branding.siteName || null);
         var iconEl = document.querySelector('.brand-icon');
         if (iconEl) iconEl.innerHTML = '<img src="' + overrides.branding.logoUrl + '" style="height:24px" onerror="this.style.display=\'none\'">';
       }

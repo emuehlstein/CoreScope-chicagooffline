@@ -2520,12 +2520,18 @@
       if (isNaN(_wdLat) || isNaN(_wdLon)) return;
       var _wdSender = _wdPayload.sender || 'unknown';
 
-      function _wdCarIcon(color) {
+      function _wdGhostIcon(color) {
+        var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="28" viewBox="0 0 24 28">'
+          + '<path d="M12 1C7 1 3 5 3 10L3 23Q5 20.5 6.5 23Q8 20.5 9.5 23Q11 20.5 12 23Q13 20.5 14.5 23Q16 20.5 17.5 23Q19 20.5 21 23L21 10C21 5 17 1 12 1Z" '
+          + 'fill="' + color + '" fill-opacity="0.9" stroke="#fff" stroke-width="1"/>'
+          + '<circle cx="9" cy="9.5" r="2" fill="#fff"/><circle cx="15" cy="9.5" r="2" fill="#fff"/>'
+          + '<circle cx="9.7" cy="9.2" r="1" fill="#000"/><circle cx="15.7" cy="9.2" r="1" fill="#000"/>'
+          + '</svg>';
         return L.divIcon({
           className: '',
-          html: '<div style="font-size:20px;line-height:1;filter:drop-shadow(0 0 3px ' + color + ');" title="' + _wdSender + '">🚗</div>',
-          iconSize: [24, 24],
-          iconAnchor: [12, 12],
+          html: '<div style="filter:drop-shadow(0 0 4px ' + color + ');" title="' + _wdSender + '">' + svg + '</div>',
+          iconSize: [24, 28],
+          iconAnchor: [12, 24],
         });
       }
 
@@ -2533,9 +2539,9 @@
         clearTimeout(_wardriveCars[_wdSender].ageTimer);
         clearTimeout(_wardriveCars[_wdSender].expireTimer);
         _wardriveCars[_wdSender].marker.setLatLng([_wdLat, _wdLon]);
-        _wardriveCars[_wdSender].marker.setIcon(_wdCarIcon('#39FF14'));
+        _wardriveCars[_wdSender].marker.setIcon(_wdGhostIcon('#39FF14'));
       } else {
-        var _wdMarker = L.marker([_wdLat, _wdLon], { icon: _wdCarIcon('#39FF14'), zIndexOffset: 500 })
+        var _wdMarker = L.marker([_wdLat, _wdLon], { icon: _wdGhostIcon('#39FF14'), zIndexOffset: 500 })
           .bindTooltip(_wdSender, { permanent: false, direction: 'top' })
           .addTo(wardrivingLayer);
         _wardriveCars[_wdSender] = { marker: _wdMarker };
@@ -2543,7 +2549,7 @@
 
       // After 60s → orange
       _wardriveCars[_wdSender].ageTimer = setTimeout(function() {
-        if (_wardriveCars[_wdSender]) _wardriveCars[_wdSender].marker.setIcon(_wdCarIcon('#FFB300'));
+        if (_wardriveCars[_wdSender]) _wardriveCars[_wdSender].marker.setIcon(_wdGhostIcon('#FFB300'));
       }, 60000);
 
       // After 5min → remove

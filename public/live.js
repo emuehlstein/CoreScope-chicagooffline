@@ -2509,8 +2509,11 @@
 
     // --- Wardriving car markers — parse @[MapperBot] pings from #wardriving channel ---
     (function () {
-      var _wdPayload = (first.decoded || {}).payload || {};
-      if (!_wdPayload.channel || _wdPayload.channel.toLowerCase() !== '#wardriving') return;
+      var _wdDecoded = first.decoded || {};
+      // DB-loaded packets nest fields under .payload; WS packets have them directly on .decoded
+      var _wdPayload = _wdDecoded.payload || _wdDecoded;
+      var _wdChan = _wdPayload.channel || '';
+      if (!_wdChan || _wdChan.toLowerCase() !== '#wardriving') return;
       var _wdMatch = (_wdPayload.text || '').match(/@\[MapperBot\]\s*([\-\d.]+),\s*([\-\d.]+)/);
       if (!_wdMatch) return;
       var _wdLat = parseFloat(_wdMatch[1]), _wdLon = parseFloat(_wdMatch[2]);

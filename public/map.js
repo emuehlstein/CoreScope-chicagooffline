@@ -20,6 +20,17 @@
   let userHasMoved = false;
   let controlsCollapsed = false;
 
+  // ── Wardriving Layer state ──
+  let wardrivingLayer = null;
+  let wardrivingTrailLayer = null;
+  let wardrivingWsHandler = null;
+  const wardriverMarkers = new Map();  // sender → L.marker
+  const wardriverState = new Map();    // sender → { lat, lon, lastUpdate, trail: [{lat,lon,ts}], trailLine }
+  const WARDRIVER_REGEX = /@\[MapperBot\]\s*([\d.-]+),\s*([\d.-]+)/;
+  const WARDRIVER_STALE_MS = 5 * 60 * 1000; // 5 min
+  let wardrivingAgeTimer = null;
+  let wardrivingEnabled = localStorage.getItem('meshcore-map-wardriving') === 'true';
+
   // Safe escape — falls back to identity if app.js hasn't loaded yet
   const safeEsc = (typeof esc === 'function') ? esc : function (s) { return s; };
 
@@ -126,6 +137,7 @@
             <label for="mcHeatmap"><input type="checkbox" id="mcHeatmap"> Heat map</label>
             <label for="mcHashLabels"><input type="checkbox" id="mcHashLabels"> Hash prefix labels</label>
             <label id="mcGeoFilterLabel" for="mcGeoFilter" style="display:none"><input type="checkbox" id="mcGeoFilter"> Mesh live area</label>
+            <label for="mcWardriving"><input type="checkbox" id="mcWardriving"> 👻 Wardrivers</label>
           </fieldset>
           <fieldset class="mc-section">
             <legend class="mc-label">Status</legend>
@@ -372,6 +384,9 @@
         } catch {}
       }
     });
+
+    // Init wardriving overlay
+    initWardriving();
   }
 
   function drawPacketRoute(hopKeys, origin) {
@@ -1122,6 +1137,185 @@
   }
   // ─── End Affinity Debug ────────────────────────────────────────────────────
 
+  // ─── Wardriving Overlay ────────────────────────────────────────────────────
+
+  function makeGhostSvg(isActive) {
+    var color = isActive ? '#39FF14' : '#FF8F00';
+    return 'data:image/svg+xml;utf8,' + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="32" viewBox="0 0 28 32">'
+      + '<path d="M14 2 C8 2 3 7 3 13 L3 26 Q5.5 23 7 26 Q9 23 11 26 Q13 23 14 26 Q15 23 17 26 Q19 23 21 26 Q22.5 23 25 26 L25 13 C25 7 20 2 14 2Z" '
+      + 'fill="' + color + '" fill-opacity="0.85" stroke="#fff" stroke-width="1.5"/>'
+      + '<circle cx="10" cy="12" r="2.5" fill="#fff"/>'
+      + '<circle cx="18" cy="12" r="2.5" fill="#fff"/>'
+      + '<circle cx="10.8" cy="11.6" r="1.2" fill="#000"/>'
+      + '<circle cx="18.8" cy="11.6" r="1.2" fill="#000"/>'
+      + '</svg>'
+    );
+  }
+
+  function makeGhostIcon(isActive) {
+    return L.icon({
+      iconUrl: makeGhostSvg(isActive),
+      iconSize: [28, 32],
+      iconAnchor: [14, 28],
+      popupAnchor: [0, -28]
+    });
+  }
+
+  function handleWardrivingPacket(pkt) {
+    var decoded;
+    var dj = pkt.decoded_json || pkt.decoded;
+    if (typeof dj === 'string') {
+      try { decoded = JSON.parse(dj); } catch (e) { return; }
+    } else {
+      decoded = dj || {};
+    }
+    // Also handle WS messages where data wraps the packet
+    if (!decoded.channel && pkt.data) {
+      dj = pkt.data.decoded_json || pkt.data.decoded;
+      if (typeof dj === 'string') {
+        try { decoded = JSON.parse(dj); } catch (e) { return; }
+      } else {
+        decoded = dj || {};
+      }
+    }
+
+    if (!decoded.channel || decoded.channel.toLowerCase() !== '#wardriving') return;
+    var text = decoded.text || '';
+    var match = text.match(WARDRIVER_REGEX);
+    if (!match) return;
+
+    var lat = parseFloat(match[1]);
+    var lon = parseFloat(match[2]);
+    if (isNaN(lat) || isNaN(lon)) return;
+
+    var sender = decoded.sender || 'Unknown';
+    var now = Date.now();
+
+    if (!wardriverState.has(sender)) {
+      wardriverState.set(sender, { lat: lat, lon: lon, lastUpdate: now, trail: [], trailLine: null });
+    }
+    var state = wardriverState.get(sender);
+    state.lat = lat;
+    state.lon = lon;
+    state.lastUpdate = now;
+    state.trail.push({ lat: lat, lon: lon, ts: now });
+    if (state.trail.length > 200) state.trail.splice(0, state.trail.length - 200);
+
+    if (wardriverMarkers.has(sender)) {
+      var marker = wardriverMarkers.get(sender);
+      marker.setLatLng([lat, lon]);
+      marker.setIcon(makeGhostIcon(true));
+      marker.setPopupContent(buildWardriverPopup(sender, lat, lon, state.trail.length));
+    } else {
+      var newMarker = L.marker([lat, lon], { icon: makeGhostIcon(true) })
+        .bindPopup(buildWardriverPopup(sender, lat, lon, state.trail.length));
+      wardriverMarkers.set(sender, newMarker);
+      if (wardrivingLayer) wardrivingLayer.addLayer(newMarker);
+    }
+
+    updateWardriverTrail(sender, state);
+  }
+
+  function buildWardriverPopup(sender, lat, lon, pointCount) {
+    return '<div style="font-family:Inter,sans-serif;">'
+      + '<h3 style="margin:0 0 6px;color:#39FF14;font-size:14px;">👻 ' + safeEsc(sender) + '</h3>'
+      + '<p style="margin:2px 0;"><b>Channel:</b> #wardriving</p>'
+      + '<p style="margin:2px 0;"><b>Position:</b> ' + lat.toFixed(5) + ', ' + lon.toFixed(5) + '</p>'
+      + '<p style="margin:2px 0;"><b>Trail points:</b> ' + pointCount + '</p>'
+      + '</div>';
+  }
+
+  function updateWardriverTrail(sender, state) {
+    if (state.trail.length < 2) return;
+    var latlngs = state.trail.map(function (p) { return [p.lat, p.lon]; });
+    if (state.trailLine) {
+      state.trailLine.setLatLngs(latlngs);
+    } else {
+      state.trailLine = L.polyline(latlngs, {
+        color: '#39FF14',
+        weight: 2.5,
+        opacity: 0.5,
+        dashArray: '4 6'
+      });
+      if (wardrivingTrailLayer) wardrivingTrailLayer.addLayer(state.trailLine);
+    }
+  }
+
+  function ageWardrivers() {
+    var now = Date.now();
+    wardriverState.forEach(function (state, sender) {
+      var marker = wardriverMarkers.get(sender);
+      if (!marker) return;
+      var isActive = (now - state.lastUpdate) < WARDRIVER_STALE_MS;
+      marker.setIcon(makeGhostIcon(isActive));
+    });
+  }
+
+  function loadHistoricalWardriving() {
+    fetch('/api/packets?limit=500&payload_type=6')
+      .then(function (res) { return res.ok ? res.json() : Promise.reject(res.status); })
+      .then(function (data) {
+        var pkts = data.packets || [];
+        pkts.forEach(function (p) { handleWardrivingPacket(p); });
+        var count = wardriverMarkers.size;
+        if (count > 0) console.log('[map] ' + count + ' wardrivers plotted from history');
+      })
+      .catch(function (err) {
+        console.warn('[map] Historical wardriving load failed:', err);
+      });
+  }
+
+  function initWardriving() {
+    wardrivingLayer = L.layerGroup();
+    wardrivingTrailLayer = L.layerGroup();
+
+    var wdEl = document.getElementById('mcWardriving');
+    if (wardrivingEnabled) {
+      wdEl.checked = true;
+      wardrivingLayer.addTo(map);
+      wardrivingTrailLayer.addTo(map);
+    }
+
+    wdEl.addEventListener('change', function (e) {
+      wardrivingEnabled = e.target.checked;
+      localStorage.setItem('meshcore-map-wardriving', e.target.checked);
+      if (e.target.checked) {
+        wardrivingLayer.addTo(map);
+        wardrivingTrailLayer.addTo(map);
+      } else {
+        map.removeLayer(wardrivingLayer);
+        map.removeLayer(wardrivingTrailLayer);
+      }
+    });
+
+    // Load historical wardriving data then subscribe to live feed
+    loadHistoricalWardriving();
+
+    // Subscribe to live WS packets for wardriving
+    wardrivingWsHandler = onWS(function (msg) {
+      if (msg.type === 'packet') {
+        handleWardrivingPacket(msg);
+      }
+    });
+
+    // Age out stale wardrivers every 30s
+    wardrivingAgeTimer = setInterval(ageWardrivers, 30000);
+  }
+
+  function destroyWardriving() {
+    if (wardrivingWsHandler) { offWS(wardrivingWsHandler); wardrivingWsHandler = null; }
+    if (wardrivingAgeTimer) { clearInterval(wardrivingAgeTimer); wardrivingAgeTimer = null; }
+    if (wardrivingLayer && map) { try { map.removeLayer(wardrivingLayer); } catch (e) {} }
+    if (wardrivingTrailLayer && map) { try { map.removeLayer(wardrivingTrailLayer); } catch (e) {} }
+    wardrivingLayer = null;
+    wardrivingTrailLayer = null;
+    wardriverMarkers.clear();
+    wardriverState.clear();
+  }
+
+  // ─── End Wardriving Overlay ────────────────────────────────────────────────
+
   registerPage('map', {
     init: function(app, routeParam) {
       _themeRefreshHandler = () => { if (markerLayer) renderMarkers(); };
@@ -1130,6 +1324,7 @@
     },
     destroy: function() {
       if (_themeRefreshHandler) { window.removeEventListener('theme-refresh', _themeRefreshHandler); _themeRefreshHandler = null; }
+      destroyWardriving();
       return destroy();
     }
   });

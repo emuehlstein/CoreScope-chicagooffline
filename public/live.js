@@ -2535,16 +2535,18 @@
         });
       }
 
-      // Use packet timestamp to compute real age (not processing time)
+      // Compute age relative to VCR reference time (replay-safe)
       var _wdPktTs = first._ts || (first.timestamp ? new Date(first.timestamp).getTime() : 0) || Date.now();
-      var _wdAge = Date.now() - _wdPktTs;
+      var _wdNow = VCR.frozenNow || Date.now();
+      var _wdAge = _wdNow - _wdPktTs;
       var _wdExpireMs = 300000; // 5 min
       var _wdAgeMs = 60000;     // 60s until orange
 
-      // Already expired — skip entirely
-      if (_wdAge >= _wdExpireMs) return;
+      // In LIVE mode, skip truly old packets; in replay, show everything
+      if (VCR.mode === 'LIVE' && _wdAge >= _wdExpireMs) return;
 
-      // Pick initial color based on real age
+      // Pick initial color based on age (clamp negative ages to fresh)
+      if (_wdAge < 0) _wdAge = 0;
       var _wdColor = _wdAge >= _wdAgeMs ? '#FFB300' : '#39FF14';
 
       if (_wardriveCars[_wdSender]) {
@@ -2559,22 +2561,25 @@
         _wardriveCars[_wdSender] = { marker: _wdMarker };
       }
 
-      // Orange after 60s (only if not already stale)
-      var _wdAgeRemaining = _wdAgeMs - _wdAge;
-      if (_wdAgeRemaining > 0) {
-        _wardriveCars[_wdSender].ageTimer = setTimeout(function() {
-          if (_wardriveCars[_wdSender]) _wardriveCars[_wdSender].marker.setIcon(_wdGhostIcon('#FFB300'));
-        }, _wdAgeRemaining);
-      }
-
-      // Remove after 5min
-      var _wdExpireRemaining = _wdExpireMs - _wdAge;
-      _wardriveCars[_wdSender].expireTimer = setTimeout(function() {
-        if (_wardriveCars[_wdSender]) {
-          if (wardrivingLayer) wardrivingLayer.removeLayer(_wardriveCars[_wdSender].marker);
-          delete _wardriveCars[_wdSender];
+      // Timers only apply in LIVE mode — during replay, markers persist until cleared
+      if (VCR.mode === 'LIVE') {
+        // Orange after 60s (only if not already stale)
+        var _wdAgeRemaining = _wdAgeMs - _wdAge;
+        if (_wdAgeRemaining > 0) {
+          _wardriveCars[_wdSender].ageTimer = setTimeout(function() {
+            if (_wardriveCars[_wdSender]) _wardriveCars[_wdSender].marker.setIcon(_wdGhostIcon('#FFB300'));
+          }, _wdAgeRemaining);
         }
-      }, 300000);
+
+        // Remove after 5min
+        var _wdExpireRemaining = Math.max(0, _wdExpireMs - _wdAge);
+        _wardriveCars[_wdSender].expireTimer = setTimeout(function() {
+          if (_wardriveCars[_wdSender]) {
+            if (wardrivingLayer) wardrivingLayer.removeLayer(_wardriveCars[_wdSender].marker);
+            delete _wardriveCars[_wdSender];
+          }
+        }, _wdExpireRemaining);
+      }
     })();
 
     // --- Build consolidated packet for feed + audio ---

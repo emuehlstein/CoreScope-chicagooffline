@@ -2535,24 +2535,40 @@
         });
       }
 
+      // Use packet timestamp to compute real age (not processing time)
+      var _wdPktTs = first._ts || (first.timestamp ? new Date(first.timestamp).getTime() : 0) || Date.now();
+      var _wdAge = Date.now() - _wdPktTs;
+      var _wdExpireMs = 300000; // 5 min
+      var _wdAgeMs = 60000;     // 60s until orange
+
+      // Already expired — skip entirely
+      if (_wdAge >= _wdExpireMs) return;
+
+      // Pick initial color based on real age
+      var _wdColor = _wdAge >= _wdAgeMs ? '#FFB300' : '#39FF14';
+
       if (_wardriveCars[_wdSender]) {
         clearTimeout(_wardriveCars[_wdSender].ageTimer);
         clearTimeout(_wardriveCars[_wdSender].expireTimer);
         _wardriveCars[_wdSender].marker.setLatLng([_wdLat, _wdLon]);
-        _wardriveCars[_wdSender].marker.setIcon(_wdGhostIcon('#39FF14'));
+        _wardriveCars[_wdSender].marker.setIcon(_wdGhostIcon(_wdColor));
       } else {
-        var _wdMarker = L.marker([_wdLat, _wdLon], { icon: _wdGhostIcon('#39FF14'), zIndexOffset: 500 })
+        var _wdMarker = L.marker([_wdLat, _wdLon], { icon: _wdGhostIcon(_wdColor), zIndexOffset: 500 })
           .bindTooltip(_wdSender, { permanent: false, direction: 'top' })
           .addTo(wardrivingLayer);
         _wardriveCars[_wdSender] = { marker: _wdMarker };
       }
 
-      // After 60s → orange
-      _wardriveCars[_wdSender].ageTimer = setTimeout(function() {
-        if (_wardriveCars[_wdSender]) _wardriveCars[_wdSender].marker.setIcon(_wdGhostIcon('#FFB300'));
-      }, 60000);
+      // Orange after 60s (only if not already stale)
+      var _wdAgeRemaining = _wdAgeMs - _wdAge;
+      if (_wdAgeRemaining > 0) {
+        _wardriveCars[_wdSender].ageTimer = setTimeout(function() {
+          if (_wardriveCars[_wdSender]) _wardriveCars[_wdSender].marker.setIcon(_wdGhostIcon('#FFB300'));
+        }, _wdAgeRemaining);
+      }
 
-      // After 5min → remove
+      // Remove after 5min
+      var _wdExpireRemaining = _wdExpireMs - _wdAge;
       _wardriveCars[_wdSender].expireTimer = setTimeout(function() {
         if (_wardriveCars[_wdSender]) {
           if (wardrivingLayer) wardrivingLayer.removeLayer(_wardriveCars[_wdSender].marker);

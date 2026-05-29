@@ -149,6 +149,7 @@ function makeLiveSandbox({ withAppJs = false } = {}) {
   addLiveGlobals(ctx);
 
   loadInCtx(ctx, 'public/roles.js');
+  loadInCtx(ctx, 'public/packet-helpers.js');
   if (withAppJs) loadInCtx(ctx, 'public/app.js');
   try { loadInCtx(ctx, 'public/live.js'); } catch (e) {
     console.error('live.js load error:', e.message);
@@ -190,7 +191,7 @@ console.log('\n=== live.js: dbPacketToLive ===');
     const pkt = { id: 1, hash: 'x', decoded_json: null, path_json: null, timestamp: '2024-01-01T00:00:00Z' };
     const result = dbPacketToLive(pkt);
     assert.strictEqual(result.decoded.header.payloadTypeName, 'UNKNOWN');
-    assert.deepStrictEqual(result.decoded.path.hops, []);
+    assert.strictEqual(result.decoded.path.hops.length, 0);
   });
 
   test('uses payload_type_name as fallback', () => {
@@ -402,9 +403,13 @@ console.log('\n=== live.js: VCR state machine ===');
     assert.strictEqual(VCR().mode, 'PAUSED', 'mode should stay PAUSED after second call');
   });
 
-  test('vcrSpeedCycle cycles through 1,2,4,8', () => {
+  test('vcrSpeedCycle cycles through 0.25, 0.5, 1, 2, 4, 8 and wraps', () => {
     vcrSetMode('LIVE');
-    VCR().speed = 1;
+    VCR().speed = 0.25;
+    vcrSpeedCycle();
+    assert.strictEqual(VCR().speed, 0.5);
+    vcrSpeedCycle();
+    assert.strictEqual(VCR().speed, 1);
     vcrSpeedCycle();
     assert.strictEqual(VCR().speed, 2);
     vcrSpeedCycle();
@@ -412,7 +417,26 @@ console.log('\n=== live.js: VCR state machine ===');
     vcrSpeedCycle();
     assert.strictEqual(VCR().speed, 8);
     vcrSpeedCycle();
-    assert.strictEqual(VCR().speed, 1); // wraps around
+    assert.strictEqual(VCR().speed, 0.25); // wraps around
+  });
+
+  test('vcrSpeedCycle saves speed to localStorage', () => {
+    VCR().speed = 1;
+    vcrSpeedCycle();
+    assert.strictEqual(ctx.localStorage.getItem('live-vcr-speed'), '2');
+    vcrSpeedCycle();
+    assert.strictEqual(ctx.localStorage.getItem('live-vcr-speed'), '4');
+  });
+
+  const speedLabel = ctx.window._liveSpeedLabel;
+  assert.ok(speedLabel, '_liveSpeedLabel must be exposed');
+
+  test('speedLabel returns fraction strings for sub-1x speeds', () => {
+    assert.strictEqual(speedLabel(0.25), '¼x');
+    assert.strictEqual(speedLabel(0.5), '½x');
+    assert.strictEqual(speedLabel(1), '1x');
+    assert.strictEqual(speedLabel(2), '2x');
+    assert.strictEqual(speedLabel(8), '8x');
   });
 
   const vcrResumeLive = ctx.window._liveVcrResumeLive;
@@ -925,6 +949,130 @@ console.log('\n=== live.js: source-level safety checks ===');
   test('node detail recent packets include transport badge', () => {
     assert.ok(src.includes('transportBadge(p.route_type)'),
       'node detail recent packets should call transportBadge(p.route_type)');
+  });
+}
+
+// ===== Node filter (M3 — #771) =====
+console.log('\n=== live.js: node filter ===');
+{
+  const ctx = makeLiveSandbox();
+  const pktInvolvesFilter = ctx.window._livePacketInvolvesFilterNode;
+  assert.ok(pktInvolvesFilter, '_livePacketInvolvesFilterNode must be exposed');
+
+  const makePkt = (hops) => ({ decoded: { path: { hops }, payload: {} } });
+
+  test('packetInvolvesFilterNode returns true when filter is empty', () => {
+    assert.strictEqual(pktInvolvesFilter(makePkt(['abcd1234']), []), true);
+  });
+
+  test('packetInvolvesFilterNode matches hop by prefix', () => {
+    assert.strictEqual(pktInvolvesFilter(makePkt(['abcd1234', 'ef012345']), ['abcd1234567890ab']), true);
+  });
+
+  test('packetInvolvesFilterNode matches full key against short hop', () => {
+    assert.strictEqual(pktInvolvesFilter(makePkt(['abcd']), ['abcd1234567890ab']), true);
+  });
+
+  test('packetInvolvesFilterNode returns false when no hop matches', () => {
+    assert.strictEqual(pktInvolvesFilter(makePkt(['ffff1234', '00001111']), ['abcd1234567890ab']), false);
+  });
+
+  test('packetInvolvesFilterNode matches any of multiple filter keys (OR logic)', () => {
+    assert.strictEqual(pktInvolvesFilter(makePkt(['ffff0000']), ['abcd1234', 'ffff0000']), true);
+  });
+
+  test('packetInvolvesFilterNode returns false for packet with no hops', () => {
+    assert.strictEqual(pktInvolvesFilter(makePkt([]), ['abcd1234']), false);
+  });
+
+  const getNodeFilterKeys = ctx.window._liveGetNodeFilterKeys;
+  assert.ok(getNodeFilterKeys, '_liveGetNodeFilterKeys must be exposed');
+
+  test('node filter defaults to empty array when localStorage is unset', () => {
+    assert.strictEqual(getNodeFilterKeys().length, 0);
+  });
+
+  test('node filter saves to localStorage when set', () => {
+    const setFilter = ctx.window._liveSetNodeFilter;
+    assert.ok(setFilter, '_liveSetNodeFilter must be exposed');
+    setFilter(['abcd1234', 'ef012345']);
+    assert.strictEqual(ctx.localStorage.getItem('live-node-filter'), 'abcd1234,ef012345');
+    setFilter([]);
+    assert.strictEqual(ctx.localStorage.getItem('live-node-filter'), '');
+  });
+}
+
+// ===== Clickable paths (M2 — #771) =====
+console.log('\n=== live.js: clickable paths ===');
+{
+  const ctx = makeLiveSandbox();
+  const buildPopupHtml = ctx.window._liveBuildClickablePathPopupHtml;
+  assert.ok(buildPopupHtml, '_liveBuildClickablePathPopupHtml must be exposed');
+
+  test('buildClickablePathPopupHtml includes type badge with color', () => {
+    const html = buildPopupHtml('GRP_TXT', '#22c55e', ['NodeA', 'Rpt1', 'NodeB'], Date.now() - 5000);
+    assert.ok(html.includes('GRP_TXT'), 'should include type name');
+    assert.ok(html.includes('#22c55e'), 'should include type color');
+  });
+
+  test('buildClickablePathPopupHtml includes hop chain', () => {
+    const html = buildPopupHtml('ADVERT', '#6b7280', ['Alpha', 'Beta', 'Gamma'], Date.now() - 3000);
+    assert.ok(html.includes('Alpha'), 'should include first hop');
+    assert.ok(html.includes('Beta'), 'should include middle hop');
+    assert.ok(html.includes('Gamma'), 'should include last hop');
+  });
+
+  test('buildClickablePathPopupHtml includes packet link', () => {
+    const html = buildPopupHtml('GRP_TXT', '#22c55e', ['A', 'B'], Date.now() - 1000, 'abc123def');
+    assert.ok(html.includes('abc123def'), 'should include packet hash link');
+  });
+
+  test('buildClickablePathPopupHtml shows relative time', () => {
+    const html = buildPopupHtml('GRP_TXT', '#22c55e', ['A', 'B'], Date.now() - 10000);
+    assert.ok(html.includes('10s ago'), 'should show 10s ago');
+  });
+
+  const pruneClickablePaths = ctx.window._livePruneClickablePaths;
+  const clickablePaths = ctx.window._liveClickablePaths;
+  assert.ok(pruneClickablePaths, '_livePruneClickablePaths must be exposed');
+  assert.ok(Array.isArray(clickablePaths), '_liveClickablePaths must be exposed');
+
+  function loadPaths(entries) {
+    clickablePaths.splice(0, clickablePaths.length, ...entries);
+  }
+
+  test('pruneClickablePaths removes entries older than TTL', () => {
+    const now = Date.now();
+    loadPaths([
+      { addedAt: now - 35000, poly: { remove() {} } },
+      { addedAt: now - 5000,  poly: { remove() {} } },
+      { addedAt: now - 1000,  poly: { remove() {} } },
+    ]);
+    pruneClickablePaths(now);
+    assert.strictEqual(clickablePaths.length, 2, 'should remove paths older than 30s');
+  });
+
+  test('pruneClickablePaths keeps all entries within TTL', () => {
+    const now = Date.now();
+    loadPaths([
+      { addedAt: now - 5000,  poly: { remove() {} } },
+      { addedAt: now - 1000,  poly: { remove() {} } },
+    ]);
+    pruneClickablePaths(now);
+    assert.strictEqual(clickablePaths.length, 2);
+  });
+
+  test('pruneClickablePaths enforces max 50 entries (FIFO eviction)', () => {
+    const now = Date.now();
+    // Match production insertion order: oldest at front (index 0), newest at back
+    // entries[0].addedAt = now-5100 (oldest), entries[51].addedAt = now (newest)
+    const entries = [];
+    for (let i = 51; i >= 0; i--) entries.push({ addedAt: now - i * 100, poly: { remove() {} } });
+    loadPaths(entries);
+    pruneClickablePaths(now);
+    assert.strictEqual(clickablePaths.length, 50, 'should evict oldest beyond 50');
+    // FIFO: the 2 oldest (addedAt now-5100 and now-5000) were shifted off; now-4900 is oldest remaining
+    assert.strictEqual(clickablePaths[0].addedAt, now - 49 * 100, 'oldest remaining should have addedAt = now-4900');
   });
 }
 

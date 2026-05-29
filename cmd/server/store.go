@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -14,12 +15,17 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"github.com/meshcore-analyzer/mbcapqueue"
 )
 
 // payloadTypeNames maps payload_type int → human-readable name (firmware-standard).
+// Must stay in sync with the canonical map in cmd/ingestor/decoder.go and
+// cmd/server/decoder.go. Source of truth: firmware/src/Packet.h:19-32.
 var payloadTypeNames = map[int]string{
 	0: "REQ", 1: "RESPONSE", 2: "TXT_MSG", 3: "ACK", 4: "ADVERT",
-	5: "GRP_TXT", 7: "ANON_REQ", 8: "PATH", 9: "TRACE", 11: "CONTROL",
+	5: "GRP_TXT", 6: "GRP_DATA", 7: "ANON_REQ", 8: "PATH", 9: "TRACE",
+	10: "MULTIPART", 11: "CONTROL", 15: "RAW_CUSTOM",
 }
 
 // StoreTx is an in-memory transmission with embedded observations.
@@ -36,6 +42,7 @@ type StoreTx struct {
 	// Display fields from longest-path observation
 	ObserverID   string
 	ObserverName string
+	ObserverIATA string
 	SNR          *float64
 	RSSI         *float64
 	PathJSON     string
@@ -58,6 +65,7 @@ type StoreObs struct {
 	TransmissionID int
 	ObserverID     string
 	ObserverName   string
+	ObserverIATA   string
 	Direction      string
 	SNR            *float64
 	RSSI           *float64
@@ -65,6 +73,40 @@ type StoreObs struct {
 	PathJSON       string
 	RawHex         string
 	Timestamp      string
+
+	// #1481 P0-2: cached parsed timestamp. The legacy handlers parse
+	// Timestamp as RFC3339Nano/RFC3339/"2006-01-02 15:04:05" with a
+	// fallback chain on every read; for /api/observers/{id}/analytics
+	// that fires 60k+ times per request under RLock. ParsedTime returns
+	// the parsed value once, caching for the lifetime of the StoreObs.
+	tsParseOnce sync.Once
+	tsParsed    time.Time
+	tsParsedOK  bool
+}
+
+// ParsedTime returns the parsed Timestamp, caching the result.
+// Tries RFC3339Nano → RFC3339 → "2006-01-02 15:04:05" in order.
+// Returns (zero, false) if Timestamp is empty or unparseable.
+// Thread-safe via sync.Once.
+func (o *StoreObs) ParsedTime() (time.Time, bool) {
+	o.tsParseOnce.Do(func() {
+		if o.Timestamp == "" {
+			return
+		}
+		if t, err := time.Parse(time.RFC3339Nano, o.Timestamp); err == nil {
+			o.tsParsed, o.tsParsedOK = t, true
+			return
+		}
+		if t, err := time.Parse(time.RFC3339, o.Timestamp); err == nil {
+			o.tsParsed, o.tsParsedOK = t, true
+			return
+		}
+		if t, err := time.Parse("2006-01-02 15:04:05", o.Timestamp); err == nil {
+			o.tsParsed, o.tsParsedOK = t, true
+			return
+		}
+	})
+	return o.tsParsed, o.tsParsedOK
 }
 
 // ParsedDecoded returns the parsed DecodedJSON map, caching the result.
@@ -131,13 +173,14 @@ type PacketStore struct {
 	byNode        map[string][]*StoreTx      // pubkey → transmissions
 	nodeHashes    map[string]map[string]bool // pubkey → Set<hash>
 	byPathHop     map[string][]*StoreTx      // lowercase hop/pubkey → transmissions with that hop in path
+	relayTimes    map[string][]int64         // lowercase pubkey → sorted unix-millis of relay events (full pubkeys only)
 	byPayloadType map[int][]*StoreTx         // payload_type → transmissions
 	loaded        bool
 	totalObs      int
 	insertCount   int64
 	queryCount    int64
 	// Response caches (separate mutex to avoid contention with store RWMutex)
-	cacheMu      sync.Mutex
+	cacheMu      sync.RWMutex
 	rfCache      map[string]*cachedResult // region → cached RF result
 	topoCache    map[string]*cachedResult // region → cached topology result
 	hashCache      map[string]*cachedResult // region → cached hash-sizes result
@@ -147,6 +190,23 @@ type PacketStore struct {
 	subpathCache map[string]*cachedResult // params → cached subpaths result
 	rfCacheTTL        time.Duration
 	collisionCacheTTL time.Duration
+	// Steady-state analytics recomputers (issue #1240). Each holds the
+	// latest snapshot for the default region="" / zero-window query of
+	// an analytics endpoint in an atomic.Value, refreshed by a
+	// background goroutine on a fixed interval. When set, the matching
+	// GetAnalytics* function serves from Load() instead of running the
+	// on-request compute path. Region/window variants still go through
+	// the legacy TTL cache (compute-on-miss).
+	analyticsRecomputerMu sync.RWMutex
+	recompTopology        *analyticsRecomputer
+	recompRF              *analyticsRecomputer
+	recompDistance        *analyticsRecomputer
+	recompChannels        *analyticsRecomputer
+	recompHashCollisions  *analyticsRecomputer
+	recompHashSizes       *analyticsRecomputer
+	recompRoles           *analyticsRecomputer
+	recompObserversClockSkew *analyticsRecomputer
+	recompNodesClockSkew     *analyticsRecomputer
 	cacheHits    int64
 	cacheMisses  int64
 	// Rate-limited invalidation (fixes #533: caches cleared faster than hit)
@@ -168,10 +228,19 @@ type PacketStore struct {
 	regionObsMu        sync.Mutex
 	regionObsCache     map[string]map[string]bool
 	regionObsCacheTime time.Time
+	// Cached area key → node pubkey set (30s per-key TTL)
+	areaNodeMu         sync.RWMutex
+	areaNodeCache      map[string]map[string]bool
+	areaNodeCacheTimes map[string]time.Time
+	// Full server config — needed for Areas map in resolveAreaNodes.
+	config *Config
 	// Cached node list + prefix map (rebuilt on demand, shared across analytics)
 	nodeCache     []nodeInfo
 	nodePM        *prefixMap
 	nodeCacheTime time.Time
+	// Per-store dedupe set for one-shot schema-degradation warnings. Field
+	// (not package-level) so each test gets a fresh state — see #1199 item 5.
+	schemaDegradationLogged sync.Map
 	// Precomputed subpath index: raw comma-joined hops → occurrence count.
 	// Built during Load(), incrementally updated on ingest. Avoids full
 	// packet iteration at query time (O(unique_subpaths) vs O(total_packets)).
@@ -187,6 +256,51 @@ type PacketStore struct {
 	hashSizeInfoMu    sync.Mutex
 	hashSizeInfoCache map[string]*hashSizeNodeInfo
 	hashSizeInfoAt    time.Time
+
+	// Cached relay stats batch result — recomputed at most once every 300s
+	// or when byPathHop changes (see invalidateRelayStatsCache).
+	relayStatsCacheMu     sync.Mutex
+	relayStatsCache       map[string]RepeaterNodeStats
+	relayStatsCacheAt     time.Time
+	relayStatsCacheWindow float64
+	relayStatsCacheSig    string
+
+	// Snapshot from the last analytics cycle + O(1) index, both under cacheMu.
+	// Populated by analytics + pre-populated from DB on Load (read-only path).
+	// Persistence to the DB is owned by the ingestor (#1289/#1324): the
+	// analytics cycle publishes a snapshot file via internal/mbcapqueue
+	// and the ingestor's RunMultibyteCapPersist applies it.
+	mbCapSnapshot []MultiByteCapEntry
+	mbCapIndex    map[string]MultiByteCapEntry
+
+	// Cached per-pubkey relay info + usefulness score maps (#1257). These
+	// fold the previously per-node GetRepeaterRelayInfo /
+	// GetRepeaterUsefulnessScore loop in handleNodes into one O(N) pass
+	// per 15s TTL window — eliminating N RLock acquisitions and N×
+	// timestamp parses of the same byPathHop entries per request.
+	repeaterEnrichMu       sync.Mutex
+	repeaterRelayCache     map[string]RepeaterRelayInfo
+	repeaterRelayCacheWin  float64
+	repeaterRelayAt        time.Time
+	repeaterUsefulCache    map[string]float64
+	repeaterUsefulAt       time.Time
+
+	// Steady-state recomputer for the two caches above (#1262). When
+	// started, an initial sync compute prewarms the caches so the very
+	// first /api/nodes?limit=2000 from live.js's SPA bootstrap hits a
+	// populated cache instead of paying the 15.7s on-thread rebuild.
+	repeaterEnrichRecompMu      sync.Mutex
+	repeaterEnrichRecompStarted bool
+	repeaterEnrichRecompStop    chan struct{}
+	repeaterEnrichRecompDone    chan struct{}
+
+	// Bridge axis (issue #672 axis 2 of 4): atomic snapshot of pubkey
+	// → 0..1 betweenness-centrality score over the current neighbor
+	// graph. Populated by the bridge recomputer (bridge_recomputer.go);
+	// nil until the first compute lands. Read path is a single atomic
+	// pointer load — no lock contention with the per-request enrichment
+	// path in handleNodes (same discipline as #1248).
+	bridgeScoreMap atomic.Pointer[map[string]float64]
 
 	// Precomputed distinct advert pubkey count (refcounted for eviction correctness).
 	// Updated incrementally during Load/Ingest/Evict — avoids JSON parsing in GetPerfStoreStats.
@@ -207,7 +321,22 @@ type PacketStore struct {
 	lruMu                 sync.RWMutex     // guards apiResolvedPathLRU + lruOrder
 
 	// Persisted neighbor graph for hop resolution at ingest time.
-	graph *NeighborGraph
+	// Accessed via atomic.Pointer because async rebuilds (path_inspect.go
+	// ensureNeighborGraph) and ingest-time readers race on the pointer
+	// (issue #1203 sub-fix).
+	graph atomic.Pointer[NeighborGraph]
+
+	// Singleflight state for ensureNeighborGraph. These were package-globals
+	// in #1203 r0 — moved to per-store fields (PR #1208 review) so parallel
+	// tests with independent *PacketStore values don't share rebuild state
+	// (cross-store deadlock/skip risk under -race).
+	rebuildMu    sync.Mutex
+	rebuildInFlt chan struct{} // nil when no rebuild is in flight
+
+
+	// Path inspector score cache (issue #944).
+	inspectMu    sync.RWMutex
+	inspectCache map[string]*inspectCachedResult
 
 	// Clock skew detection engine.
 	clockSkew *ClockSkewEngine
@@ -221,6 +350,29 @@ type PacketStore struct {
 	// Bounded cold load: oldest packet timestamp loaded into memory.
 	// Empty string means all data is in memory (no limit applied).
 	oldestLoaded string
+
+	// Hot startup atomic gates — see contract below.
+	//
+	// Contract / ordering invariant (PR #1187):
+	//   * hashMigrationComplete (set by migrateContentHashesAsync) gates
+	//     content-hash–dependent code paths (e.g. dedup correctness on the
+	//     write side). Set true ONLY after the migration loop finishes.
+	//   * backgroundLoadDone is set true exactly once, after
+	//     loadBackgroundChunks finishes its loop AND its post-load index
+	//     rebuild. It gates "hot startup has finished filling
+	//     retentionHours of data into memory" (used by /api/perf and the
+	//     UI's hot-load banner). It says nothing about success — see
+	//     backgroundLoadFailed for the success/failure signal.
+	//   * backgroundLoadFailed is set true ONLY if at least one chunk
+	//     errored during background load. /api/perf surfaces it so
+	//     operators can distinguish "done & full" from "done & partial".
+	//     Read order MUST be: load backgroundLoadDone first; only if true
+	//     is backgroundLoadFailed meaningful.
+	// 0 = disabled (current behavior). Background loader fills the rest.
+	hotStartupHours        float64
+	backgroundLoadDone     atomic.Bool
+	backgroundLoadFailed   atomic.Bool
+	backgroundLoadProgress atomic.Int64 // 0–100 percent complete
 
 	// Async hash migration state: set after migrateContentHashesAsync completes.
 	hashMigrationComplete atomic.Bool
@@ -382,6 +534,7 @@ func NewPacketStore(db *DB, cfg *PacketStoreConfig, cacheTTLs ...map[string]inte
 		byObserver:    make(map[string][]*StoreObs),
 		byNode:        make(map[string][]*StoreTx),
 		byPathHop:     make(map[string][]*StoreTx),
+		relayTimes:    make(map[string][]int64),
 		nodeHashes:    make(map[string]map[string]bool),
 		byPayloadType: make(map[int][]*StoreTx),
 		rfCache:       make(map[string]*cachedResult),
@@ -392,7 +545,15 @@ func NewPacketStore(db *DB, cfg *PacketStoreConfig, cacheTTLs ...map[string]inte
 		chanCache:     make(map[string]*cachedResult),
 		distCache:     make(map[string]*cachedResult),
 		subpathCache:  make(map[string]*cachedResult),
-		rfCacheTTL:         15 * time.Second,
+		// #1239: 60 seconds by default. rfCacheTTL is the shared TTL for
+		// the RF, topology, distance, hash-sizes, subpath, and channel
+		// analytics caches. Distance analytics IS viewed live during
+		// active analysis sessions (operators won't tolerate a 5-min
+		// lag), so the bump from 15s → 60s smooths the most-frequent
+		// cold-miss churn during heavy ingest without freezing data.
+		// Override via cacheTTL.analyticsRF in config.json (also
+		// propagates to distance / topology / hash-sizes / etc.).
+		rfCacheTTL: 60 * time.Second,
 		collisionCacheTTL: 3600 * time.Second,
 		invCooldown:       300 * time.Second,
 		spIndex:       make(map[string]int, 4096),
@@ -401,12 +562,22 @@ func NewPacketStore(db *DB, cfg *PacketStoreConfig, cacheTTLs ...map[string]inte
 		lastSeenTouched: make(map[string]time.Time),
 		clockSkew:       NewClockSkewEngine(),
 		useResolvedPathIndex: true,
+		areaNodeCache:      make(map[string]map[string]bool),
+		areaNodeCacheTimes: make(map[string]time.Time),
 	}
 	ps.initResolvedPathIndex()
 	if cfg != nil {
 		ps.retentionHours = cfg.RetentionHours
 		ps.maxMemoryMB = cfg.MaxMemoryMB
 		ps.maxResolvedPubkeyIndexEntries = cfg.MaxResolvedPubkeyIndexEntries
+		if cfg.HotStartupHours > 0 {
+			h := cfg.HotStartupHours
+			if ps.retentionHours > 0 && h > ps.retentionHours {
+				log.Printf("[store] warning: hotStartupHours (%g) > retentionHours (%g) — clamping", h, ps.retentionHours)
+				h = ps.retentionHours
+			}
+			ps.hotStartupHours = h
+		}
 	}
 	// Wire cacheTTL config values to server-side cache durations.
 	if len(cacheTTLs) > 0 && cacheTTLs[0] != nil {
@@ -464,28 +635,49 @@ func (s *PacketStore) Load() error {
 		obsRawHexCol = ", o.raw_hex"
 	}
 
-	limitClause := ""
+	// Build WHERE conditions: retention cutoff (mirrors Evict logic) + optional memory-cap limit.
+	// When hotStartupHours > 0, use it as the initial cutoff (smaller window = fast startup).
+	//
+	// PR #1187 r2 #7: compute the hot cutoff ONCE here and reuse the same
+	// string for both the SQL filter below AND for s.oldestLoaded later.
+	// Two separate time.Now().UTC() calls produced microsecond skew at chunk
+	// borders, so the SQL window and oldestLoaded could disagree.
+	var loadConditions []string
+	hotCutoffHours := s.retentionHours
+	if s.hotStartupHours > 0 {
+		hotCutoffHours = s.hotStartupHours
+	}
+	var hotCutoffStr string
+	if hotCutoffHours > 0 {
+		hotCutoffStr = time.Now().UTC().Add(-time.Duration(hotCutoffHours * float64(time.Hour))).Format(time.RFC3339)
+		loadConditions = append(loadConditions, fmt.Sprintf("t.first_seen >= '%s'", hotCutoffStr))
+	}
 	if maxPackets > 0 {
-		limitClause = fmt.Sprintf(
-			"\n\t\t\tWHERE t.id IN (SELECT id FROM transmissions ORDER BY first_seen DESC LIMIT %d)", maxPackets)
+		loadConditions = append(loadConditions, fmt.Sprintf(
+			"t.id IN (SELECT id FROM transmissions ORDER BY first_seen DESC LIMIT %d)", maxPackets))
+	}
+	filterClause := ""
+	if len(loadConditions) > 0 {
+		filterClause = "\n\t\t\tWHERE " + strings.Join(loadConditions, "\n\t\t\t  AND ")
 	}
 
 	if s.db.isV3 {
 		loadSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
-				o.id, obs.id, obs.name, o.direction,
+				o.id, obs.id, obs.name, COALESCE(obs.iata, ''), o.direction,
 				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
-			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + limitClause + `
+			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + filterClause + `
 			ORDER BY t.first_seen ASC, o.timestamp DESC`
 	} else {
 		loadSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
-				o.id, o.observer_id, o.observer_name, o.direction,
+				o.id, o.observer_id, o.observer_name, COALESCE(obs.iata, ''), o.direction,
 				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + `
 			FROM transmissions t
-			LEFT JOIN observations o ON o.transmission_id = t.id` + limitClause + `
+			LEFT JOIN observations o ON o.transmission_id = t.id
+			LEFT JOIN observers obs ON obs.id = o.observer_id` + filterClause + `
 			ORDER BY t.first_seen ASC, o.timestamp DESC`
 	}
 
@@ -502,7 +694,7 @@ func (s *PacketStore) Load() error {
 		var rawHex, hash, firstSeen, decodedJSON sql.NullString
 		var routeType, payloadType, payloadVersion sql.NullInt64
 		var obsID sql.NullInt64
-		var observerID, observerName, direction, pathJSON, obsTimestamp sql.NullString
+		var observerID, observerName, observerIATA, direction, pathJSON, obsTimestamp sql.NullString
 		var snr, rssi sql.NullFloat64
 		var score sql.NullInt64
 		var obsRawHex sql.NullString
@@ -510,7 +702,7 @@ func (s *PacketStore) Load() error {
 
 		scanArgs := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
 			&payloadVersion, &decodedJSON,
-			&obsID, &observerID, &observerName, &direction,
+			&obsID, &observerID, &observerName, &observerIATA, &direction,
 			&snr, &rssi, &score, &pathJSON, &obsTimestamp}
 		if s.db.hasObsRawHex {
 			scanArgs = append(scanArgs, &obsRawHex)
@@ -569,6 +761,7 @@ func (s *PacketStore) Load() error {
 				TransmissionID: txID,
 				ObserverID:     obsIDStr,
 				ObserverName:   nullStrVal(observerName),
+				ObserverIATA:   nullStrVal(observerIATA),
 				Direction:      nullStrVal(direction),
 				SNR:            nullFloatPtr(snr),
 				RSSI:           nullFloatPtr(rssi),
@@ -590,17 +783,8 @@ func (s *PacketStore) Load() error {
 						s.addToByNode(tx, pk)
 					}
 					// touchRelayLastSeen handled in post-load pass
-					// byPathHop resolved-key entries
-					clear(hopsSeen)
-					for _, hop := range txGetParsedPath(tx) {
-						hopsSeen[strings.ToLower(hop)] = true
-					}
-					for _, pk := range pks {
-						if !hopsSeen[pk] {
-							hopsSeen[pk] = true
-							s.byPathHop[pk] = append(s.byPathHop[pk], tx)
-						}
-					}
+					// byPathHop resolved-key entries (#1164: helper invalidates relay stats cache).
+					s.addResolvedPubkeysToPathHopIndex(tx, pks, hopsSeen)
 					// resolvedPubkeyIndex
 					s.addToResolvedPubkeyIndex(tx.ID, pks)
 				}
@@ -631,9 +815,14 @@ func (s *PacketStore) Load() error {
 		}
 	}
 
-	// Post-load: pick best observation (longest path) for each transmission
+	// Post-load: pick best observation (longest path) for each transmission,
+	// then re-index so relay hops from resolved_path land in byNode.
+	// indexByNode was called earlier (on StoreTx creation) before observations
+	// were appended, so tx.ResolvedPath was nil at that point — call it again
+	// now that pickBestObservation has propagated the best path.
 	for _, tx := range s.packets {
 		pickBestObservation(tx)
+		s.indexByNode(tx)
 	}
 
 	// Build precomputed subpath index for O(1) analytics queries
@@ -646,7 +835,12 @@ func (s *PacketStore) Load() error {
 	s.buildDistanceIndex()
 
 	// Track oldest loaded timestamp for future SQL fallback queries.
-	if len(s.packets) > 0 {
+	// When hotStartupHours > 0 use the SAME cutoff string that was used in
+	// the load SQL (PR #1187 r2 #7) — recomputing time.Now().UTC() here
+	// produced microsecond skew vs. the SQL filter at chunk boundaries.
+	if s.hotStartupHours > 0 {
+		s.oldestLoaded = hotCutoffStr
+	} else if len(s.packets) > 0 {
 		s.oldestLoaded = s.packets[0].FirstSeen
 	}
 
@@ -659,7 +853,384 @@ func (s *PacketStore) Load() error {
 		log.Printf("[store] Loaded %d transmissions (%d observations) in %v (tracked ~%.0fMB, heap ~%.0fMB)",
 			len(s.packets), s.totalObs, elapsed, s.trackedMemoryMB(), s.estimatedMemoryMB())
 	}
+	s.loadMultibyteCapFromDB()
 	return nil
+}
+
+// loadChunk queries a [from, to) time window from SQLite without holding the
+// write lock, builds local data structures, then merges them into the store
+// under s.mu.Lock(). It is the building block for the background loader.
+//
+// The chunk is assumed to be older than the data already in the store, so
+// localPackets are prepended to s.packets.
+//
+// byPayloadType is updated here incrementally. byPathHop, spIndex, and
+// distHops are NOT updated here — the caller (loadBackgroundChunks) rebuilds
+// those once after all chunks are merged.
+func (s *PacketStore) loadChunk(from, to time.Time) error {
+	fromStr := from.UTC().Format(time.RFC3339)
+	toStr := to.UTC().Format(time.RFC3339)
+
+	// Build the same SQL as Load() but with a [from, to) window.
+	rpCol := ""
+	if s.db.hasResolvedPath {
+		rpCol = ",\n\t\t\t\to.resolved_path"
+	}
+	obsRawHexCol := ""
+	if s.db.hasObsRawHex {
+		obsRawHexCol = ", o.raw_hex"
+	}
+
+	const filterClause = "\n\t\t\tWHERE t.first_seen >= ? AND t.first_seen < ?"
+
+	var chunkSQL string
+	if s.db.isV3 {
+		chunkSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
+				t.payload_type, t.payload_version, t.decoded_json,
+				o.id, obs.id, obs.name, o.direction,
+				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + `
+			FROM transmissions t
+			LEFT JOIN observations o ON o.transmission_id = t.id
+			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + filterClause + `
+			ORDER BY t.first_seen ASC, o.timestamp DESC`
+	} else {
+		chunkSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
+				t.payload_type, t.payload_version, t.decoded_json,
+				o.id, o.observer_id, o.observer_name, o.direction,
+				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + `
+			FROM transmissions t
+			LEFT JOIN observations o ON o.transmission_id = t.id` + filterClause + `
+			ORDER BY t.first_seen ASC, o.timestamp DESC`
+	}
+
+	rows, err := s.db.conn.Query(chunkSQL, fromStr, toStr)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	// Local data structures — built without holding the lock.
+	localByHash := make(map[string]*StoreTx)
+	localPackets := make([]*StoreTx, 0)
+	localByTxID := make(map[int]*StoreTx)
+	localByObsID := make(map[int]*StoreObs)
+	localByObserver := make(map[string][]*StoreObs)
+	var localTotalObs int
+	var localTrackedBytes int64
+	var localMaxTxID int
+	var localMaxObsID int
+
+	for rows.Next() {
+		var txID int
+		var rawHex, hash, firstSeen, decodedJSON sql.NullString
+		var routeType, payloadType, payloadVersion sql.NullInt64
+		var obsID sql.NullInt64
+		var observerID, observerName, direction, pathJSON, obsTimestamp sql.NullString
+		var snr, rssi sql.NullFloat64
+		var score sql.NullInt64
+		var obsRawHex sql.NullString
+		var resolvedPathStr sql.NullString
+
+		scanArgs := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
+			&payloadVersion, &decodedJSON,
+			&obsID, &observerID, &observerName, &direction,
+			&snr, &rssi, &score, &pathJSON, &obsTimestamp}
+		if s.db.hasObsRawHex {
+			scanArgs = append(scanArgs, &obsRawHex)
+		}
+		if s.db.hasResolvedPath {
+			scanArgs = append(scanArgs, &resolvedPathStr)
+		}
+		if err := rows.Scan(scanArgs...); err != nil {
+			log.Printf("[store] loadChunk scan error: %v", err)
+			continue
+		}
+
+		hashStr := nullStrVal(hash)
+		tx := localByHash[hashStr]
+		if tx == nil {
+			tx = &StoreTx{
+				ID:          txID,
+				RawHex:      nullStrVal(rawHex),
+				Hash:        hashStr,
+				FirstSeen:   nullStrVal(firstSeen),
+				LatestSeen:  nullStrVal(firstSeen),
+				RouteType:   nullIntPtr(routeType),
+				PayloadType: nullIntPtr(payloadType),
+				DecodedJSON: nullStrVal(decodedJSON),
+				obsKeys:     make(map[string]bool),
+				observerSet: make(map[string]bool),
+			}
+			localByHash[hashStr] = tx
+			localPackets = append(localPackets, tx)
+			localByTxID[txID] = tx
+			if txID > localMaxTxID {
+				localMaxTxID = txID
+			}
+			localTrackedBytes += estimateStoreTxBytes(tx)
+		}
+
+		if obsID.Valid {
+			oid := int(obsID.Int64)
+			obsIDStr := nullStrVal(observerID)
+			obsPJ := nullStrVal(pathJSON)
+
+			dk := obsIDStr + "|" + obsPJ
+			if tx.obsKeys[dk] {
+				continue
+			}
+
+			obs := &StoreObs{
+				ID:             oid,
+				TransmissionID: txID,
+				ObserverID:     obsIDStr,
+				ObserverName:   nullStrVal(observerName),
+				Direction:      nullStrVal(direction),
+				SNR:            nullFloatPtr(snr),
+				RSSI:           nullFloatPtr(rssi),
+				Score:          nullIntPtr(score),
+				PathJSON:       obsPJ,
+				RawHex:         nullStrVal(obsRawHex),
+				Timestamp:      normalizeTimestamp(nullStrVal(obsTimestamp)),
+			}
+
+			tx.Observations = append(tx.Observations, obs)
+			tx.obsKeys[dk] = true
+			if obs.ObserverID != "" && !tx.observerSet[obs.ObserverID] {
+				tx.observerSet[obs.ObserverID] = true
+				tx.UniqueObserverCount++
+			}
+			tx.ObservationCount++
+			if obs.Timestamp > tx.LatestSeen {
+				tx.LatestSeen = obs.Timestamp
+			}
+
+			localByObsID[oid] = obs
+			if oid > localMaxObsID {
+				localMaxObsID = oid
+			}
+			if obsIDStr != "" {
+				localByObserver[obsIDStr] = append(localByObserver[obsIDStr], obs)
+			}
+			localTotalObs++
+			localTrackedBytes += estimateStoreObsBytes(obs)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Pick best observation for each local packet before merging.
+	for _, tx := range localPackets {
+		pickBestObservation(tx)
+	}
+
+	if len(localPackets) == 0 {
+		return nil
+	}
+
+	// PR #1187 r3 MUST-FIX 1: index↔slice consistency.
+	//
+	// The previous (r2 #6, commit 2ec762aa) merge order was:
+	//   1) prepend s.packets in one critical section
+	//   2) populate s.byHash/byTxID/byObsID/byObserver/byNode/byPayloadType
+	//      in separate per-batch critical sections
+	//   3) bump counters in a third section
+	//
+	// Any RLock-holding reader between steps observed packets present in
+	// s.packets but missing from s.byHash → silent partial data loss in
+	// GetPacketByHash and the QueryPackets hash/node fast-paths.
+	//
+	// We invert the order: build the indexes FIRST in bounded per-batch
+	// critical sections, then under a SINGLE final critical section
+	// prepend s.packets AND bump counters AND advance maxIDs. The
+	// invariant "every tx in s.packets is in s.byHash/s.byTxID" holds at
+	// every RLock instant — readers either see the old state, or an
+	// intermediate state where indexes contain a superset of s.packets
+	// (which is harmless: nothing in s.packets dangles), or the fully
+	// merged new state.
+	const mergeBatchSize = 500
+
+	for batchStart := 0; batchStart < len(localPackets); batchStart += mergeBatchSize {
+		batchEnd := batchStart + mergeBatchSize
+		if batchEnd > len(localPackets) {
+			batchEnd = len(localPackets)
+		}
+		batch := localPackets[batchStart:batchEnd]
+
+		// Build the per-batch index views outside the lock so the
+		// critical section below is O(batch), not O(total local).
+		batchHashes := make(map[string]*StoreTx, len(batch))
+		batchTxIDs := make(map[int]*StoreTx, len(batch))
+		batchObsIDs := make(map[int]*StoreObs)
+		batchByObserver := make(map[string][]*StoreObs)
+		for _, tx := range batch {
+			batchHashes[tx.Hash] = tx
+			batchTxIDs[tx.ID] = tx
+			for _, o := range tx.Observations {
+				batchObsIDs[o.ID] = o
+				if o.ObserverID != "" {
+					batchByObserver[o.ObserverID] = append(batchByObserver[o.ObserverID], o)
+				}
+			}
+		}
+
+		s.mu.Lock()
+		newObsIDs := make(map[int]bool, len(batchObsIDs))
+		for k := range batchObsIDs {
+			if s.byObsID[k] == nil {
+				newObsIDs[k] = true
+			}
+		}
+		for k, v := range batchHashes {
+			if s.byHash[k] == nil {
+				s.byHash[k] = v
+			}
+		}
+		for k, v := range batchTxIDs {
+			if s.byTxID[k] == nil {
+				s.byTxID[k] = v
+			}
+		}
+		for k, v := range batchObsIDs {
+			if newObsIDs[k] {
+				s.byObsID[k] = v
+			}
+		}
+		for observerID, obsList := range batchByObserver {
+			for _, o := range obsList {
+				if newObsIDs[o.ID] {
+					s.byObserver[observerID] = append(s.byObserver[observerID], o)
+				}
+			}
+		}
+		for _, tx := range batch {
+			s.indexByNode(tx)
+			if tx.PayloadType != nil {
+				pt := *tx.PayloadType
+				s.byPayloadType[pt] = append(s.byPayloadType[pt], tx)
+			}
+			s.trackAdvertPubkey(tx)
+		}
+		s.mu.Unlock()
+		runtime.Gosched()
+	}
+
+	// Final atomic step: now that every tx in localPackets is fully
+	// indexed, publish it into s.packets and bump counters in one short
+	// critical section. After this point the new state is fully visible;
+	// before it readers see the old slice (which is still fully indexed).
+	s.mu.Lock()
+	s.packets = append(localPackets, s.packets...)
+	s.totalObs += localTotalObs
+	s.trackedBytes += localTrackedBytes
+	if localMaxTxID > s.maxTxID {
+		s.maxTxID = localMaxTxID
+	}
+	if localMaxObsID > s.maxObsID {
+		s.maxObsID = localMaxObsID
+	}
+	s.mu.Unlock()
+
+	log.Printf("[store] background chunk [%s, %s) merged: %d tx, %d obs", fromStr, toStr, len(localPackets), localTotalObs)
+	return nil
+}
+
+// loadBackgroundChunks fills the remaining retentionHours window by loading
+// daily chunks from oldestLoaded back to the retention cutoff. After all
+// chunks are merged it rebuilds analytics indexes once. Chunk errors are
+// handled by advancing past the failed window so the loop always terminates.
+func (s *PacketStore) loadBackgroundChunks() {
+	if s.retentionHours <= 0 {
+		s.backgroundLoadDone.Store(true)
+		return
+	}
+
+	target := time.Now().UTC().Add(-time.Duration(s.retentionHours * float64(time.Hour)))
+	totalHours := s.retentionHours - s.hotStartupHours
+	if totalHours <= 0 {
+		s.backgroundLoadDone.Store(true)
+		return
+	}
+
+	var chunksLoaded float64
+	var chunkErrors int
+	totalChunks := math.Ceil(totalHours / 24)
+
+	for {
+		s.mu.RLock()
+		oldest := s.oldestLoaded
+		s.mu.RUnlock()
+
+		if oldest == "" {
+			break
+		}
+		chunkEnd, err := time.Parse(time.RFC3339, oldest)
+		if err != nil {
+			log.Printf("[store] background loader: bad oldestLoaded %q: %v", oldest, err)
+			break
+		}
+		if !chunkEnd.After(target) {
+			break
+		}
+
+		chunkStart := chunkEnd.Add(-24 * time.Hour)
+		if chunkStart.Before(target) {
+			chunkStart = target
+		}
+
+		chunkStartStr := chunkStart.Format(time.RFC3339)
+		if err := s.loadChunk(chunkStart, chunkEnd); err != nil {
+			chunkErrors++
+			log.Printf("[store] background chunk [%s, %s) error: %v — advancing past it",
+				chunkStartStr, chunkEnd.Format(time.RFC3339), err)
+		}
+		// Always advance oldestLoaded to chunkStart so the loop terminates,
+		// even when the chunk was empty (loadChunk skips the update when 0 packets).
+		s.mu.Lock()
+		if s.oldestLoaded > chunkStartStr || s.oldestLoaded == "" {
+			s.oldestLoaded = chunkStartStr
+		}
+		s.mu.Unlock()
+
+		chunksLoaded++
+		if totalChunks > 0 {
+			pct := int64(chunksLoaded / totalChunks * 100)
+			if pct > 100 {
+				pct = 100
+			}
+			s.backgroundLoadProgress.Store(pct)
+		}
+
+		// Yield between chunks so ingest goroutines can acquire s.mu.Lock()
+		// without being starved. The chosen tradeoff is brief lock-holds per
+		// chunk rather than a configurable sleep; background fill is
+		// best-effort and queries fall back to SQL while it runs.
+		runtime.Gosched()
+	}
+
+	// Rebuild analytics indexes once after all chunks are merged.
+	s.mu.Lock()
+	s.buildSubpathIndex()
+	s.buildPathHopIndex()
+	s.buildDistanceIndex()
+	s.mu.Unlock()
+
+	s.backgroundLoadDone.Store(true)
+	if chunkErrors > 0 {
+		s.backgroundLoadFailed.Store(true)
+	}
+	s.backgroundLoadProgress.Store(100)
+
+	s.mu.RLock()
+	totalPkts := len(s.packets)
+	oldest := s.oldestLoaded
+	s.mu.RUnlock()
+	if chunkErrors > 0 {
+		log.Printf("[store] background load done with %d chunk error(s): %d packets in memory, oldestLoaded=%s", chunkErrors, totalPkts, oldest)
+	} else {
+		log.Printf("[store] background load complete: %d packets in memory, oldestLoaded=%s", totalPkts, oldest)
+	}
 }
 
 // pickBestObservation selects the observation with the longest path
@@ -679,6 +1250,7 @@ func pickBestObservation(tx *StoreTx) {
 	}
 	tx.ObserverID = best.ObserverID
 	tx.ObserverName = best.ObserverName
+	tx.ObserverIATA = best.ObserverIATA
 	tx.SNR = best.SNR
 	tx.RSSI = best.RSSI
 	tx.PathJSON = best.PathJSON
@@ -812,6 +1384,22 @@ func (s *PacketStore) untrackAdvertPubkey(tx *StoreTx) {
 
 // QueryPackets returns filtered, paginated packets from memory.
 func (s *PacketStore) QueryPackets(q PacketQuery) *PacketResult {
+	// SQL fallback: if the query window predates the in-memory window, delegate
+	// to the DB layer which covers the full SQLite retention period.
+	s.mu.RLock()
+	oldest := s.oldestLoaded
+	s.mu.RUnlock()
+	if oldest != "" {
+		needsSQL := (q.Since != "" && q.Since < oldest) ||
+			(q.Until != "" && q.Until < oldest)
+		if needsSQL {
+			if result, err := s.db.QueryPackets(q); err == nil {
+				return result
+			} else {
+				log.Printf("[store] QueryPackets SQL fallback failed: %v — using in-memory", err)
+			}
+		}
+	}
 	atomic.AddInt64(&s.queryCount, 1)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -825,6 +1413,20 @@ func (s *PacketStore) QueryPackets(q PacketQuery) *PacketResult {
 
 	results := s.filterPackets(q)
 	total := len(results)
+
+	// #1345: order by ingest id, not insertion-into-s.packets order. After
+	// Load() (which orders by first_seen ASC) the slice is mostly id-ordered
+	// EXCEPT where rxTime ≠ ingest time — exactly the buffered-observer-upload
+	// case that hides fresh activity. Sort by ID DESC so "page 0" is always
+	// the most-recently-ingested transmissions, matching the DB-path fix.
+	// Cost: O(n log n) on the filtered set per query; acceptable for the
+	// typical filter-then-paginate flow (filterPackets already O(n)).
+	sortedByID := make([]*StoreTx, len(results))
+	copy(sortedByID, results)
+	sort.Slice(sortedByID, func(i, j int) bool {
+		return sortedByID[i].ID < sortedByID[j].ID
+	})
+	results = sortedByID
 
 	// results is oldest-first (ASC). For DESC (default) read backwards from the tail;
 	// for ASC read forwards. Both are O(page_size) — no sort copy needed.
@@ -858,6 +1460,20 @@ func (s *PacketStore) QueryPackets(q PacketQuery) *PacketResult {
 
 // QueryGroupedPackets returns transmissions grouped by hash (already 1:1).
 func (s *PacketStore) QueryGroupedPackets(q PacketQuery) *PacketResult {
+	s.mu.RLock()
+	oldest := s.oldestLoaded
+	s.mu.RUnlock()
+	if oldest != "" {
+		needsSQL := (q.Since != "" && q.Since < oldest) ||
+			(q.Until != "" && q.Until < oldest)
+		if needsSQL {
+			if result, err := s.db.QueryGroupedPackets(q); err == nil {
+				return result
+			} else {
+				log.Printf("[store] QueryGroupedPackets SQL fallback failed: %v — using in-memory", err)
+			}
+		}
+	}
 	atomic.AddInt64(&s.queryCount, 1)
 
 	if q.Limit <= 0 {
@@ -865,7 +1481,7 @@ func (s *PacketStore) QueryGroupedPackets(q PacketQuery) *PacketResult {
 	}
 
 	// Cache key covers all filter dimensions. Empty key = no filters.
-	cacheKey := q.Since + "|" + q.Until + "|" + q.Region + "|" + q.Node + "|" + q.Hash + "|" + q.Observer + "|" + q.Channel
+	cacheKey := q.Since + "|" + q.Until + "|" + q.Region + "|" + q.Area + "|" + q.Node + "|" + q.Hash + "|" + q.Observer + "|" + q.Channel
 	if q.Type != nil {
 		cacheKey += fmt.Sprintf("|t%d", *q.Type)
 	}
@@ -935,6 +1551,11 @@ func groupedTxsToPage(txs []*StoreTx, total, offset, limit int) *PacketResult {
 
 	packets := make([]map[string]interface{}, len(page))
 	for i, tx := range page {
+		// #1189 R2: compute distinct IATA set across all observations.
+		// Frontend uses this in the default collapsed view to show CROSS-region
+		// reception at a glance — see groupedObserverIataBadgesHtml in
+		// public/packets.js.
+		distinctIatas := storeTxDistinctIatas(tx)
 		m := map[string]interface{}{
 			"hash":              strOrNil(tx.Hash),
 			"first_seen":        strOrNil(tx.FirstSeen),
@@ -944,6 +1565,8 @@ func groupedTxsToPage(txs []*StoreTx, total, offset, limit int) *PacketResult {
 			"latest":            strOrNil(tx.LatestSeen),
 			"observer_id":       strOrNil(tx.ObserverID),
 			"observer_name":     strOrNil(tx.ObserverName),
+			"observer_iata":     strOrNil(tx.ObserverIATA),
+			"distinct_iatas":    distinctIatas,
 			"path_json":         strOrNil(tx.PathJSON),
 			"payload_type":      intPtrOrNil(tx.PayloadType),
 			"route_type":        intPtrOrNil(tx.RouteType),
@@ -957,6 +1580,34 @@ func groupedTxsToPage(txs []*StoreTx, total, offset, limit int) *PacketResult {
 	}
 
 	return &PacketResult{Packets: packets, Total: total}
+}
+
+// storeTxDistinctIatas (#1189 R2) returns a sorted, deduped list of observer
+// IATA codes for a StoreTx, excluding empty values. Returns an empty
+// (non-nil) []string when the tx has no IATA'd observations so JSON
+// serialization stays consistent across the in-memory store and SQL
+// fallback paths (db.go's parseDistinctIatasCSV does the same).
+func storeTxDistinctIatas(tx *StoreTx) []string {
+	if tx == nil {
+		return []string{}
+	}
+	seen := make(map[string]bool)
+	// Include the header observer's IATA (some hot-path StoreTx records the
+	// chosen observer fields directly without re-populating Observations).
+	if tx.ObserverIATA != "" {
+		seen[tx.ObserverIATA] = true
+	}
+	for _, o := range tx.Observations {
+		if o != nil && o.ObserverIATA != "" {
+			seen[o.ObserverIATA] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // GetStoreStats returns aggregate counts (packet data from memory, node/observer from DB).
@@ -1025,6 +1676,10 @@ func (s *PacketStore) GetPerfStoreStats() map[string]interface{} {
 	nodeIdx := len(s.byNode)
 	pathHopIdx := len(s.byPathHop)
 	ptIdx := len(s.byPayloadType)
+	oldestLoaded := s.oldestLoaded
+	retentionHours := s.retentionHours
+	maxMemoryMB := s.maxMemoryMB
+	hotStartupHours := s.hotStartupHours
 
 	// Distinct advert pubkey count — precomputed incrementally (see trackAdvertPubkey).
 	advertByObsCount := len(s.advertPubkeys)
@@ -1036,18 +1691,22 @@ func (s *PacketStore) GetPerfStoreStats() map[string]interface{} {
 	evicted := atomic.LoadInt64(&s.evicted)
 
 	return map[string]interface{}{
-		"totalLoaded":       totalLoaded,
-		"totalObservations": totalObs,
-		"evicted":           evicted,
-		"inserts":           atomic.LoadInt64(&s.insertCount),
-		"queries":           atomic.LoadInt64(&s.queryCount),
-		"inMemory":          totalLoaded,
-		"sqliteOnly":        false,
-		"retentionHours":    s.retentionHours,
-		"maxMemoryMB":       s.maxMemoryMB,
-		"oldestLoaded":      s.oldestLoaded,
-		"estimatedMB":       estimatedMB,
-		"trackedMB":         trackedMB,
+		"totalLoaded":            totalLoaded,
+		"totalObservations":      totalObs,
+		"evicted":                evicted,
+		"inserts":                atomic.LoadInt64(&s.insertCount),
+		"queries":                atomic.LoadInt64(&s.queryCount),
+		"inMemory":               totalLoaded,
+		"sqliteOnly":             false,
+		"retentionHours":         retentionHours,
+		"maxMemoryMB":            maxMemoryMB,
+		"oldestLoaded":           oldestLoaded,
+		"estimatedMB":            estimatedMB,
+		"trackedMB":              trackedMB,
+		"hotStartupHours":        hotStartupHours,
+		"backgroundLoadComplete": s.backgroundLoadDone.Load(),
+		"backgroundLoadFailed":   s.backgroundLoadFailed.Load(),
+		"backgroundLoadProgress": s.backgroundLoadProgress.Load(),
 		"indexes": map[string]interface{}{
 			"byHash":           hashIdx,
 			"byTxID":           txIdx,
@@ -1218,24 +1877,28 @@ func (s *PacketStore) GetPerfStoreStatsTyped() PerfPacketStoreStats {
 	}
 
 	return PerfPacketStoreStats{
-		TotalLoaded:       totalLoaded,
-		TotalObservations: totalObs,
-		Evicted:           int(atomic.LoadInt64(&s.evicted)),
-		Inserts:           atomic.LoadInt64(&s.insertCount),
-		Queries:           atomic.LoadInt64(&s.queryCount),
-		InMemory:          totalLoaded,
-		SqliteOnly:        false,
-		MaxPackets:        2386092,
-		EstimatedMB:       estimatedMB,
-		TrackedMB:         trackedMB,
-		AvgBytesPerPacket: avgBytesPerPacket,
-		MaxMB:             s.maxMemoryMB,
+		TotalLoaded:              totalLoaded,
+		TotalObservations:        totalObs,
+		Evicted:                  int(atomic.LoadInt64(&s.evicted)),
+		Inserts:                  atomic.LoadInt64(&s.insertCount),
+		Queries:                  atomic.LoadInt64(&s.queryCount),
+		InMemory:                 totalLoaded,
+		SqliteOnly:               false,
+		MaxPackets:               2386092,
+		EstimatedMB:              estimatedMB,
+		TrackedMB:                trackedMB,
+		AvgBytesPerPacket:        avgBytesPerPacket,
+		MaxMB:                    s.maxMemoryMB,
 		Indexes: PacketStoreIndexes{
 			ByHash:           hashIdx,
 			ByObserver:       observerIdx,
 			ByNode:           nodeIdx,
 			AdvertByObserver: advertByObsCount,
 		},
+		HotStartupHours:        s.hotStartupHours,
+		BackgroundLoadComplete: s.backgroundLoadDone.Load(),
+		BackgroundLoadFailed:   s.backgroundLoadFailed.Load(),
+		BackgroundLoadProgress: s.backgroundLoadProgress.Load(),
 	}
 }
 
@@ -1348,9 +2011,9 @@ func (s *PacketStore) QueryMultiNodePackets(pubkeys []string, limit, offset int,
 			filtered = append(filtered, tx)
 		}
 	}
-	// Sort oldest-first to match pagination expectations (same as s.packets order).
+	// #1345: sort by ingest id, not first_seen (=rxTime).
 	sort.Slice(filtered, func(i, j int) bool {
-		return filtered[i].FirstSeen < filtered[j].FirstSeen
+		return filtered[i].ID < filtered[j].ID
 	})
 
 	total := len(filtered)
@@ -1401,7 +2064,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	if s.db.isV3 {
 		querySQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
-				o.id, obs.id, obs.name, o.direction,
+				o.id, obs.id, obs.name, COALESCE(obs.iata, ''), o.direction,
 				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRHCol + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
@@ -1411,10 +2074,11 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	} else {
 		querySQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
-				o.id, o.observer_id, o.observer_name, o.direction,
+				o.id, o.observer_id, o.observer_name, COALESCE(obs.iata, ''), o.direction,
 				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRHCol + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
+			LEFT JOIN observers obs ON obs.id = o.observer_id
 			WHERE t.id > ?
 			ORDER BY t.id ASC, o.timestamp DESC`
 	}
@@ -1428,14 +2092,14 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 
 	// Scan into temp structures
 	type tempRow struct {
-		txID                                                 int
-		rawHex, hash, firstSeen, decodedJSON                 string
-		routeType, payloadType                               *int
-		obsID                                                *int
-		observerID, observerName, direction, pathJSON, obsTS string
-		obsRawHex                                            string
-		snr, rssi                                            *float64
-		score                                                *int
+		txID                                                               int
+		rawHex, hash, firstSeen, decodedJSON                               string
+		routeType, payloadType                                             *int
+		obsID                                                              *int
+		observerID, observerName, observerIATA, direction, pathJSON, obsTS string
+		obsRawHex                                                          string
+		snr, rssi                                                          *float64
+		score                                                              *int
 	}
 
 	var tempRows []tempRow
@@ -1447,14 +2111,14 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		var rawHex, hash, firstSeen, decodedJSON sql.NullString
 		var routeType, payloadType, payloadVersion sql.NullInt64
 		var obsIDVal sql.NullInt64
-		var observerID, observerName, direction, pathJSON, obsTimestamp sql.NullString
+		var observerID, observerName, observerIATA, direction, pathJSON, obsTimestamp sql.NullString
 		var snrVal, rssiVal sql.NullFloat64
 		var scoreVal sql.NullInt64
 		var obsRawHex sql.NullString
 
 		scanArgs2 := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
 			&payloadVersion, &decodedJSON,
-			&obsIDVal, &observerID, &observerName, &direction,
+			&obsIDVal, &observerID, &observerName, &observerIATA, &direction,
 			&snrVal, &rssiVal, &scoreVal, &pathJSON, &obsTimestamp}
 		if s.db.hasObsRawHex {
 			scanArgs2 = append(scanArgs2, &obsRawHex)
@@ -1481,6 +2145,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 			payloadType:  nullIntPtr(payloadType),
 			observerID:   nullStrVal(observerID),
 			observerName: nullStrVal(observerName),
+			observerIATA: nullStrVal(observerIATA),
 			direction:    nullStrVal(direction),
 			pathJSON:     nullStrVal(pathJSON),
 			obsTS:        nullStrVal(obsTimestamp),
@@ -1512,6 +2177,9 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	// Hoist getCachedNodesAndPM() once before the observation loop to avoid
 	// per-observation function calls (review item #1).
 	_, cachedPM := s.getCachedNodesAndPM()
+	// Hoist atomic graph.Load() out of the per-row loop too (PR #1208
+	// carmack #1) — one Load per ingest call, not one per row.
+	cachedGraph := s.graph.Load()
 
 	// Decode-window tracking: resolved pubkeys per-tx for touchRelayLastSeen,
 	// and resolved paths per-obs for broadcast/persist.
@@ -1580,6 +2248,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 				TransmissionID: r.txID,
 				ObserverID:     r.observerID,
 				ObserverName:   r.observerName,
+				ObserverIATA:   r.observerIATA,
 				Direction:      r.direction,
 				SNR:            r.snr,
 				RSSI:           r.rssi,
@@ -1594,24 +2263,15 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 			var resolvedPubkeys []string
 			var rpForBroadcast []*string
 			if r.pathJSON != "" && r.pathJSON != "[]" && cachedPM != nil {
-				rpForBroadcast = resolvePathForObs(r.pathJSON, r.observerID, tx, cachedPM, s.graph)
+				rpForBroadcast = resolvePathForObs(r.pathJSON, r.observerID, tx, cachedPM, cachedGraph)
 				resolvedPubkeys = extractResolvedPubkeys(rpForBroadcast)
 				// Feed decode-window consumers: addToByNode + resolvedPubkeyIndex
 				for _, pk := range resolvedPubkeys {
 					s.addToByNode(tx, pk)
 				}
 				s.addToResolvedPubkeyIndex(tx.ID, resolvedPubkeys)
-				// byPathHop resolved-key entries
-				clear(hopsSeen)
-				for _, hop := range txGetParsedPath(tx) {
-					hopsSeen[strings.ToLower(hop)] = true
-				}
-				for _, pk := range resolvedPubkeys {
-					if !hopsSeen[pk] {
-						hopsSeen[pk] = true
-						s.byPathHop[pk] = append(s.byPathHop[pk], tx)
-					}
-				}
+				// byPathHop resolved-key entries (#1164: helper invalidates relay stats cache).
+				s.addResolvedPubkeysToPathHopIndex(tx, resolvedPubkeys, hopsSeen)
 			}
 			// Stash rpForBroadcast for later broadcast/persist (keyed by obs ID)
 			if rpForBroadcast != nil {
@@ -1667,6 +2327,9 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		}
 		addTxToPathHopIndex(s.byPathHop, tx)
 	}
+	if len(broadcastTxs) > 0 {
+		s.invalidateRelayStatsCache()
+	}
 
 	// Incrementally update precomputed distance index with new transmissions
 	if len(broadcastTxs) > 0 {
@@ -1680,16 +2343,13 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 				repeaterSet[n.PublicKey] = true
 			}
 		}
-		hopCache := make(map[string]*nodeInfo)
-		resolveHop := func(hop string) *nodeInfo {
-			if cached, ok := hopCache[hop]; ok {
-				return cached
-			}
-			r, _, _ := pm.resolveWithContext(hop, nil, s.graph)
-			hopCache[hop] = r
-			return r
-		}
+		// Per-tx hop resolver: cache reused across txs, context rebound per
+		// tx via setContext (#1197 perf fix).
+		resolveHop, setContext := s.hopResolverPerTx(pm)
 		for _, tx := range broadcastTxs {
+			// Per-tx context (sender + observer + unambiguous-prefix anchors)
+			// so resolveWithContext tiers 1 and 2 light up. See #1197.
+			setContext(buildHopContextPubkeys(tx, pm))
 			txHops, txPath := computeDistancesForTx(tx, nodeByPk, repeaterSet, resolveHop)
 			if len(txHops) > 0 {
 				s.distHops = append(s.distHops, txHops...)
@@ -1783,38 +2443,13 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		s.invalidateCachesFor(inv)
 	}
 
-	// Persist resolved paths and neighbor edges asynchronously (don't block ingest).
-	if len(broadcastTxs) > 0 && s.db != nil {
-		dbPath := s.db.path
-		var obsUpdates []persistObsUpdate
-		var edgeUpdates []persistEdgeUpdate
-
-		_, pm := s.getCachedNodesAndPM()
-		// Read graph ref under lock (it's set during startup and not replaced after,
-		// but reading under lock is safer — review item #5).
-		graphRef := s.graph
-		for _, tx := range broadcastTxs {
-			for _, obs := range tx.Observations {
-				// Use decode-window resolved path for persist
-				if broadcastRP != nil {
-					if rp, ok := broadcastRP[obs.ID]; ok && rp != nil {
-						rpJSON := marshalResolvedPath(rp)
-						if rpJSON != "" {
-							obsUpdates = append(obsUpdates, persistObsUpdate{obs.ID, rpJSON})
-						}
-					}
-				}
-				for _, ec := range extractEdgesFromObs(obs, tx, pm) {
-					edgeUpdates = append(edgeUpdates, persistEdgeUpdate{ec.A, ec.B, ec.Timestamp})
-					if graphRef != nil {
-						graphRef.upsertEdge(ec.A, ec.B, "", obs.ObserverID, obs.SNR, parseTimestamp(ec.Timestamp))
-					}
-				}
-			}
-		}
-
-		asyncPersistResolvedPathsAndEdges(dbPath, obsUpdates, edgeUpdates, "persist")
-	}
+		// Per #1287 (Option 4): the server NEVER writes to the DB and
+	// NEVER mutates the in-memory neighbor graph incrementally. The
+	// ingestor owns neighbor_edges; recompNeighborGraph re-reads the
+	// snapshot every 60s and atomic-swaps it into s.graph. We also no
+	// longer persist resolved_path here — the ingestor (which already
+	// sees every observation) owns that write too.
+	_ = broadcastRP // resolved path is still computed in-memory (above) for live broadcast; no SQL write.
 
 	return result, newMaxID
 }
@@ -1833,7 +2468,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 		obsRHCol2 = ", o.raw_hex"
 	}
 	if s.db.isV3 {
-		querySQL = `SELECT o.id, o.transmission_id, obs.id, obs.name, o.direction,
+		querySQL = `SELECT o.id, o.transmission_id, obs.id, obs.name, COALESCE(obs.iata, ''), o.direction,
 				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRHCol2 + `
 			FROM observations o
 			LEFT JOIN observers obs ON obs.rowid = o.observer_idx
@@ -1841,9 +2476,10 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 			ORDER BY o.id ASC
 			LIMIT ?`
 	} else {
-		querySQL = `SELECT o.id, o.transmission_id, o.observer_id, o.observer_name, o.direction,
+		querySQL = `SELECT o.id, o.transmission_id, o.observer_id, o.observer_name, COALESCE(obs.iata, ''), o.direction,
 				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRHCol2 + `
 			FROM observations o
+			LEFT JOIN observers obs ON obs.id = o.observer_id
 			WHERE o.id > ?
 			ORDER BY o.id ASC
 			LIMIT ?`
@@ -1861,6 +2497,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 		txID         int
 		observerID   string
 		observerName string
+		observerIATA string
 		direction    string
 		snr, rssi    *float64
 		score        *int
@@ -1872,12 +2509,12 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 	var obsRows []obsRow
 	for rows.Next() {
 		var oid, txID int
-		var observerID, observerName, direction, pathJSON, ts sql.NullString
+		var observerID, observerName, observerIATA, direction, pathJSON, ts sql.NullString
 		var snr, rssi sql.NullFloat64
 		var score sql.NullInt64
 		var obsRawHex sql.NullString
 
-		scanArgs3 := []interface{}{&oid, &txID, &observerID, &observerName, &direction,
+		scanArgs3 := []interface{}{&oid, &txID, &observerID, &observerName, &observerIATA, &direction,
 			&snr, &rssi, &score, &pathJSON, &ts}
 		if s.db.hasObsRawHex {
 			scanArgs3 = append(scanArgs3, &obsRawHex)
@@ -1891,6 +2528,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 			txID:         txID,
 			observerID:   nullStrVal(observerID),
 			observerName: nullStrVal(observerName),
+			observerIATA: nullStrVal(observerIATA),
 			direction:    nullStrVal(direction),
 			snr:          nullFloatPtr(snr),
 			rssi:         nullFloatPtr(rssi),
@@ -1917,7 +2555,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 
 	// Hoist getCachedNodesAndPM() before the loop — same pattern as IngestNewFromDB (review fix #1).
 	_, pm := s.getCachedNodesAndPM()
-	graphRef := s.graph
+	graphRef := s.graph.Load()
 
 	hopsSeen := make(map[string]bool) // reused across observations; cleared per use
 
@@ -1947,6 +2585,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 			TransmissionID: r.txID,
 			ObserverID:     r.observerID,
 			ObserverName:   r.observerName,
+			ObserverIATA:   r.observerIATA,
 			Direction:      r.direction,
 			SNR:            r.snr,
 			RSSI:           r.rssi,
@@ -1961,23 +2600,14 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 		var obsResolvedPath []*string
 		if r.pathJSON != "" && r.pathJSON != "[]" {
 			if pm != nil {
-				obsResolvedPath = resolvePathForObs(r.pathJSON, r.observerID, tx, pm, s.graph)
+				obsResolvedPath = resolvePathForObs(r.pathJSON, r.observerID, tx, pm, graphRef)
 				pks := extractResolvedPubkeys(obsResolvedPath)
 				for _, pk := range pks {
 					s.addToByNode(tx, pk)
 				}
 				s.addToResolvedPubkeyIndex(tx.ID, pks)
-				// byPathHop resolved-key entries
-				clear(hopsSeen)
-				for _, hop := range txGetParsedPath(tx) {
-					hopsSeen[strings.ToLower(hop)] = true
-				}
-				for _, pk := range pks {
-					if !hopsSeen[pk] {
-						hopsSeen[pk] = true
-						s.byPathHop[pk] = append(s.byPathHop[pk], tx)
-					}
-				}
+				// byPathHop resolved-key entries (#1164: helper invalidates relay stats cache).
+				s.addResolvedPubkeysToPathHopIndex(tx, pks, hopsSeen)
 			}
 		}
 		// Stash for broadcast/persist
@@ -2070,6 +2700,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 	for _, tx := range updatedTxs {
 		pickBestObservation(tx)
 	}
+	pathHopMutated := false
 	for txID, tx := range updatedTxs {
 		if tx.PathJSON != oldPaths[txID] {
 			// Path changed — remove old subpaths, add new ones.
@@ -2097,7 +2728,12 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 				s.spTotalPaths++
 			}
 			addTxToPathHopIndex(s.byPathHop, tx)
+			// #1164: coalesce — one invalidate after the loop, not per-tx.
+			pathHopMutated = true
 		}
+	}
+	if pathHopMutated {
+		s.invalidateRelayStatsCache()
 	}
 
 	// Check if any paths changed (used for distance update and cache invalidation).
@@ -2123,38 +2759,14 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 		})
 	}
 
-	// Persist resolved paths and neighbor edges asynchronously (review fix #3).
-	// Only process NEW observations — not all observations of each updated tx —
-	// to avoid edge count inflation and unnecessary UPDATEs for pre-existing data.
-	if len(newObs) > 0 && s.db != nil {
-		dbPath := s.db.path
-		var obsUpdates []persistObsUpdate
-		var edgeUpdates []persistEdgeUpdate
-
-		for _, obs := range newObs {
-			tx := s.byTxID[obs.TransmissionID]
-			if tx == nil {
-				continue
-			}
-			// Use decode-window resolved path for persist
-			if obsRPMap != nil {
-				if rp, ok := obsRPMap[obs.ID]; ok && rp != nil {
-					rpJSON := marshalResolvedPath(rp)
-					if rpJSON != "" {
-						obsUpdates = append(obsUpdates, persistObsUpdate{obs.ID, rpJSON})
-					}
-				}
-			}
-			for _, ec := range extractEdgesFromObs(obs, tx, pm) {
-				edgeUpdates = append(edgeUpdates, persistEdgeUpdate{ec.A, ec.B, ec.Timestamp})
-				if graphRef != nil {
-					graphRef.upsertEdge(ec.A, ec.B, "", obs.ObserverID, obs.SNR, parseTimestamp(ec.Timestamp))
-				}
-			}
-		}
-
-		asyncPersistResolvedPathsAndEdges(dbPath, obsUpdates, edgeUpdates, "obs-persist")
-	}
+	// Per #1287 (Option 4): server never writes to the DB and never
+	// mutates the in-memory neighbor graph incrementally — the
+	// ingestor owns both. recompNeighborGraph re-reads the snapshot
+	// every 60s and atomic-swaps into s.graph.
+	_ = obsRPMap // resolved path stays in-memory for broadcast; no SQL write.
+	_ = newObs
+	_ = pm
+	_ = graphRef
 
 	return broadcastMaps
 }
@@ -2179,7 +2791,7 @@ func (s *PacketStore) MaxObservationID() int {
 func (s *PacketStore) filterPackets(q PacketQuery) []*StoreTx {
 	// Fast path: single-key index lookups
 	if q.Hash != "" && q.Type == nil && q.Route == nil && q.Observer == "" &&
-		q.Region == "" && q.Node == "" && q.Channel == "" && q.Since == "" && q.Until == "" {
+		q.Region == "" && q.Area == "" && q.Node == "" && q.Channel == "" && q.Since == "" && q.Until == "" {
 		h := strings.ToLower(q.Hash)
 		tx := s.byHash[h]
 		if tx == nil {
@@ -2188,7 +2800,7 @@ func (s *PacketStore) filterPackets(q PacketQuery) []*StoreTx {
 		return []*StoreTx{tx}
 	}
 	if q.Observer != "" && q.Type == nil && q.Route == nil &&
-		q.Region == "" && q.Node == "" && q.Channel == "" && q.Hash == "" && q.Since == "" && q.Until == "" {
+		q.Region == "" && q.Area == "" && q.Node == "" && q.Channel == "" && q.Hash == "" && q.Since == "" && q.Until == "" {
 		return s.transmissionsForObserver(q.Observer, nil)
 	}
 
@@ -2234,6 +2846,12 @@ func (s *PacketStore) filterPackets(q PacketQuery) []*StoreTx {
 		}
 	}
 
+	// Pre-compute area node set.
+	var areaNodes map[string]bool
+	if q.Area != "" {
+		areaNodes = s.resolveAreaNodes(q.Area)
+	}
+
 	// Pre-compute node filter parameters.
 	var nodePK string
 	var nodeHashSet map[string]bool
@@ -2251,13 +2869,17 @@ func (s *PacketStore) filterPackets(q PacketQuery) []*StoreTx {
 	// filter is active and an index exists.
 	source := s.packets
 	if hasNode && !hasType && !hasRoute && q.Observer == "" &&
-		filterHash == "" && !hasSince && !hasUntil && q.Region == "" && filterChannel == "" {
+		filterHash == "" && !hasSince && !hasUntil && q.Region == "" && q.Area == "" && filterChannel == "" {
 		if indexed, ok := s.byNode[nodePK]; ok {
 			return indexed
 		}
 	}
 	// Single-pass filter: apply all predicates in one scan.
 	results := filterTxSlice(source, func(tx *StoreTx) bool {
+		// Data integrity: exclude legacy rows missing hash or timestamp (#871)
+		if tx.Hash == "" || tx.FirstSeen == "" {
+			return false
+		}
 		if hasType && (tx.PayloadType == nil || *tx.PayloadType != filterType) {
 			return false
 		}
@@ -2294,6 +2916,19 @@ func (s *PacketStore) filterPackets(q PacketQuery) []*StoreTx {
 				}
 			}
 			if !found {
+				return false
+			}
+		}
+		if areaNodes != nil {
+			// Only ADVERT packets carry the originator pubkey (public_key/pubKey).
+			// All other packet types (GRP_TXT, TXT_MSG, REQ, …) have encrypted
+			// senders so pk == "" and are excluded when an area filter is active.
+			d := tx.ParsedDecoded()
+			pk, _ := d["public_key"].(string)
+			if pk == "" {
+				pk, _ = d["pubKey"].(string)
+			}
+			if pk == "" || !areaNodes[pk] {
 				return false
 			}
 		}
@@ -2419,6 +3054,189 @@ func (s *PacketStore) fetchAndCacheRegionObs(region string) map[string]bool {
 	return m
 }
 
+// resolveAreaNodes returns a set of node pubkeys whose GPS coordinates fall
+// inside the named area polygon. Returns nil if the area key is not in config.
+// Results are cached per-key for 30 seconds. Uses its own RWMutex so callers
+// holding s.mu won't deadlock.
+func (s *PacketStore) resolveAreaNodes(areaKey string) map[string]bool {
+	if s.config == nil || s.config.Areas == nil {
+		return nil
+	}
+	entry, ok := s.config.Areas[areaKey]
+	if !ok {
+		return nil
+	}
+
+	// Fast path: serve from cache if the per-key TTL is still valid.
+	s.areaNodeMu.RLock()
+	if t, ok := s.areaNodeCacheTimes[areaKey]; ok && time.Since(t) < 30*time.Second {
+		m := s.areaNodeCache[areaKey]
+		s.areaNodeMu.RUnlock()
+		return m
+	}
+	s.areaNodeMu.RUnlock()
+
+	// Slow path: query the DB outside any lock, then write back under Lock.
+	pks, err := s.db.GetNodePubkeysInArea(entry)
+	var m map[string]bool
+	if err == nil && len(pks) > 0 {
+		m = make(map[string]bool, len(pks))
+		for _, pk := range pks {
+			m[pk] = true
+		}
+	}
+
+	s.areaNodeMu.Lock()
+	// Re-check in case another goroutine already refreshed while we queried.
+	if t, ok := s.areaNodeCacheTimes[areaKey]; !ok || time.Since(t) >= 30*time.Second {
+		s.areaNodeCache[areaKey] = m
+		s.areaNodeCacheTimes[areaKey] = time.Now()
+	} else {
+		m = s.areaNodeCache[areaKey]
+	}
+	s.areaNodeMu.Unlock()
+	return m
+}
+
+// iataMatchesRegion returns true if iata matches any of the comma-separated
+// region codes in regionParam. Comparison is case-insensitive and trim-tolerant.
+// Empty iata never matches; empty regionParam never matches.
+//
+// #804: shared helper used by analytics to attribute transmissions to a node's
+// HOME region (derived from observers that hear its zero-hop direct adverts)
+// rather than to the observer that happened to relay a packet.
+func iataMatchesRegion(iata, regionParam string) bool {
+	if iata == "" || regionParam == "" {
+		return false
+	}
+	codes := normalizeRegionCodes(regionParam)
+	if len(codes) == 0 {
+		return false
+	}
+	got := strings.TrimSpace(strings.ToUpper(iata))
+	if got == "" {
+		return false
+	}
+	for _, c := range codes {
+		if c == got {
+			return true
+		}
+	}
+	return false
+}
+
+// computeNodeHomeRegions returns a pubkey → IATA map deriving each node's
+// HOME region from zero-hop DIRECT adverts. A zero-hop direct advert is the
+// most authoritative location signal because the path byte is set locally on
+// the originating radio and the packet has not been relayed: the observer
+// that hears it is necessarily within direct RF range of the originator.
+//
+// When a node has zero-hop direct adverts heard by observers from multiple
+// regions, the most-frequently-observed region wins (geographic plurality).
+//
+// Caller must hold s.mu (read or write). Returns empty map (not nil) if no
+// observers are loaded or no zero-hop direct adverts have been seen.
+//
+// #804: feeds analytics region-attribution so a multi-byte repeater whose
+// flood adverts get relayed across regions is still attributed to its home.
+func (s *PacketStore) computeNodeHomeRegions() map[string]string {
+	// Build observer → IATA map. observers table is small (≪ packets), so a
+	// single DB read here is acceptable; resolveRegionObservers does similar.
+	obsIATA := make(map[string]string, 64)
+	if s.db != nil {
+		if observers, err := s.db.GetObservers(); err == nil {
+			for _, o := range observers {
+				if o.IATA != nil && *o.IATA != "" {
+					obsIATA[o.ID] = strings.TrimSpace(strings.ToUpper(*o.IATA))
+				}
+			}
+		}
+	}
+	if len(obsIATA) == 0 {
+		return map[string]string{}
+	}
+
+	// Tally zero-hop direct ADVERT region observations per pubkey.
+	type tally struct {
+		counts map[string]int
+	}
+	per := make(map[string]*tally, 256)
+
+	for _, tx := range s.packets {
+		if tx.RawHex == "" || len(tx.RawHex) < 4 {
+			continue
+		}
+		if tx.PayloadType == nil || *tx.PayloadType != PayloadADVERT {
+			continue
+		}
+		if tx.DecodedJSON == "" {
+			continue
+		}
+		header, err := strconv.ParseUint(tx.RawHex[:2], 16, 8)
+		if err != nil {
+			continue
+		}
+		routeType := header & 0x03
+		if routeType != uint64(RouteDirect) && routeType != uint64(RouteTransportDirect) {
+			continue
+		}
+		// Path byte index — for direct/transport-direct it's at offset 1
+		// (matches the analytics decoder's pathByteIdx logic).
+		if len(tx.RawHex) < 4 {
+			continue
+		}
+		pathByte, err := strconv.ParseUint(tx.RawHex[2:4], 16, 8)
+		if err != nil {
+			continue
+		}
+		hopCount := pathByte & 0x3F
+		if hopCount != 0 {
+			continue
+		}
+
+		var d map[string]interface{}
+		if json.Unmarshal([]byte(tx.DecodedJSON), &d) != nil {
+			continue
+		}
+		pk, _ := d["pubKey"].(string)
+		if pk == "" {
+			pk, _ = d["public_key"].(string)
+		}
+		if pk == "" {
+			continue
+		}
+
+		for _, obs := range tx.Observations {
+			iata := obsIATA[obs.ObserverID]
+			if iata == "" {
+				continue
+			}
+			t := per[pk]
+			if t == nil {
+				t = &tally{counts: map[string]int{}}
+				per[pk] = t
+			}
+			t.counts[iata]++
+		}
+	}
+
+	out := make(map[string]string, len(per))
+	for pk, t := range per {
+		var bestIATA string
+		bestCount := 0
+		for iata, n := range t.counts {
+			if n > bestCount || (n == bestCount && iata < bestIATA) {
+				bestCount = n
+				bestIATA = iata
+			}
+		}
+		if bestIATA != "" {
+			out[pk] = bestIATA
+		}
+	}
+	return out
+}
+
 // enrichObs returns a map with observation fields + transmission fields.
 func (s *PacketStore) enrichObs(obs *StoreObs) map[string]interface{} {
 	tx := s.byTxID[obs.TransmissionID]
@@ -2428,6 +3246,7 @@ func (s *PacketStore) enrichObs(obs *StoreObs) map[string]interface{} {
 		"timestamp":     strOrNil(obs.Timestamp),
 		"observer_id":   strOrNil(obs.ObserverID),
 		"observer_name": strOrNil(obs.ObserverName),
+		"observer_iata": strOrNil(obs.ObserverIATA),
 		"direction":     strOrNil(obs.Direction),
 		"snr":           floatPtrOrNil(obs.SNR),
 		"rssi":          floatPtrOrNil(obs.RSSI),
@@ -2472,6 +3291,7 @@ func txToMap(tx *StoreTx, includeObservations ...bool) map[string]interface{} {
 		"observation_count": tx.ObservationCount,
 		"observer_id":       strOrNil(tx.ObserverID),
 		"observer_name":     strOrNil(tx.ObserverName),
+		"observer_iata":     strOrNil(tx.ObserverIATA),
 		"snr":               floatPtrOrNil(tx.SNR),
 		"rssi":              floatPtrOrNil(tx.RSSI),
 		"path_json":         strOrNil(tx.PathJSON),
@@ -2491,6 +3311,7 @@ func txToMap(tx *StoreTx, includeObservations ...bool) map[string]interface{} {
 				"id":            o.ID,
 				"observer_id":   strOrNil(o.ObserverID),
 				"observer_name": strOrNil(o.ObserverName),
+				"observer_iata": strOrNil(o.ObserverIATA),
 				"snr":           floatPtrOrNil(o.SNR),
 				"rssi":          floatPtrOrNil(o.RSSI),
 				"path_json":     strOrNil(o.PathJSON),
@@ -2705,6 +3526,84 @@ func addTxToPathHopIndex(idx map[string][]*StoreTx, tx *StoreTx) {
 	}
 }
 
+// addTxToRelayTimeIndex records the relay timestamp for each resolved pubkey.
+// pubkeys is the pre-extracted list (use extractResolvedPubkeys on the decoded path).
+// Maintains sorted ascending order for O(log n) window queries.
+// Must be called with s.mu held (or during build before store is live).
+func addTxToRelayTimeIndex(idx map[string][]int64, firstSeen string, pubkeys []string) {
+	if len(pubkeys) == 0 {
+		return
+	}
+	ms, err := time.Parse(time.RFC3339, firstSeen)
+	if err != nil {
+		return
+	}
+	millis := ms.UnixMilli()
+	seen := make(map[string]bool, len(pubkeys))
+	for _, pk := range pubkeys {
+		pk = strings.ToLower(pk)
+		if pk == "" || seen[pk] {
+			continue
+		}
+		seen[pk] = true
+		slice := idx[pk]
+		i := sort.Search(len(slice), func(j int) bool { return slice[j] >= millis })
+		if i < len(slice) && slice[i] == millis {
+			continue // idempotent
+		}
+		slice = append(slice, 0)
+		copy(slice[i+1:], slice[i:])
+		slice[i] = millis
+		idx[pk] = slice
+	}
+}
+
+// removeFromRelayTimeIndex removes the relay timestamp for each resolved pubkey.
+// Inverse of addTxToRelayTimeIndex.
+func removeFromRelayTimeIndex(idx map[string][]int64, firstSeen string, pubkeys []string) {
+	if len(pubkeys) == 0 {
+		return
+	}
+	ms, err := time.Parse(time.RFC3339, firstSeen)
+	if err != nil {
+		return
+	}
+	millis := ms.UnixMilli()
+	seen := make(map[string]bool, len(pubkeys))
+	for _, pk := range pubkeys {
+		pk = strings.ToLower(pk)
+		if pk == "" || seen[pk] {
+			continue
+		}
+		seen[pk] = true
+		slice := idx[pk]
+		i := sort.Search(len(slice), func(j int) bool { return slice[j] >= millis })
+		if i < len(slice) && slice[i] == millis {
+			newSlice := make([]int64, 0, len(slice)-1)
+			newSlice = append(newSlice, slice[:i]...)
+			newSlice = append(newSlice, slice[i+1:]...)
+			idx[pk] = newSlice
+			if len(newSlice) == 0 {
+				delete(idx, pk)
+			}
+		}
+	}
+}
+
+// relayMetrics computes relay_count_1h, relay_count_24h, and last_relayed from a
+// sorted unix-millis slice. now is time.Now().UnixMilli(). O(log n).
+func relayMetrics(times []int64, now int64) (count1h, count24h int, lastRelayed string) {
+	if len(times) == 0 {
+		return 0, 0, ""
+	}
+	i1h := sort.Search(len(times), func(i int) bool { return times[i] >= now-3600000 })
+	i24h := sort.Search(len(times), func(i int) bool { return times[i] >= now-86400000 })
+	count1h = len(times) - i1h
+	count24h = len(times) - i24h
+	lastRelayed = time.UnixMilli(times[len(times)-1]).UTC().Format(time.RFC3339)
+	return
+}
+
 // removeTxFromPathHopIndex removes a transmission from all its raw path-hop index entries.
 // Resolved pubkey entries are cleaned up via removeFromResolvedPubkeyIndex.
 func removeTxFromPathHopIndex(idx map[string][]*StoreTx, tx *StoreTx) {
@@ -2720,6 +3619,48 @@ func removeTxFromPathHopIndex(idx map[string][]*StoreTx, tx *StoreTx) {
 			removeTxFromSlice(idx, key, tx)
 		}
 	}
+}
+
+// addResolvedPubkeysToPathHopIndex appends tx into byPathHop under each
+// resolved pubkey key that isn't already present as a raw hop. Mutating
+// byPathHop here MUST be paired with invalidateRelayStatsCache so the
+// cached batch relay stats don't go stale for up to relayStatsCacheTTL.
+// hopsSeen is a scratch map the caller can reuse across calls (it will
+// be cleared on entry).
+//
+// Must be called with s.mu held.
+func (s *PacketStore) addResolvedPubkeysToPathHopIndex(tx *StoreTx, pubkeys []string, hopsSeen map[string]bool) bool {
+	if len(pubkeys) == 0 {
+		return false
+	}
+	clear(hopsSeen)
+	for _, hop := range txGetParsedPath(tx) {
+		hopsSeen[strings.ToLower(hop)] = true
+	}
+	mutated := false
+	for _, pk := range pubkeys {
+		if !hopsSeen[pk] {
+			hopsSeen[pk] = true
+			s.byPathHop[pk] = append(s.byPathHop[pk], tx)
+			mutated = true
+		}
+	}
+	// Mutating byPathHop invalidates the batch relay-stats cache (#1164).
+	if mutated {
+		s.invalidateRelayStatsCache()
+	}
+	return mutated
+}
+
+// invalidateRelayStatsCache drops the cached batch relay-stats result so
+// the next call to GetRepeaterNodeStatsBatchCached recomputes from scratch.
+// Call this whenever byPathHop changes (add or remove). Safe to call while
+// holding s.mu — relayStatsCacheMu is never acquired while holding relayStatsCacheMu,
+// so there is no lock-ordering cycle.
+func (s *PacketStore) invalidateRelayStatsCache() {
+	s.relayStatsCacheMu.Lock()
+	s.relayStatsCache = nil
+	s.relayStatsCacheMu.Unlock()
 }
 
 // removeTxFromSlice removes tx from idx[key] by ID, deleting the key if empty.
@@ -2774,18 +3715,12 @@ func (s *PacketStore) updateDistanceIndexForTxs(txs []*StoreTx) {
 			repeaterSet[nd.PublicKey] = true
 		}
 	}
-	hopCache := make(map[string]*nodeInfo)
-	resolveHop := func(hop string) *nodeInfo {
-		if cached, ok := hopCache[hop]; ok {
-			return cached
-		}
-		r, _, _ := pm.resolveWithContext(hop, nil, s.graph)
-		hopCache[hop] = r
-		return r
-	}
-
+	// Per-tx hop resolver shared across the recompute loop (#1197 perf).
+	resolveHop, setContext := s.hopResolverPerTx(pm)
 	// Recompute distance records for each changed tx.
 	for _, tx := range txs {
+		// Per-tx context for hop disambiguation (#1197).
+		setContext(buildHopContextPubkeys(tx, pm))
 		txHops, txPath := computeDistancesForTx(tx, nodeByPk, repeaterSet, resolveHop)
 		if len(txHops) > 0 {
 			s.distHops = append(s.distHops, txHops...)
@@ -2810,20 +3745,14 @@ func (s *PacketStore) buildDistanceIndex() {
 		}
 	}
 
-	hopCache := make(map[string]*nodeInfo)
-	resolveHop := func(hop string) *nodeInfo {
-		if cached, ok := hopCache[hop]; ok {
-			return cached
-		}
-		r, _, _ := pm.resolveWithContext(hop, nil, s.graph)
-		hopCache[hop] = r
-		return r
-	}
-
 	hops := make([]distHopRecord, 0, len(s.packets))
 	paths := make([]distPathRecord, 0, len(s.packets)/2)
 
+	// Per-tx hop resolver shared across the per-tx loop (#1197 perf).
+	resolveHop, setContext := s.hopResolverPerTx(pm)
 	for _, tx := range s.packets {
+		// Per-tx context for hop disambiguation (#1197).
+		setContext(buildHopContextPubkeys(tx, pm))
 		txHops, txPath := computeDistancesForTx(tx, nodeByPk, repeaterSet, resolveHop)
 		if len(txHops) > 0 {
 			hops = append(hops, txHops...)
@@ -2946,7 +3875,7 @@ func (s *PacketStore) evictionCandidateTxIDs() []int {
 	}
 	cutoffIdx := 0
 	if s.retentionHours > 0 {
-		cutoff := time.Now().UTC().Add(-time.Duration(s.retentionHours*3600) * time.Second).Format(time.RFC3339)
+		cutoff := time.Now().UTC().Add(-time.Duration(s.retentionHours * float64(time.Hour))).Format(time.RFC3339)
 		for cutoffIdx < len(s.packets) && s.packets[cutoffIdx].FirstSeen < cutoff {
 			cutoffIdx++
 		}
@@ -3010,7 +3939,7 @@ func (s *PacketStore) evictStaleInternal(rpBatch map[int][]string) int {
 
 	// Time-based eviction: find how many packets from the head are too old
 	if s.retentionHours > 0 {
-		cutoff := time.Now().UTC().Add(-time.Duration(s.retentionHours*3600) * time.Second).Format(time.RFC3339)
+		cutoff := time.Now().UTC().Add(-time.Duration(s.retentionHours * float64(time.Hour))).Format(time.RFC3339)
 		for cutoffIdx < len(s.packets) && s.packets[cutoffIdx].FirstSeen < cutoff {
 			cutoffIdx++
 		}
@@ -3138,6 +4067,7 @@ func (s *PacketStore) evictStaleInternal(rpBatch map[int][]string) int {
 		// Remove from path-hop index
 		removeTxFromPathHopIndex(s.byPathHop, tx)
 	}
+	s.invalidateRelayStatsCache()
 
 	// Batch-remove from byObserver: single pass per affected observer slice
 	for obsID := range affectedObservers {
@@ -3283,6 +4213,161 @@ func (s *PacketStore) StartEvictionTicker() func() {
 }
 
 // computeDistancesForTx computes distance records for a single transmission.
+// buildHopContextPubkeys collects context pubkeys for hop disambiguation:
+// the originator/sender pubkey plus any unambiguous-prefix anchors in the
+// path (single-candidate prefixes — strong context). Used by callers of
+// pm.resolveWithContext to light up tiers 1 and 2 of the resolver. See #1197.
+//
+// Returned pubkeys are de-duplicated and lowercased.
+func buildHopContextPubkeys(tx *StoreTx, pm *prefixMap) []string {
+	if tx == nil || pm == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, 16)
+	out := make([]string, 0, 16)
+	add := func(pk string) {
+		if pk == "" {
+			return
+		}
+		l := strings.ToLower(pk)
+		if _, ok := seen[l]; ok {
+			return
+		}
+		seen[l] = struct{}{}
+		out = append(out, l)
+	}
+
+	// Sender / originator pubkey from decoded payload. Use the cached
+	// ParsedDecoded() (sync.Once-gated) instead of re-unmarshaling — the
+	// helper is hot (3 distance sites + analytics topology, all 30k+ tx
+	// loops). See #1197 (carmack/adversarial r1).
+	if dec := tx.ParsedDecoded(); dec != nil {
+		if pk, ok := dec["pubKey"].(string); ok {
+			add(pk)
+		}
+	}
+
+	// Observer pubkey, where available. ObserverID is the observers.id PRIMARY
+	// KEY from the MQTT topic — it is NOT guaranteed to be a node pubkey hex
+	// (some observers register with arbitrary string ids like "myobserver").
+	// Guard against polluting the context with non-pubkey strings: include
+	// only when it parses as hex AND is long enough to plausibly be a pubkey
+	// prefix. The full prefix-map lookup would also be acceptable, but the
+	// hex+length check is O(len) and avoids one map probe per tx on a hot
+	// path. See #1197 (adversarial r1 #4).
+	if obs := tx.ObserverID; obs != "" && len(obs) >= 4 && isHexLower(strings.ToLower(obs)) {
+		add(obs)
+	}
+
+	// Unambiguous-prefix anchors: any hop in the path whose prefix has exactly
+	// one candidate is a strong context signal.
+	for _, hop := range txGetParsedPath(tx) {
+		h := strings.ToLower(hop)
+		if cands, ok := pm.m[h]; ok && len(cands) == 1 {
+			add(cands[0].PublicKey)
+		}
+	}
+
+	return out
+}
+
+// isHexLower reports whether s consists only of [0-9a-f] (assumes already
+// lowercased by caller). Used to guard ObserverID before adding it to the
+// hop-disambiguation context, since ObserverID is a free-form observers.id
+// and may not be a node pubkey hex.
+func isHexLower(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// hasUpperASCII reports whether s contains any uppercase ASCII letter.
+// Used by resolveWithContext tier-1 to skip the strings.ToLower allocation
+// when the context pubkeys are already lowercased (the common case — see
+// buildHopContextPubkeys / buildAggregateHopContextPubkeys, which lowercase
+// on the way in). #1247.
+func hasUpperASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+// buildAggregateHopContextPubkeys gathers context across many txs for hot
+// loops that resolve hops outside any per-tx scope (subpath/topology
+// aggregations). Caller passes the slice of txs to consider; we union the
+// per-tx contexts with de-dup. Used by call sites that read from precomputed
+// indices (s.spIndex, s.spTxIndex) or that resolve user-supplied hops.
+//
+// Result is order-independent in semantics; iteration order is deterministic
+// only modulo Go's map iteration (acceptable — the resolver's tier-2 averages
+// GPS positions and tier-3 picks the lex-smallest pubkey on ties, so context
+// order does not affect the chosen candidate).
+func buildAggregateHopContextPubkeys(txs []*StoreTx, pm *prefixMap) []string {
+	if len(txs) == 0 || pm == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, 32)
+	var out []string
+	for _, tx := range txs {
+		for _, pk := range buildHopContextPubkeys(tx, pm) {
+			if _, ok := seen[pk]; ok {
+				continue
+			}
+			seen[pk] = struct{}{}
+			out = append(out, pk)
+		}
+	}
+	return out
+}
+
+// hopResolverPerTx returns (resolveHop, setContext). The cache is allocated
+// once and cleared between txs; setContext rebinds the per-tx context. Used
+// by all per-tx distance/topology loops to avoid 4× duplicate closure
+// definitions and per-tx map allocation. See #1197 (adversarial r1 #7,
+// carmack r1 #3).
+//
+// CONCURRENCY: NOT safe for concurrent use. The returned closures share
+// mutable captured state — `contextPubkeys` is reassigned by setContext and
+// read by resolveHop, and `hopCache` is mutated by both (resolveHop writes
+// on miss, setContext clears wholesale). Callers MUST invoke both functions
+// from a single goroutine for the lifetime of the (resolveHop, setContext)
+// pair. If a future caller fans out per-tx work across goroutines, allocate
+// a fresh resolver pair per goroutine. See #1199 item 4.
+func (s *PacketStore) hopResolverPerTx(pm *prefixMap) (resolveHop func(string) *nodeInfo, setContext func([]string)) {
+	hopCache := make(map[string]*nodeInfo, 16)
+	var contextPubkeys []string
+	// Hoist the atomic graph.Load() out of the per-hop closure body so we do
+	// one Load per resolver instance, not one per resolveHop call (PR #1208
+	// carmack #1). Pair (resolveHop, setContext) is documented single-
+	// goroutine, single-request scope — pinning the graph here matches that
+	// lifetime.
+	graph := s.graph.Load()
+	resolveHop = func(hop string) *nodeInfo {
+		if cached, ok := hopCache[hop]; ok {
+			return cached
+		}
+		r, _, _ := pm.resolveWithContext(hop, contextPubkeys, graph)
+		hopCache[hop] = r
+		return r
+	}
+	setContext = func(ctx []string) {
+		contextPubkeys = ctx
+		clear(hopCache)
+	}
+	return resolveHop, setContext
+}
+
 func computeDistancesForTx(tx *StoreTx, nodeByPk map[string]*nodeInfo, repeaterSet map[string]bool, resolveHop func(string) *nodeInfo) ([]distHopRecord, *distPathRecord) {
 	pathHops := txGetParsedPath(tx)
 	if len(pathHops) == 0 {
@@ -3478,7 +4563,13 @@ func (s *PacketStore) GetChannels(region string) []map[string]interface{} {
 		}
 		channelName := decoded.Channel
 		if channelName == "" {
-			channelName = "unknown"
+			// Issue #1373: encrypted-no-key packets decode with channel="".
+			// Previously we bucketed them under a literal "unknown" channel
+			// which then leaked into /api/channels as a ghost entry next to
+			// real channels (especially visible after the operator added a
+			// PSK client-side). Skip them — they belong in encrypted-channels
+			// analytics, not the user-facing channel list.
+			continue
 		}
 		ch := channelMap[channelName]
 		if ch == nil {
@@ -3508,6 +4599,51 @@ func (s *PacketStore) GetChannels(region string) []map[string]interface{} {
 			"hash": ch.Hash, "name": ch.Name,
 			"lastMessage": ch.LastMessage, "lastSender": ch.LastSender,
 			"messageCount": ch.MessageCount, "lastActivity": ch.LastActivity,
+		})
+	}
+
+	// #688: scan decoded message text for #hashtag mentions and surface any
+	// previously-unseen channel names as discovered channels. We dedup against
+	// channelMap (matched by name) so a channel that already has traffic does
+	// NOT also appear as discovered.
+	discovered := map[string]string{} // name -> lastActivity
+	for _, snap := range snapshots {
+		if !snap.hasRegion {
+			continue
+		}
+		var decoded decodedGrp
+		if json.Unmarshal([]byte(snap.decodedJSON), &decoded) != nil {
+			continue
+		}
+		if decoded.Type != "CHAN" || decoded.Text == "" {
+			continue
+		}
+		if hasGarbageChars(decoded.Text) {
+			continue
+		}
+		for _, tag := range extractHashtagsFromText(decoded.Text) {
+			// Skip if already a known/decoded channel (by name with or without '#').
+			bare := tag[1:]
+			if _, ok := channelMap[tag]; ok {
+				continue
+			}
+			if _, ok := channelMap[bare]; ok {
+				continue
+			}
+			if existing, ok := discovered[tag]; !ok || snap.firstSeen > existing {
+				discovered[tag] = snap.firstSeen
+			}
+		}
+	}
+	for name, lastActivity := range discovered {
+		channels = append(channels, map[string]interface{}{
+			"hash":         name,
+			"name":         name,
+			"lastMessage":  nil,
+			"lastSender":   nil,
+			"messageCount": 0,
+			"lastActivity": lastActivity,
+			"discovered":   true,
 		})
 	}
 
@@ -3716,6 +4852,19 @@ func (s *PacketStore) GetChannelMessages(channelHash string, limit, offset int, 
 
 			senderTs := decoded.SenderTimestamp
 
+			// Issue #1366: emit tx.LatestSeen (max observation timestamp,
+			// server UTC) as the rendered timestamp — NOT tx.FirstSeen,
+			// which stays pinned at the first-ever observation of a hash
+			// and lags reality for heartbeat-style retransmissions. Fall
+			// back to FirstSeen only when LatestSeen is empty (no obs).
+			// sender_timestamp from the decoded payload is NOT used as the
+			// rendered field: client RTCs are unreliable. It remains in
+			// the response for debug surfaces.
+			displayTs := tx.LatestSeen
+			if displayTs == "" {
+				displayTs = tx.FirstSeen
+			}
+
 			observers := []string{}
 			obsName := tx.ObserverName
 			if obsName == "" {
@@ -3729,7 +4878,8 @@ func (s *PacketStore) GetChannelMessages(channelHash string, limit, offset int, 
 				Data: map[string]interface{}{
 					"sender":           displaySender,
 					"text":             displayText,
-					"timestamp":        strOrNil(tx.FirstSeen),
+					"timestamp":        strOrNil(displayTs),
+					"first_seen":       strOrNil(tx.FirstSeen),
 					"sender_timestamp": senderTs,
 					"packetId":         tx.ID,
 					"packetHash":       strOrNil(tx.Hash),
@@ -3745,6 +4895,18 @@ func (s *PacketStore) GetChannelMessages(channelHash string, limit, offset int, 
 			msgOrder = append(msgOrder, dedupeKey)
 		}
 	}
+
+	// Issue #1366 follow-up: msgOrder is in tx insertion order
+	// (≈ FirstSeen ascending). Re-sort by the rendered timestamp field
+	// (= LatestSeen, set above) ascending, so the page tail = newest
+	// LatestSeen. Without this, a long-running heartbeat with old
+	// FirstSeen but fresh LatestSeen ends up at the head of msgOrder
+	// and gets sliced off by the tail selection below.
+	sort.SliceStable(msgOrder, func(i, j int) bool {
+		ti, _ := msgMap[msgOrder[i]].Data["timestamp"].(string)
+		tj, _ := msgMap[msgOrder[j]].Data["timestamp"].(string)
+		return ti < tj
+	})
 
 	total := len(msgOrder)
 	// Return latest messages (tail)
@@ -3768,9 +4930,34 @@ func (s *PacketStore) GetChannelMessages(channelHash string, limit, offset int, 
 }
 
 // GetAnalyticsChannels returns full channel analytics computed from in-memory packets.
-func (s *PacketStore) GetAnalyticsChannels(region string) map[string]interface{} {
+func (s *PacketStore) GetAnalyticsChannels(region, area string) map[string]interface{} {
+	return s.GetAnalyticsChannelsWithWindow(region, area, TimeWindow{})
+}
+
+// GetAnalyticsChannelsWithWindow returns channel analytics for the given region,
+// optionally bounded to a time window (issue #842). Zero TimeWindow = all data.
+func (s *PacketStore) GetAnalyticsChannelsWithWindow(region, area string, window TimeWindow) map[string]interface{} {
+	if region == "" && area == "" && window.IsZero() {
+		s.analyticsRecomputerMu.RLock()
+		rc := s.recompChannels
+		s.analyticsRecomputerMu.RUnlock()
+		if rc != nil {
+			if v := rc.Load(); v != nil {
+				if m, ok := v.(map[string]interface{}); ok {
+					s.cacheMu.Lock()
+					s.cacheHits++
+					s.cacheMu.Unlock()
+					return m
+				}
+			}
+		}
+	}
+	cacheKey := region + "|" + area
+	if !window.IsZero() {
+		cacheKey += "|" + window.CacheKey()
+	}
 	s.cacheMu.Lock()
-	if cached, ok := s.chanCache[region]; ok && time.Now().Before(cached.expiresAt) {
+	if cached, ok := s.chanCache[cacheKey]; ok && time.Now().Before(cached.expiresAt) {
 		s.cacheHits++
 		s.cacheMu.Unlock()
 		return cached.data
@@ -3778,16 +4965,48 @@ func (s *PacketStore) GetAnalyticsChannels(region string) map[string]interface{}
 	s.cacheMisses++
 	s.cacheMu.Unlock()
 
-	result := s.computeAnalyticsChannels(region)
+	result := s.computeAnalyticsChannels(region, area, window)
 
 	s.cacheMu.Lock()
-	s.chanCache[region] = &cachedResult{data: result, expiresAt: time.Now().Add(s.rfCacheTTL)}
+	s.chanCache[cacheKey] = &cachedResult{data: result, expiresAt: time.Now().Add(s.rfCacheTTL)}
 	s.cacheMu.Unlock()
 
 	return result
 }
 
-func (s *PacketStore) computeAnalyticsChannels(region string) map[string]interface{} {
+// channelNameMatchesHash validates that a decrypted channel name hashes to the
+// observed single-byte channel hash. This rejects rainbow-table mismatches where
+// an observer's lookup table incorrectly maps a hash byte to the wrong name.
+// Firmware invariant: channelHash = SHA256(SHA256("#name")[:16])[0]
+func channelNameMatchesHash(name string, hashStr string) bool {
+	expected, err := strconv.Atoi(hashStr)
+	if err != nil {
+		return false
+	}
+	chanName := name
+	if !strings.HasPrefix(chanName, "#") {
+		chanName = "#" + chanName
+	}
+	h1 := sha256.Sum256([]byte(chanName))
+	h2 := sha256.Sum256(h1[:16])
+	return int(h2[0]) == expected
+}
+
+// isPlaceholderName returns true if the name is a "chN" placeholder (not a real decrypted name).
+func isPlaceholderName(name string) bool {
+	if !strings.HasPrefix(name, "ch") {
+		return false
+	}
+	_, err := strconv.Atoi(name[2:])
+	return err == nil
+}
+
+func (s *PacketStore) computeAnalyticsChannels(region, area string, window TimeWindow) map[string]interface{} {
+	var areaNodes map[string]bool
+	if area != "" {
+		areaNodes = s.resolveAreaNodes(area)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -3836,6 +5055,9 @@ func (s *PacketStore) computeAnalyticsChannels(region string) map[string]interfa
 
 	grpTxts := s.byPayloadType[5]
 	for _, tx := range grpTxts {
+		if !window.Includes(tx.FirstSeen) {
+			continue
+		}
 		if regionObs != nil {
 			match := false
 			for _, obs := range tx.Observations {
@@ -3845,6 +5067,16 @@ func (s *PacketStore) computeAnalyticsChannels(region string) map[string]interfa
 				}
 			}
 			if !match {
+				continue
+			}
+		}
+		if areaNodes != nil {
+			d := tx.ParsedDecoded()
+			pk, _ := d["public_key"].(string)
+			if pk == "" {
+				pk, _ = d["pubKey"].(string)
+			}
+			if pk == "" || !areaNodes[pk] {
 				continue
 			}
 		}
@@ -3866,16 +5098,27 @@ func (s *PacketStore) computeAnalyticsChannels(region string) map[string]interfa
 			name = "ch" + hash
 		}
 		encrypted := decoded.Text == "" && decoded.Sender == ""
-		// Use hash as key for grouping (matches Node.js String(hash))
-		chKey := hash
-		if decoded.Type == "CHAN" && decoded.Channel != "" {
-			chKey = hash + "_" + decoded.Channel
+
+		// Bug #978 fix: validate channel name against hash to reject rainbow-table mismatches.
+		// If the claimed channel name doesn't hash to the observed channelHash byte, discard it.
+		if name != "" && name != "ch"+hash && !channelNameMatchesHash(name, hash) {
+			name = "ch" + hash
+			encrypted = true
 		}
+
+		// Bug #978 fix: always group by hash byte alone — same physical channel,
+		// regardless of which observer decrypted it.
+		chKey := hash
 
 		ch := channelMap[chKey]
 		if ch == nil {
 			ch = &chanInfo{Hash: hash, Name: name, Senders: map[string]bool{}, LastActivity: tx.FirstSeen, Encrypted: encrypted}
 			channelMap[chKey] = ch
+		} else {
+			// Upgrade bucket name: if current is placeholder and we have a validated decrypted name
+			if isPlaceholderName(ch.Name) && !isPlaceholderName(name) {
+				ch.Name = name
+			}
 		}
 		ch.Messages++
 		ch.LastActivity = tx.FirstSeen
@@ -3964,9 +5207,34 @@ func (s *PacketStore) computeAnalyticsChannels(region string) map[string]interfa
 }
 
 // GetAnalyticsRF returns full RF analytics computed from in-memory observations.
-func (s *PacketStore) GetAnalyticsRF(region string) map[string]interface{} {
+func (s *PacketStore) GetAnalyticsRF(region, area string) map[string]interface{} {
+	return s.GetAnalyticsRFWithWindow(region, area, TimeWindow{})
+}
+
+// GetAnalyticsRFWithWindow returns RF analytics bounded by an optional
+// time window (issue #842). Zero TimeWindow = all data (backwards compatible).
+func (s *PacketStore) GetAnalyticsRFWithWindow(region, area string, window TimeWindow) map[string]interface{} {
+	if region == "" && area == "" && window.IsZero() {
+		s.analyticsRecomputerMu.RLock()
+		rc := s.recompRF
+		s.analyticsRecomputerMu.RUnlock()
+		if rc != nil {
+			if v := rc.Load(); v != nil {
+				if m, ok := v.(map[string]interface{}); ok {
+					s.cacheMu.Lock()
+					s.cacheHits++
+					s.cacheMu.Unlock()
+					return m
+				}
+			}
+		}
+	}
+	cacheKey := region + "|" + area
+	if !window.IsZero() {
+		cacheKey += "|" + window.CacheKey()
+	}
 	s.cacheMu.Lock()
-	if cached, ok := s.rfCache[region]; ok && time.Now().Before(cached.expiresAt) {
+	if cached, ok := s.rfCache[cacheKey]; ok && time.Now().Before(cached.expiresAt) {
 		s.cacheHits++
 		s.cacheMu.Unlock()
 		return cached.data
@@ -3974,16 +5242,21 @@ func (s *PacketStore) GetAnalyticsRF(region string) map[string]interface{} {
 	s.cacheMisses++
 	s.cacheMu.Unlock()
 
-	result := s.computeAnalyticsRF(region)
+	result := s.computeAnalyticsRF(region, area, window)
 
 	s.cacheMu.Lock()
-	s.rfCache[region] = &cachedResult{data: result, expiresAt: time.Now().Add(s.rfCacheTTL)}
+	s.rfCache[cacheKey] = &cachedResult{data: result, expiresAt: time.Now().Add(s.rfCacheTTL)}
 	s.cacheMu.Unlock()
 
 	return result
 }
 
-func (s *PacketStore) computeAnalyticsRF(region string) map[string]interface{} {
+func (s *PacketStore) computeAnalyticsRF(region, area string, window TimeWindow) map[string]interface{} {
+	var areaNodes map[string]bool
+	if area != "" {
+		areaNodes = s.resolveAreaNodes(area)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -4022,8 +5295,21 @@ func (s *PacketStore) computeAnalyticsRF(region string) map[string]interface{} {
 		for obsID := range regionObs {
 			obsList := s.byObserver[obsID]
 			for _, obs := range obsList {
+				if !window.Includes(obs.Timestamp) {
+					continue
+				}
 				totalObs++
 				tx := s.byTxID[obs.TransmissionID]
+				if areaNodes != nil && tx != nil {
+					d := tx.ParsedDecoded()
+					pk, _ := d["public_key"].(string)
+					if pk == "" {
+						pk, _ = d["pubKey"].(string)
+					}
+					if pk == "" || !areaNodes[pk] {
+						continue
+					}
+				}
 				hash := ""
 				if tx != nil {
 					hash = tx.Hash
@@ -4107,6 +5393,22 @@ func (s *PacketStore) computeAnalyticsRF(region string) map[string]interface{} {
 	} else {
 		// No region: iterate all transmissions and their observations
 		for _, tx := range s.packets {
+			// Window filter: skip transmissions outside the requested window.
+			// We use tx.FirstSeen as the bounding timestamp; per-obs window
+			// filter below handles cases where individual obs timestamps differ.
+			if !window.Includes(tx.FirstSeen) {
+				continue
+			}
+			if areaNodes != nil {
+				d := tx.ParsedDecoded()
+				pk, _ := d["public_key"].(string)
+				if pk == "" {
+					pk, _ = d["pubKey"].(string)
+				}
+				if pk == "" || !areaNodes[pk] {
+					continue
+				}
+			}
 			hash := tx.Hash
 			if hash != "" {
 				regionalHashes[hash] = true
@@ -4511,18 +5813,46 @@ func (s *PacketStore) computeAnalyticsRF(region string) map[string]interface{} {
 // --- Topology Analytics ---
 
 type nodeInfo struct {
-	PublicKey string
-	Name      string
-	Role      string
-	Lat       float64
-	Lon       float64
-	HasGPS    bool
+	PublicKey        string
+	Name             string
+	Role             string
+	Lat              float64
+	Lon              float64
+	HasGPS           bool
+	LastSeen         time.Time
+	ObservationCount int // count of advertisements/observations; used for tier-3 tiebreak in resolveWithContext
+}
+
+// schemaDegradationLogged is now a PacketStore field (see type definition) so
+// each store/test instance has a fresh dedupe set. Issue #1199 item 5: the
+// prior package-level sync.Map silently suppressed re-emission across tests.
+
+func (s *PacketStore) logSchemaDegradationOnce(msg string) {
+	if _, loaded := s.schemaDegradationLogged.LoadOrStore(msg, true); !loaded {
+		log.Printf("[store] schema-degradation: %s", msg)
+	}
 }
 
 func (s *PacketStore) getAllNodes() []nodeInfo {
-	rows, err := s.db.conn.Query("SELECT public_key, name, role, lat, lon FROM nodes")
+	// Schema probe: try richest → leanest. Logs a one-shot warning when we
+	// fall back to a thinner schema so operators see that a column is
+	// missing and the new tiebreak features are degraded. See #1197
+	// (adversarial r1 #10).
+	rows, err := s.db.conn.Query("SELECT public_key, name, role, lat, lon, last_seen, COALESCE(advert_count, 0) FROM nodes")
+	hasLastSeen := true
+	hasAdvertCount := true
 	if err != nil {
-		return nil
+		s.logSchemaDegradationOnce("nodes.advert_count missing — tier-3/4 ObservationCount tiebreak degraded; resolveWithContext will fall back to lex-pubkey order")
+		rows, err = s.db.conn.Query("SELECT public_key, name, role, lat, lon, last_seen FROM nodes")
+		hasAdvertCount = false
+		if err != nil {
+			s.logSchemaDegradationOnce("nodes.last_seen missing — node freshness signal unavailable")
+			rows, err = s.db.conn.Query("SELECT public_key, name, role, lat, lon FROM nodes")
+			hasLastSeen = false
+			if err != nil {
+				return nil
+			}
+		}
 	}
 	defer rows.Close()
 	var nodes []nodeInfo
@@ -4530,12 +5860,30 @@ func (s *PacketStore) getAllNodes() []nodeInfo {
 		var pk string
 		var name, role sql.NullString
 		var lat, lon sql.NullFloat64
-		rows.Scan(&pk, &name, &role, &lat, &lon)
+		var lastSeen sql.NullString
+		var advertCount sql.NullInt64
+		if hasAdvertCount {
+			rows.Scan(&pk, &name, &role, &lat, &lon, &lastSeen, &advertCount)
+		} else if hasLastSeen {
+			rows.Scan(&pk, &name, &role, &lat, &lon, &lastSeen)
+		} else {
+			rows.Scan(&pk, &name, &role, &lat, &lon)
+		}
 		n := nodeInfo{PublicKey: pk, Name: nullStrVal(name), Role: nullStrVal(role)}
 		if lat.Valid && lon.Valid {
 			n.Lat = lat.Float64
 			n.Lon = lon.Float64
 			n.HasGPS = !(n.Lat == 0 && n.Lon == 0)
+		}
+		if hasLastSeen && lastSeen.Valid && lastSeen.String != "" {
+			if t, err := time.Parse(time.RFC3339, lastSeen.String); err == nil {
+				n.LastSeen = t
+			} else if t, err := time.Parse("2006-01-02 15:04:05", lastSeen.String); err == nil {
+				n.LastSeen = t
+			}
+		}
+		if hasAdvertCount && advertCount.Valid {
+			n.ObservationCount = int(advertCount.Int64)
 		}
 		nodes = append(nodes, n)
 	}
@@ -4551,9 +5899,20 @@ type prefixMap struct {
 // entries to ~7×N (+ 1 full-key entry per node for exact-match lookups).
 const maxPrefixLen = 8
 
+// canAppearInPath returns true if the node's role allows it to appear as a
+// path hop.  Only repeaters, room servers, and rooms can forward packets;
+// companions and sensors originate but never relay.
+func canAppearInPath(role string) bool {
+	r := strings.ToLower(role)
+	return strings.Contains(r, "repeater") || strings.Contains(r, "room_server") || r == "room"
+}
+
 func buildPrefixMap(nodes []nodeInfo) *prefixMap {
 	pm := &prefixMap{m: make(map[string][]nodeInfo, len(nodes)*(maxPrefixLen+1))}
 	for _, n := range nodes {
+		if !canAppearInPath(n.Role) {
+			continue
+		}
 		pk := strings.ToLower(n.PublicKey)
 		maxLen := maxPrefixLen
 		if maxLen > len(pk) {
@@ -4623,12 +5982,27 @@ func (pm *prefixMap) resolve(hop string) *nodeInfo {
 
 // resolveWithContext resolves a hop prefix using the neighbor affinity graph
 // for disambiguation when multiple candidates match. It applies a 4-tier
-// priority: (1) affinity graph score, (2) geographic proximity to context
-// nodes, (3) GPS preference, (4) first match fallback.
+// priority:
+//
+//	(1) "neighbor_affinity"           — graph score vs context nodes,
+//	                                    requires affinity ≥3× runner-up and
+//	                                    affinityMinObservations
+//	(2) "geo_proximity"               — geographic proximity to GPS context
+//	                                    centroid (only fires when at least
+//	                                    one context node has GPS)
+//	(3) "gps_preference"              — among GPS-having candidates, pick
+//	                                    highest ObservationCount; lex-pubkey
+//	                                    tiebreak for determinism
+//	(4) "observation_count_fallback"  — no GPS available; pick highest
+//	                                    ObservationCount; lex-pubkey tiebreak
+//
+// (Pre-PR #1197/#1198 the tier-3 step was first-GPS-wins and tier-4 was
+// first-slice-element. Both now use observation count + lex tiebreak; the
+// returned method label was renamed accordingly.)
 //
 // contextPubkeys are pubkeys of nodes that provide context for disambiguation
 // (e.g., the originator, observer, or adjacent hops in the path).
-// graph may be nil, in which case it falls back to the existing resolve().
+// graph may be nil, in which case tier-1 is skipped.
 func (pm *prefixMap) resolveWithContext(hop string, contextPubkeys []string, graph *NeighborGraph) (*nodeInfo, string, float64) {
 	h := strings.ToLower(hop)
 	candidates := pm.m[h]
@@ -4648,6 +6022,16 @@ func (pm *prefixMap) resolveWithContext(hop string, contextPubkeys []string, gra
 	// highest-affinity candidate among them. Raw score is appropriate because
 	// it reflects both observation frequency and recency, which are the right
 	// signals for "which candidate is this hop most likely referring to."
+	//
+	// Issue #1229 (Option C): the raw score is further multiplied by
+	// e.Confidence() — a source-diversity factor in (0,1] derived from the
+	// number of distinct observers that contributed to the edge. Edges seen
+	// by a single observer are discounted to 1/3 weight; edges seen by ≥3
+	// observers saturate at full weight. This stacks with the geo-rejection
+	// filter merged for #1228 to give two independent lines of defense
+	// against cross-region prefix-collision pollution. Backward-compatible
+	// with the persistence format: legacy edges with empty Observers sets
+	// fall back to single-observer weight.
 	if graph != nil && len(contextPubkeys) > 0 {
 		type scored struct {
 			idx   int
@@ -4655,32 +6039,84 @@ func (pm *prefixMap) resolveWithContext(hop string, contextPubkeys []string, gra
 			count int // observation count of the best-scoring edge
 		}
 		now := time.Now()
-		var scores []scored
-		for i, cand := range candidates {
-			candPK := strings.ToLower(cand.PublicKey)
-			bestScore := 0.0
-			bestCount := 0
-			for _, ctxPK := range contextPubkeys {
-				edges := graph.Neighbors(strings.ToLower(ctxPK))
-				for _, e := range edges {
-					if e.Ambiguous {
-						continue
-					}
-					otherPK := e.NodeA
-					if strings.EqualFold(otherPK, ctxPK) {
-						otherPK = e.NodeB
-					}
-					if strings.EqualFold(otherPK, candPK) {
-						s := e.Score(now)
-						if s > bestScore {
-							bestScore = s
-							bestCount = e.Count
-						}
-					}
+		// PERF (#1247): hoist per-context work out of the candidate loop.
+		// The previous shape ran graph.Neighbors(ToLower(ctxPK)) and
+		// re-lowercased candPK on every (cand, ctxPK) pair, then used
+		// strings.EqualFold to compare two already-lowercased pubkeys.
+		// At analytics scale (5k+ contextPubkeys, ~30k resolveHop calls)
+		// this dominated computeAnalyticsTopology / computeAnalyticsRF
+		// CPU time (37% / 55% of those endpoints respectively per
+		// pprof). The new shape:
+		//   1. Lowercases ctx pubkeys at most once per call (skipped
+		//      entirely when the input is already lowercased — the
+		//      common case for analytics callers that go through
+		//      buildHopContextPubkeys).
+		//   2. Lowercases candidate pubkeys at most once per call and
+		//      uses raw == comparisons against NeighborEdge.NodeA/NodeB
+		//      (which makeEdgeKey already lowercases).
+		//   3. Loops outer-ctx / inner-edge / matched-cand-lookup. The
+		//      previous shape was outer-cand / inner-ctx / inner-edge,
+		//      which called graph.Neighbors(ctxPK) — taking the graph
+		//      RLock each time — once per (cand, ctx) pair instead of
+		//      once per ctx.
+		lowerCtx := contextPubkeys
+		needLower := false
+		for _, p := range contextPubkeys {
+			if hasUpperASCII(p) {
+				needLower = true
+				break
+			}
+		}
+		if needLower {
+			lowerCtx = make([]string, len(contextPubkeys))
+			for i, p := range contextPubkeys {
+				lowerCtx[i] = strings.ToLower(p)
+			}
+		}
+		candPKs := make([]string, len(candidates))
+		bestScores := make([]float64, len(candidates))
+		bestCounts := make([]int, len(candidates))
+		needLowerCand := false
+		for i, c := range candidates {
+			if hasUpperASCII(c.PublicKey) {
+				needLowerCand = true
+				break
+			}
+			candPKs[i] = c.PublicKey
+		}
+		if needLowerCand {
+			for i, c := range candidates {
+				candPKs[i] = strings.ToLower(c.PublicKey)
+			}
+		}
+		candByPK := make(map[string]int, len(candidates))
+		for i, pk := range candPKs {
+			candByPK[pk] = i
+		}
+		for _, ctxPK := range lowerCtx {
+			for _, e := range graph.Neighbors(ctxPK) {
+				if e.Ambiguous {
+					continue
+				}
+				otherPK := e.NodeA
+				if otherPK == ctxPK {
+					otherPK = e.NodeB
+				}
+				ci, ok := candByPK[otherPK]
+				if !ok {
+					continue
+				}
+				s := e.Score(now) * e.Confidence()
+				if s > bestScores[ci] {
+					bestScores[ci] = s
+					bestCounts[ci] = e.Count
 				}
 			}
-			if bestScore > 0 {
-				scores = append(scores, scored{i, bestScore, bestCount})
+		}
+		var scores []scored
+		for i, s := range bestScores {
+			if s > 0 {
+				scores = append(scores, scored{i, s, bestCounts[i]})
 			}
 		}
 
@@ -4740,15 +6176,48 @@ func (pm *prefixMap) resolveWithContext(hop string, contextPubkeys []string, gra
 		}
 	}
 
-	// Priority 3: GPS preference
+	// Priority 3: GPS preference. Among GPS-having candidates, prefer the one
+	// with the highest observation count (recent/active evidence) rather than
+	// slice/DB-insertion order. Ties on count are broken by lexicographically
+	// smallest PublicKey for full determinism. See #1197.
+	bestGPSIdx := -1
 	for i := range candidates {
-		if candidates[i].HasGPS {
-			return &candidates[i], "gps_preference", 0
+		if !candidates[i].HasGPS {
+			continue
+		}
+		if bestGPSIdx < 0 || betterByObsCount(&candidates[i], &candidates[bestGPSIdx]) {
+			bestGPSIdx = i
 		}
 	}
+	if bestGPSIdx >= 0 {
+		return &candidates[bestGPSIdx], "gps_preference", 0
+	}
 
-	// Priority 4: First match fallback
-	return &candidates[0], "first_match", 0
+	// Priority 4: Fallback — pick the candidate with the highest observation
+	// count (no GPS available on any candidate). Avoids slice-order
+	// arbitrariness. Ties on count are broken by lexicographically smallest
+	// PublicKey. Method label "observation_count_fallback" — the previous
+	// "first_match" was misleading after the tier-4 algorithm changed in
+	// PR #1198 (adversarial r1 #2).
+	bestIdx := 0
+	for i := 1; i < len(candidates); i++ {
+		if betterByObsCount(&candidates[i], &candidates[bestIdx]) {
+			bestIdx = i
+		}
+	}
+	return &candidates[bestIdx], "observation_count_fallback", 0
+}
+
+// betterByObsCount reports whether candidate a should beat b under the
+// tier-3/4 selection rule: higher ObservationCount wins; ties go to the
+// lexicographically smaller PublicKey for determinism. Pointer receivers
+// avoid value-copying nodeInfo (string + 2 floats + time.Time + int) on
+// the hot resolve path. See #1197 (adversarial r1 #6, carmack r1 #4).
+func betterByObsCount(a, b *nodeInfo) bool {
+	if a.ObservationCount != b.ObservationCount {
+		return a.ObservationCount > b.ObservationCount
+	}
+	return a.PublicKey < b.PublicKey
 }
 
 // geoDistApprox returns an approximate distance between two lat/lon points
@@ -4770,9 +6239,35 @@ func parsePathJSON(pathJSON string) []string {
 	return hops
 }
 
-func (s *PacketStore) GetAnalyticsTopology(region string) map[string]interface{} {
+func (s *PacketStore) GetAnalyticsTopology(region, area string) map[string]interface{} {
+	return s.GetAnalyticsTopologyWithWindow(region, area, TimeWindow{})
+}
+
+// GetAnalyticsTopologyWithWindow — see issue #842.
+// For default (region="", area="", zero window), prefer the steady-state
+// recomputer snapshot if registered (issue #1240).
+func (s *PacketStore) GetAnalyticsTopologyWithWindow(region, area string, window TimeWindow) map[string]interface{} {
+	if region == "" && area == "" && window.IsZero() {
+		s.analyticsRecomputerMu.RLock()
+		rc := s.recompTopology
+		s.analyticsRecomputerMu.RUnlock()
+		if rc != nil {
+			if v := rc.Load(); v != nil {
+				if m, ok := v.(map[string]interface{}); ok {
+					s.cacheMu.Lock()
+					s.cacheHits++
+					s.cacheMu.Unlock()
+					return m
+				}
+			}
+		}
+	}
+	cacheKey := region + "|" + area
+	if !window.IsZero() {
+		cacheKey += "|" + window.CacheKey()
+	}
 	s.cacheMu.Lock()
-	if cached, ok := s.topoCache[region]; ok && time.Now().Before(cached.expiresAt) {
+	if cached, ok := s.topoCache[cacheKey]; ok && time.Now().Before(cached.expiresAt) {
 		s.cacheHits++
 		s.cacheMu.Unlock()
 		return cached.data
@@ -4780,16 +6275,21 @@ func (s *PacketStore) GetAnalyticsTopology(region string) map[string]interface{}
 	s.cacheMisses++
 	s.cacheMu.Unlock()
 
-	result := s.computeAnalyticsTopology(region)
+	result := s.computeAnalyticsTopology(region, area, window)
 
 	s.cacheMu.Lock()
-	s.topoCache[region] = &cachedResult{data: result, expiresAt: time.Now().Add(s.rfCacheTTL)}
+	s.topoCache[cacheKey] = &cachedResult{data: result, expiresAt: time.Now().Add(s.rfCacheTTL)}
 	s.cacheMu.Unlock()
 
 	return result
 }
 
-func (s *PacketStore) computeAnalyticsTopology(region string) map[string]interface{} {
+func (s *PacketStore) computeAnalyticsTopology(region, area string, window TimeWindow) map[string]interface{} {
+	var areaNodes map[string]bool
+	if area != "" {
+		areaNodes = s.resolveAreaNodes(area)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -4800,28 +6300,15 @@ func (s *PacketStore) computeAnalyticsTopology(region string) map[string]interfa
 
 	allNodes, pm := s.getCachedNodesAndPM()
 	_ = allNodes // only pm is needed for topology
-	hopCache := make(map[string]*nodeInfo)
 
-	resolveHop := func(hop string) *nodeInfo {
-		if cached, ok := hopCache[hop]; ok {
-			return cached
-		}
-		r, _, _ := pm.resolveWithContext(hop, nil, s.graph)
-		hopCache[hop] = r
-		return r
-	}
-
-	hopCounts := map[int]int{}
-	var allHopsList []int
-	hopSnr := map[int][]float64{}
-	hopFreq := map[string]int{}
-	pairFreq := map[string]int{}
-	observerMap := map[string]string{} // observer_id → observer_name
-	perObserver := map[string]map[string]*struct{ minDist, maxDist, count int }{}
-
+	// Materialize the filtered tx slice ONCE — both the context-build pass
+	// and the main aggregation pass need the same window+region predicate.
+	// Two scans of s.packets re-running identical predicates is wasteful at
+	// the 30k+ packet hot-path scale (#1199 item 2). One filter, two passes
+	// over the result.
+	filteredTxs := make([]*StoreTx, 0, len(s.packets))
 	for _, tx := range s.packets {
-		hops := txGetParsedPath(tx)
-		if len(hops) == 0 {
+		if !window.Includes(tx.FirstSeen) {
 			continue
 		}
 		if regionObs != nil {
@@ -4836,6 +6323,72 @@ func (s *PacketStore) computeAnalyticsTopology(region string) map[string]interfa
 				continue
 			}
 		}
+		filteredTxs = append(filteredTxs, tx)
+	}
+
+	// Pre-pass: build the full hop-disambiguation context from all in-window
+	// txs BEFORE any resolveHop call. The earlier shape — populating
+	// contextPubkeys lazily during the main scan and reading it from a
+	// closure — was correct only because the current code never calls
+	// resolveHop inside the scan loop. A future maintainer who adds such a
+	// call inside the loop would silently get partial context AND a
+	// stale-cached result for any hop seen before the context grew. Two
+	// explicit passes remove the hazard. See #1197 (carmack/adversarial r1).
+	var contextPubkeys []string
+	{
+		seen := make(map[string]struct{}, 64)
+		for _, tx := range filteredTxs {
+			for _, pk := range buildHopContextPubkeys(tx, pm) {
+				if _, ok := seen[pk]; ok {
+					continue
+				}
+				seen[pk] = struct{}{}
+				contextPubkeys = append(contextPubkeys, pk)
+			}
+		}
+	}
+
+	hopCache := make(map[string]*nodeInfo)
+	graph := s.graph.Load() // hoist out of resolver closure (PR #1208 carmack #1)
+	resolveHop := func(hop string) *nodeInfo {
+		if cached, ok := hopCache[hop]; ok {
+			return cached
+		}
+		r, _, _ := pm.resolveWithContext(hop, contextPubkeys, graph)
+		hopCache[hop] = r
+		return r
+	}
+
+	hopCounts := map[int]int{}
+	var allHopsList []int
+	hopSnr := map[int][]float64{}
+	hopFreq := map[string]int{}
+	pairFreq := map[string]int{}
+	observerMap := map[string]string{} // observer_id → observer_name
+	perObserver := map[string]map[string]*struct{ minDist, maxDist, count int }{}
+
+	for _, tx := range filteredTxs {
+		hops := txGetParsedPath(tx)
+		if len(hops) == 0 {
+			continue
+		}
+
+		// Area filter: skip this tx entirely from hop-count stats if none of its
+		// hops belong to an area node — keeps hopCounts histogram consistent with
+		// hopFreq, which already filters per-hop.
+		if areaNodes != nil {
+			hasAreaHop := false
+			for _, h := range hops {
+				r := resolveHop(h)
+				if r != nil && areaNodes[r.PublicKey] {
+					hasAreaHop = true
+					break
+				}
+			}
+			if !hasAreaHop {
+				continue
+			}
+		}
 
 		n := len(hops)
 		hopCounts[n]++
@@ -4844,10 +6397,25 @@ func (s *PacketStore) computeAnalyticsTopology(region string) map[string]interfa
 			hopSnr[n] = append(hopSnr[n], *tx.SNR)
 		}
 		for _, h := range hops {
+			// Area filter: only count hops belonging to nodes in the area.
+			if areaNodes != nil {
+				r := resolveHop(h)
+				if r == nil || !areaNodes[r.PublicKey] {
+					continue
+				}
+			}
 			hopFreq[h]++
 		}
 		for i := 0; i < len(hops)-1; i++ {
 			a, b := hops[i], hops[i+1]
+			// Area filter: only count pairs where both nodes are in the area.
+			if areaNodes != nil {
+				rA := resolveHop(a)
+				rB := resolveHop(b)
+				if rA == nil || !areaNodes[rA.PublicKey] || rB == nil || !areaNodes[rB.PublicKey] {
+					continue
+				}
+			}
 			if a > b {
 				a, b = b, a
 			}
@@ -4862,6 +6430,12 @@ func (s *PacketStore) computeAnalyticsTopology(region string) map[string]interfa
 			perObserver[obsID] = map[string]*struct{ minDist, maxDist, count int }{}
 		}
 		for i, h := range hops {
+			if areaNodes != nil {
+				r := resolveHop(h)
+				if r == nil || !areaNodes[r.PublicKey] {
+					continue
+				}
+			}
 			dist := n - i
 			entry := perObserver[obsID][h]
 			if entry == nil {
@@ -4908,6 +6482,103 @@ func (s *PacketStore) computeAnalyticsTopology(region string) map[string]interfa
 	for _, v := range allHopsList {
 		if v > maxHops {
 			maxHops = v
+		}
+	}
+
+	// pmLookup resolves a hop hex string to its prefix-map candidates,
+	// applying the same truncation used during map construction.
+	pmLookup := func(hop string) []nodeInfo {
+		key := strings.ToLower(hop)
+		if len(key) > maxPrefixLen {
+			key = key[:maxPrefixLen]
+		}
+		return pm.m[key]
+	}
+
+	// --- Dedup pass: merge hop prefixes that resolve unambiguously to the same node ---
+	// Only merge when pm.m[hop] has exactly 1 candidate (unique_prefix).
+	// Ambiguous short prefixes (efiten's concern: 1-byte collisions) stay separate.
+	{
+		type dedupInfo struct {
+			totalCount int
+			longestHop string
+		}
+		byPubkey := map[string]*dedupInfo{} // pubkey → merged info
+		ambiguous := map[string]int{}       // hop → count (kept as-is)
+		for h, c := range hopFreq {
+			candidates := pmLookup(h)
+			if len(candidates) == 1 {
+				pk := strings.ToLower(candidates[0].PublicKey)
+				if info, ok := byPubkey[pk]; ok {
+					info.totalCount += c
+					if len(h) > len(info.longestHop) {
+						info.longestHop = h
+					}
+				} else {
+					byPubkey[pk] = &dedupInfo{totalCount: c, longestHop: h}
+				}
+			} else {
+				ambiguous[h] = c
+			}
+		}
+		// Rebuild hopFreq
+		hopFreq = make(map[string]int, len(byPubkey)+len(ambiguous))
+		for _, info := range byPubkey {
+			hopFreq[info.longestHop] = info.totalCount
+		}
+		for h, c := range ambiguous {
+			hopFreq[h] = c
+		}
+	}
+
+	// --- Dedup pass for pairs: merge by resolved pubkey pair ---
+	{
+		type pairDedupInfo struct {
+			totalCount int
+			longestA   string
+			longestB   string
+		}
+		byPubkeyPair := map[string]*pairDedupInfo{} // "pkA|pkB" (sorted) → merged info
+		ambiguousPairs := map[string]int{}
+		for p, c := range pairFreq {
+			parts := strings.SplitN(p, "|", 2)
+			candA := pmLookup(parts[0])
+			candB := pmLookup(parts[1])
+			if len(candA) == 1 && len(candB) == 1 {
+				pkA := strings.ToLower(candA[0].PublicKey)
+				pkB := strings.ToLower(candB[0].PublicKey)
+				// Canonicalize by sorted pubkey
+				if pkA > pkB {
+					pkA, pkB = pkB, pkA
+					parts[0], parts[1] = parts[1], parts[0]
+				}
+				key := pkA + "|" + pkB
+				if info, ok := byPubkeyPair[key]; ok {
+					info.totalCount += c
+					if len(parts[0]) > len(info.longestA) {
+						info.longestA = parts[0]
+					}
+					if len(parts[1]) > len(info.longestB) {
+						info.longestB = parts[1]
+					}
+				} else {
+					byPubkeyPair[key] = &pairDedupInfo{totalCount: c, longestA: parts[0], longestB: parts[1]}
+				}
+			} else {
+				ambiguousPairs[p] = c
+			}
+		}
+		// Rebuild pairFreq
+		pairFreq = make(map[string]int, len(byPubkeyPair)+len(ambiguousPairs))
+		for _, info := range byPubkeyPair {
+			a, b := info.longestA, info.longestB
+			if a > b {
+				a, b = b, a
+			}
+			pairFreq[a+"|"+b] = info.totalCount
+		}
+		for p, c := range ambiguousPairs {
+			pairFreq[p] = c
 		}
 	}
 
@@ -5141,9 +6812,29 @@ func haversineKm(lat1, lon1, lat2, lon2 float64) float64 {
 	return R * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 }
 
-func (s *PacketStore) GetAnalyticsDistance(region string) map[string]interface{} {
+// GetAnalyticsDistance returns the distance analytics map. For the
+// default (region="", area="") query, prefer the steady-state recomputer
+// snapshot if one is registered (issue #1240). Region/area-keyed variants
+// continue to use the legacy TTL cache + on-request compute.
+func (s *PacketStore) GetAnalyticsDistance(region, area string) map[string]interface{} {
+	if region == "" && area == "" {
+		s.analyticsRecomputerMu.RLock()
+		rc := s.recompDistance
+		s.analyticsRecomputerMu.RUnlock()
+		if rc != nil {
+			if v := rc.Load(); v != nil {
+				if m, ok := v.(map[string]interface{}); ok {
+					s.cacheMu.Lock()
+					s.cacheHits++
+					s.cacheMu.Unlock()
+					return m
+				}
+			}
+		}
+	}
+	cacheKey := region + "|" + area
 	s.cacheMu.Lock()
-	if cached, ok := s.distCache[region]; ok && time.Now().Before(cached.expiresAt) {
+	if cached, ok := s.distCache[cacheKey]; ok && time.Now().Before(cached.expiresAt) {
 		s.cacheHits++
 		s.cacheMu.Unlock()
 		return cached.data
@@ -5151,32 +6842,56 @@ func (s *PacketStore) GetAnalyticsDistance(region string) map[string]interface{}
 	s.cacheMisses++
 	s.cacheMu.Unlock()
 
-	result := s.computeAnalyticsDistance(region)
+	result := s.computeAnalyticsDistance(region, area)
 
 	s.cacheMu.Lock()
-	s.distCache[region] = &cachedResult{data: result, expiresAt: time.Now().Add(s.rfCacheTTL)}
+	s.distCache[cacheKey] = &cachedResult{data: result, expiresAt: time.Now().Add(s.rfCacheTTL)}
 	s.cacheMu.Unlock()
 
 	return result
 }
 
-func (s *PacketStore) computeAnalyticsDistance(region string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *PacketStore) computeAnalyticsDistance(region, area string) map[string]interface{} {
+	// #1239: hold s.mu.RLock() only long enough to (a) snapshot the
+	// distHops/distPaths slice headers and (b) build the region match
+	// set (which reads tx.Observations, a field mutated by ingest under
+	// s.mu.Lock). All filtering, sorting, deduping, histogram building
+	// and category stats run on locally-captured slices OUTSIDE the
+	// lock so concurrent ingest writers are not blocked by readers.
+	//
+	// Safety: snapshot slice headers are O(1). distHops/distPaths are
+	// append-only via re-slice in buildDistanceIndex / updateDistanceIndexForTxs
+	// under s.mu.Lock; if the backing array is reallocated after we
+	// release the RLock, our snapshot still points at the prior backing
+	// array (kept alive by GC) and observes the consistent length we
+	// captured. The distHopRecord / distPathRecord values themselves
+	// are value types (not pointers to live records) so we cannot read
+	// torn writes from them post-release.
 	var regionObs map[string]bool
 	if region != "" {
+		// resolveRegionObservers uses its own mutex (regionObsMu)
+		// and is safe to call without s.mu held.
 		regionObs = s.resolveRegionObservers(region)
 	}
+	var areaNodes map[string]bool
+	if area != "" {
+		areaNodes = s.resolveAreaNodes(area)
+	}
 
-	// Build region match set using precomputed tx pointers
+	s.mu.RLock()
+	hopsSnap := s.distHops
+	pathsSnap := s.distPaths
+
+	// Build region match set INSIDE the lock — touches tx.Observations
+	// (slice header mutated by ingest). For non-region calls (the common
+	// cold path) we skip this entirely and the RLock hold is microseconds.
 	var matchSet map[*StoreTx]bool
 	if regionObs != nil {
 		matchSet = make(map[*StoreTx]bool)
 		seen := make(map[*StoreTx]bool)
-		for i := range s.distHops {
-			tx := s.distHops[i].tx
-			if seen[tx] {
+		for i := range hopsSnap {
+			tx := hopsSnap[i].tx
+			if tx == nil || seen[tx] {
 				continue
 			}
 			seen[tx] = true
@@ -5187,9 +6902,9 @@ func (s *PacketStore) computeAnalyticsDistance(region string) map[string]interfa
 				}
 			}
 		}
-		for i := range s.distPaths {
-			tx := s.distPaths[i].tx
-			if seen[tx] {
+		for i := range pathsSnap {
+			tx := pathsSnap[i].tx
+			if tx == nil || seen[tx] {
 				continue
 			}
 			seen[tx] = true
@@ -5198,23 +6913,73 @@ func (s *PacketStore) computeAnalyticsDistance(region string) map[string]interfa
 					matchSet[tx] = true
 					break
 				}
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	// Everything below operates on hopsSnap / pathsSnap / matchSet —
+	// no s.mu, no s.distHops / s.distPaths access. Safe to run while
+	// ingest writers reallocate the underlying store-owned slices.
+
+	// Additionally filter matchSet by area nodes
+	if areaNodes != nil && matchSet != nil {
+		for tx := range matchSet {
+			d := tx.ParsedDecoded()
+			pk, _ := d["public_key"].(string)
+			if pk == "" {
+				pk, _ = d["pubKey"].(string)
+			}
+			if pk == "" || !areaNodes[pk] {
+				delete(matchSet, tx)
+			}
+		}
+	} else if areaNodes != nil {
+		// No region filter but area filter: build matchSet from area nodes
+		matchSet = make(map[*StoreTx]bool)
+		for i := range s.distHops {
+			tx := s.distHops[i].tx
+			if matchSet[tx] {
+				continue
+			}
+			d := tx.ParsedDecoded()
+			pk, _ := d["public_key"].(string)
+			if pk == "" {
+				pk, _ = d["pubKey"].(string)
+			}
+			if pk != "" && areaNodes[pk] {
+				matchSet[tx] = true
+			}
+		}
+		for i := range s.distPaths {
+			tx := s.distPaths[i].tx
+			if matchSet[tx] {
+				continue
+			}
+			d := tx.ParsedDecoded()
+			pk, _ := d["public_key"].(string)
+			if pk == "" {
+				pk, _ = d["pubKey"].(string)
+			}
+			if pk != "" && areaNodes[pk] {
+				matchSet[tx] = true
 			}
 		}
 	}
 
 	// Filter precomputed hop records (copy to avoid mutating precomputed data during sort)
-	filteredHops := make([]distHopRecord, 0, len(s.distHops))
-	for i := range s.distHops {
-		if matchSet == nil || matchSet[s.distHops[i].tx] {
-			filteredHops = append(filteredHops, s.distHops[i])
+	filteredHops := make([]distHopRecord, 0, len(hopsSnap))
+	for i := range hopsSnap {
+		if matchSet == nil || matchSet[hopsSnap[i].tx] {
+			filteredHops = append(filteredHops, hopsSnap[i])
 		}
 	}
 
 	// Filter precomputed path records
-	filteredPaths := make([]distPathRecord, 0, len(s.distPaths))
-	for i := range s.distPaths {
-		if matchSet == nil || matchSet[s.distPaths[i].tx] {
-			filteredPaths = append(filteredPaths, s.distPaths[i])
+	filteredPaths := make([]distPathRecord, 0, len(pathsSnap))
+	for i := range pathsSnap {
+		if matchSet == nil || matchSet[pathsSnap[i].tx] {
+			filteredPaths = append(filteredPaths, pathsSnap[i])
 		}
 	}
 
@@ -5391,9 +7156,25 @@ func (s *PacketStore) computeAnalyticsDistance(region string) map[string]interfa
 
 // --- Hash Sizes Analytics ---
 
-func (s *PacketStore) GetAnalyticsHashSizes(region string) map[string]interface{} {
+func (s *PacketStore) GetAnalyticsHashSizes(region, area string) map[string]interface{} {
+	if region == "" && area == "" {
+		s.analyticsRecomputerMu.RLock()
+		rc := s.recompHashSizes
+		s.analyticsRecomputerMu.RUnlock()
+		if rc != nil {
+			if v := rc.Load(); v != nil {
+				if m, ok := v.(map[string]interface{}); ok {
+					s.cacheMu.Lock()
+					s.cacheHits++
+					s.cacheMu.Unlock()
+					return m
+				}
+			}
+		}
+	}
+	cacheKey := region + "|" + area
 	s.cacheMu.Lock()
-	if cached, ok := s.hashCache[region]; ok && time.Now().Before(cached.expiresAt) {
+	if cached, ok := s.hashCache[cacheKey]; ok && time.Now().Before(cached.expiresAt) {
 		s.cacheHits++
 		s.cacheMu.Unlock()
 		return cached.data
@@ -5401,38 +7182,92 @@ func (s *PacketStore) GetAnalyticsHashSizes(region string) map[string]interface{
 	s.cacheMisses++
 	s.cacheMu.Unlock()
 
-	result := s.computeAnalyticsHashSizes(region)
-
-	// Add multi-byte capability data (only for unfiltered/global view)
-	if region == "" {
-		// Pass adopter hash sizes so capability can cross-reference
-		adopterHS := make(map[string]int)
-		if mbNodes, ok := result["multiByteNodes"].([]map[string]interface{}); ok {
-			for _, n := range mbNodes {
-				pk, _ := n["pubkey"].(string)
-				hs, _ := n["hashSize"].(int)
-				if pk != "" && hs >= 2 {
-					adopterHS[pk] = hs
-				}
-			}
-		}
-		result["multiByteCapability"] = s.computeMultiByteCapability(adopterHS)
-	}
+	result := s.computeAnalyticsHashSizesWithCapability(region, area)
 
 	s.cacheMu.Lock()
-	s.hashCache[region] = &cachedResult{data: result, expiresAt: time.Now().Add(s.rfCacheTTL)}
+	s.hashCache[cacheKey] = &cachedResult{data: result, expiresAt: time.Now().Add(s.rfCacheTTL)}
 	s.cacheMu.Unlock()
 
 	return result
 }
 
-func (s *PacketStore) computeAnalyticsHashSizes(region string) map[string]interface{} {
+// computeAnalyticsHashSizesWithCapability runs computeAnalyticsHashSizes
+// then layers in the multiByteCapability augmentation. Extracted so the
+// steady-state recomputer (issue #1240) produces the same shape as the
+// cached GetAnalyticsHashSizes call.
+func (s *PacketStore) computeAnalyticsHashSizesWithCapability(region, area string) map[string]interface{} {
+	result := s.computeAnalyticsHashSizes(region, area)
+	globalAdopterHS := make(map[string]int)
+	if region == "" {
+		if mbNodes, ok := result["multiByteNodes"].([]map[string]interface{}); ok {
+			for _, n := range mbNodes {
+				pk, _ := n["pubkey"].(string)
+				hs, _ := n["hashSize"].(int)
+				if pk != "" && hs >= 2 {
+					globalAdopterHS[pk] = hs
+				}
+			}
+		}
+	} else {
+		// Pull the global multiByteNodes set without the region/area filter.
+		// Use a separate compute call (not the cached path) to avoid
+		// recursive locking on hashCache and to keep this side-effect free.
+		globalRes := s.computeAnalyticsHashSizes("", "")
+		if mbNodes, ok := globalRes["multiByteNodes"].([]map[string]interface{}); ok {
+			for _, n := range mbNodes {
+				pk, _ := n["pubkey"].(string)
+				hs, _ := n["hashSize"].(int)
+				if pk != "" && hs >= 2 {
+					globalAdopterHS[pk] = hs
+				}
+			}
+		}
+	}
+	mbEntries := s.computeMultiByteCapability(globalAdopterHS)
+	result["multiByteCapability"] = mbEntries
+
+	// Build the O(1) lookup index OUTSIDE the cache lock — at Cascadia
+	// scale this is a ~2400-entry allocation + hash + insert per cycle.
+	// Holding cacheMu while doing it blocks every API reader for the
+	// duration. Swap the pointers in under a short write-lock.
+	mbIdx := make(map[string]MultiByteCapEntry, len(mbEntries))
+	for _, e := range mbEntries {
+		mbIdx[e.PublicKey] = e
+	}
+	s.cacheMu.Lock()
+	s.mbCapSnapshot = mbEntries
+	s.mbCapIndex = mbIdx
+	s.cacheMu.Unlock()
+	// Publish snapshot to the on-disk handoff so the ingestor can
+	// persist it (#1289/#1324: server is read-only; persistence is the
+	// ingestor's job). Best-effort — a write failure here does not
+	// affect serving (the in-memory index above is the read path).
+	s.publishMultibyteCapSnapshot(mbEntries)
+
+	return result
+}
+
+func (s *PacketStore) computeAnalyticsHashSizes(region, area string) map[string]interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var regionObs map[string]bool
 	if region != "" {
 		regionObs = s.resolveRegionObservers(region)
+	}
+	var areaNodes map[string]bool
+	if area != "" {
+		areaNodes = s.resolveAreaNodes(area)
+	}
+
+	// #804: derive each node's HOME region from zero-hop direct adverts (the
+	// most authoritative location signal — those packets cannot have been
+	// relayed). When non-empty, multi-byte node attribution prefers this
+	// over observer-region. Falls back to observer-region when unknown.
+	nodeHomeRegion := s.computeNodeHomeRegions()
+	attributionMethod := "observer"
+	if region != "" && len(nodeHomeRegion) > 0 {
+		attributionMethod = "repeater"
 	}
 
 	allNodes, pm := s.getCachedNodesAndPM()
@@ -5452,18 +7287,6 @@ func (s *PacketStore) computeAnalyticsHashSizes(region string) map[string]interf
 	for _, tx := range s.packets {
 		if tx.RawHex == "" {
 			continue
-		}
-		if regionObs != nil {
-			match := false
-			for _, obs := range tx.Observations {
-				if regionObs[obs.ObserverID] {
-					match = true
-					break
-				}
-			}
-			if !match {
-				continue
-			}
 		}
 
 		// Parse header and path byte
@@ -5494,52 +7317,89 @@ func (s *PacketStore) computeAnalyticsHashSizes(region string) map[string]interf
 			continue
 		}
 
-		// Track originator from advert packets (including zero-hop adverts,
-		// keyed by pubKey so same-name nodes don't merge).
+		// #804: pre-extract originator pubkey for ADVERT packets so we can
+		// (a) relax observer-region filter when the originator's HOME region
+		//     matches the requested region (a flood relay heard outside the
+		//     home region must still attribute to the home), and
+		// (b) reuse the parsed values below without re-parsing.
+		var advertPK, advertName string
+		var advertParsed bool
 		if tx.PayloadType != nil && *tx.PayloadType == PayloadADVERT && tx.DecodedJSON != "" {
 			var d map[string]interface{}
 			if json.Unmarshal([]byte(tx.DecodedJSON), &d) == nil {
-				pk := ""
 				if v, ok := d["pubKey"].(string); ok {
-					pk = v
+					advertPK = v
 				} else if v, ok := d["public_key"].(string); ok {
-					pk = v
+					advertPK = v
 				}
-				if pk != "" {
-					name := ""
-					if n, ok := d["name"].(string); ok {
-						name = n
-					}
-					if name == "" {
-						if len(pk) >= 8 {
-							name = pk[:8]
-						} else {
-							name = pk
-						}
-					}
-					// Skip zero-hop direct adverts for hash_size — the
-					// path byte is locally generated and unreliable.
-					// Still count the packet and update lastSeen.
-					isZeroHop := (routeType == uint64(RouteDirect) || routeType == uint64(RouteTransportDirect)) && (actualPathByte&0x3F) == 0
-					if byNode[pk] == nil {
-						role := nodeRoleByPK[pk] // empty if unknown
-						initHS := hashSize
-						if isZeroHop {
-							initHS = 0
-						}
-						byNode[pk] = map[string]interface{}{
-							"hashSize": initHS, "packets": 0,
-							"lastSeen": tx.FirstSeen, "name": name,
-							"role": role,
-						}
-					}
-					byNode[pk]["packets"] = byNode[pk]["packets"].(int) + 1
-					if !isZeroHop {
-						byNode[pk]["hashSize"] = hashSize
-					}
-					byNode[pk]["lastSeen"] = tx.FirstSeen
+				if n, ok := d["name"].(string); ok {
+					advertName = n
+				}
+				advertParsed = advertPK != ""
+			}
+		}
+
+		if regionObs != nil {
+			match := false
+			for _, obs := range tx.Observations {
+				if regionObs[obs.ObserverID] {
+					match = true
+					break
 				}
 			}
+			// #804: allow ADVERTs from a node whose HOME region matches the
+			// requested region even if no observer in that region heard this
+			// particular packet (e.g. flood relay heard only by an out-of-
+			// region observer). Conservative: only ADVERTs (the source is
+			// known by pubkey) and only when home is established.
+			if !match && advertParsed {
+				if home, ok := nodeHomeRegion[advertPK]; ok && iataMatchesRegion(home, region) {
+					match = true
+				}
+			}
+			if !match {
+				continue
+			}
+		}
+
+		// Area filter: skip ADVERT packets whose originator is not in the area.
+		if areaNodes != nil && advertParsed && !areaNodes[advertPK] {
+			continue
+		}
+
+		// Track originator from advert packets (including zero-hop adverts,
+		// keyed by pubKey so same-name nodes don't merge).
+		if advertParsed {
+			pk := advertPK
+			name := advertName
+			if name == "" {
+				if len(pk) >= 8 {
+					name = pk[:8]
+				} else {
+					name = pk
+				}
+			}
+			// Skip zero-hop direct adverts for hash_size — the
+			// path byte is locally generated and unreliable.
+			// Still count the packet and update lastSeen.
+			isZeroHop := (routeType == uint64(RouteDirect) || routeType == uint64(RouteTransportDirect)) && (actualPathByte&0x3F) == 0
+			if byNode[pk] == nil {
+				role := nodeRoleByPK[pk] // empty if unknown
+				initHS := hashSize
+				if isZeroHop {
+					initHS = 0
+				}
+				byNode[pk] = map[string]interface{}{
+					"hashSize": initHS, "packets": 0,
+					"lastSeen": tx.FirstSeen, "name": name,
+					"role": role,
+				}
+			}
+			byNode[pk]["packets"] = byNode[pk]["packets"].(int) + 1
+			if !isZeroHop {
+				byNode[pk]["hashSize"] = hashSize
+			}
+			byNode[pk]["lastSeen"] = tx.FirstSeen
 		}
 
 		// Distribution/hourly/uniqueHops only for packets with relay hops
@@ -5620,6 +7480,15 @@ func (s *PacketStore) computeAnalyticsHashSizes(region string) map[string]interf
 	// Multi-byte nodes
 	multiByteNodes := make([]map[string]interface{}, 0)
 	for pk, data := range byNode {
+		// #804: when a region filter is active, prefer the repeater's HOME
+		// region over the observer that happened to relay it. Falls back to
+		// the (already-applied) observer-region filter when the node's home
+		// region is unknown.
+		if region != "" {
+			if home, ok := nodeHomeRegion[pk]; ok && !iataMatchesRegion(home, region) {
+				continue
+			}
+		}
 		if data["hashSize"].(int) > 1 {
 			multiByteNodes = append(multiByteNodes, map[string]interface{}{
 				"name": data["name"], "hashSize": data["hashSize"],
@@ -5634,10 +7503,16 @@ func (s *PacketStore) computeAnalyticsHashSizes(region string) map[string]interf
 
 	// Distribution by repeaters: count unique REPEATER nodes per hash size
 	distributionByRepeaters := map[string]int{"1": 0, "2": 0, "3": 0}
-	for _, data := range byNode {
+	for pk, data := range byNode {
 		role, _ := data["role"].(string)
 		if !strings.Contains(strings.ToLower(role), "repeater") {
 			continue
+		}
+		// #804: same repeater-region preference as multiByteNodes.
+		if region != "" {
+			if home, ok := nodeHomeRegion[pk]; ok && !iataMatchesRegion(home, region) {
+				continue
+			}
 		}
 		hs := data["hashSize"].(int)
 		key := strconv.Itoa(hs)
@@ -5651,6 +7526,7 @@ func (s *PacketStore) computeAnalyticsHashSizes(region string) map[string]interf
 		"hourly":                  hourly,
 		"topHops":                 topHops,
 		"multiByteNodes":          multiByteNodes,
+		"attributionMethod":       attributionMethod,
 	}
 }
 
@@ -5666,9 +7542,25 @@ type hashSizeNodeInfo struct {
 
 // GetAnalyticsHashCollisions returns pre-computed hash collision analysis.
 // This moves the O(n²) distance computation from the frontend to the server.
-func (s *PacketStore) GetAnalyticsHashCollisions(region string) map[string]interface{} {
+func (s *PacketStore) GetAnalyticsHashCollisions(region, area string) map[string]interface{} {
+	if region == "" && area == "" {
+		s.analyticsRecomputerMu.RLock()
+		rc := s.recompHashCollisions
+		s.analyticsRecomputerMu.RUnlock()
+		if rc != nil {
+			if v := rc.Load(); v != nil {
+				if m, ok := v.(map[string]interface{}); ok {
+					s.cacheMu.Lock()
+					s.cacheHits++
+					s.cacheMu.Unlock()
+					return m
+				}
+			}
+		}
+	}
+	cacheKey := region + "|" + area
 	s.cacheMu.Lock()
-	if cached, ok := s.collisionCache[region]; ok && time.Now().Before(cached.expiresAt) {
+	if cached, ok := s.collisionCache[cacheKey]; ok && time.Now().Before(cached.expiresAt) {
 		s.cacheHits++
 		s.cacheMu.Unlock()
 		return cached.data
@@ -5676,10 +7568,10 @@ func (s *PacketStore) GetAnalyticsHashCollisions(region string) map[string]inter
 	s.cacheMisses++
 	s.cacheMu.Unlock()
 
-	result := s.computeHashCollisions(region)
+	result := s.computeHashCollisions(region, area)
 
 	s.cacheMu.Lock()
-	s.collisionCache[region] = &cachedResult{data: result, expiresAt: time.Now().Add(s.collisionCacheTTL)}
+	s.collisionCache[cacheKey] = &cachedResult{data: result, expiresAt: time.Now().Add(s.collisionCacheTTL)}
 	s.cacheMu.Unlock()
 
 	return result
@@ -5721,7 +7613,7 @@ type twoByteCellInfo struct {
 	CollisionCount  int                         `json:"collision_count"`
 }
 
-func (s *PacketStore) computeHashCollisions(region string) map[string]interface{} {
+func (s *PacketStore) computeHashCollisions(region, area string) map[string]interface{} {
 	// Get all nodes from DB
 	nodes := s.getAllNodes()
 	hashInfo := s.GetNodeHashSizeInfo()
@@ -5768,6 +7660,20 @@ func (s *PacketStore) computeHashCollisions(region string) map[string]interface{
 			filtered := make([]nodeInfo, 0, len(regionNodePKs))
 			for _, n := range nodes {
 				if regionNodePKs[n.PublicKey] {
+					filtered = append(filtered, n)
+				}
+			}
+			nodes = filtered
+		}
+	}
+
+	// If area is specified, filter to only nodes in the area
+	if area != "" {
+		areaNodes := s.resolveAreaNodes(area)
+		if areaNodes != nil {
+			filtered := make([]nodeInfo, 0, len(nodes))
+			for _, n := range nodes {
+				if areaNodes[n.PublicKey] {
 					filtered = append(filtered, n)
 				}
 			}
@@ -6127,6 +8033,108 @@ func EnrichNodeWithHashSize(node map[string]interface{}, info *hashSizeNodeInfo)
 	}
 }
 
+// EnrichNodeWithMultiByte adds multi-byte capability fields to a node map.
+func EnrichNodeWithMultiByte(node map[string]interface{}, entry *MultiByteCapEntry) {
+	if entry == nil {
+		return
+	}
+	node["multi_byte_status"] = entry.Status
+	node["multi_byte_evidence"] = entry.Evidence
+	node["multi_byte_max_hash_size"] = entry.MaxHashSize
+}
+
+// GetMultibyteCapFor returns the capability entry for a single pubkey via an O(1) map
+// lookup into the snapshot rebuilt by each analytics cycle (and pre-populated from
+// the DB on cold start). Returns false when the pubkey has no known capability.
+func (s *PacketStore) GetMultibyteCapFor(pk string) (*MultiByteCapEntry, bool) {
+	s.cacheMu.RLock()
+	e, ok := s.mbCapIndex[pk]
+	s.cacheMu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	return &e, true
+}
+
+// loadMultibyteCapFromDB pre-populates mbCapSnapshot and mbCapIndex from the nodes
+// table so cold starts serve the last-known capability without waiting for the first
+// analytics cycle (~15s).
+func (s *PacketStore) loadMultibyteCapFromDB() {
+	if !s.db.hasMultibyteSupCols {
+		return
+	}
+	rows, err := s.db.conn.Query(
+		`SELECT public_key, COALESCE(name,''), COALESCE(role,''), COALESCE(last_seen,''), multibyte_sup, COALESCE(multibyte_evidence,'')
+		 FROM nodes WHERE multibyte_sup > 0`)
+	if err != nil {
+		log.Printf("[multibyte] loadFromDB: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var entries []MultiByteCapEntry
+	for rows.Next() {
+		var pk, name, role, lastSeen, evidence string
+		var sup int
+		if err := rows.Scan(&pk, &name, &role, &lastSeen, &sup, &evidence); err != nil {
+			continue
+		}
+		status := "unknown"
+		switch sup {
+		case 2:
+			status = "confirmed"
+		case 1:
+			status = "suspected"
+		}
+		entries = append(entries, MultiByteCapEntry{
+			PublicKey: pk,
+			Name:      name,
+			Role:      role,
+			Status:    status,
+			Evidence:  evidence,
+			LastSeen:  lastSeen,
+		})
+	}
+	if len(entries) == 0 {
+		return
+	}
+	idx := make(map[string]MultiByteCapEntry, len(entries))
+	for _, e := range entries {
+		idx[e.PublicKey] = e
+	}
+	s.cacheMu.Lock()
+	s.mbCapSnapshot = entries
+	s.mbCapIndex = idx
+	s.cacheMu.Unlock()
+	log.Printf("[multibyte] loaded %d capability entries from DB", len(entries))
+}
+
+// publishMultibyteCapSnapshot writes the analytics-cycle output to the
+// on-disk handoff (internal/mbcapqueue). The ingestor's
+// RunMultibyteCapPersist consumes the file and writes confirmed /
+// suspected entries to the DB.
+//
+// INVARIANT (#1289/#1324): the server is the read path and opens
+// SQLite mode=ro. It MUST NOT execute any UPDATE on
+// nodes.multibyte_* — see readonly_invariant_test.go. This helper is
+// the only side-effect path for capability data leaving the server.
+func (s *PacketStore) publishMultibyteCapSnapshot(entries []MultiByteCapEntry) {
+	if s.db == nil || s.db.path == "" {
+		return
+	}
+	out := make([]mbcapqueue.Entry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, mbcapqueue.Entry{
+			PublicKey: e.PublicKey,
+			Status:    e.Status,
+			Evidence:  e.Evidence,
+		})
+	}
+	if err := mbcapqueue.WriteSnapshot(s.db.path, mbcapqueue.Snapshot{Entries: out}); err != nil {
+		log.Printf("[multibyte] publish snapshot: %v", err)
+	}
+}
+
 // --- Multi-Byte Capability Inference ---
 
 // MultiByteCapEntry represents a node's inferred multi-byte capability.
@@ -6323,7 +8331,12 @@ func (s *PacketStore) computeMultiByteCapability(adopterHashSizes map[string]int
 
 // --- Bulk Health (in-memory) ---
 
-func (s *PacketStore) GetBulkHealth(limit int, region string) []map[string]interface{} {
+func (s *PacketStore) GetBulkHealth(limit int, region, area string) []map[string]interface{} {
+	var areaNodes map[string]bool
+	if area != "" {
+		areaNodes = s.resolveAreaNodes(area)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -6354,10 +8367,10 @@ func (s *PacketStore) GetBulkHealth(limit int, region string) []map[string]inter
 		}
 	}
 
-	// Get nodes from DB
+	// Get nodes from DB — fetch more when filtering so we don't under-fill after exclusions
 	queryLimit := limit
-	if regionNodeKeys != nil {
-		queryLimit = 500
+	if regionNodeKeys != nil || areaNodes != nil {
+		queryLimit = 10000
 	}
 	rows, err := s.db.conn.Query("SELECT public_key, name, role, lat, lon FROM nodes ORDER BY last_seen DESC LIMIT ?", queryLimit)
 	if err != nil {
@@ -6378,15 +8391,19 @@ func (s *PacketStore) GetBulkHealth(limit int, region string) []map[string]inter
 		if regionNodeKeys != nil && !regionNodeKeys[pk] {
 			continue
 		}
+		if areaNodes != nil && !areaNodes[pk] {
+			continue
+		}
 		nodes = append(nodes, dbNode{
 			pk: pk, name: nullStrVal(name), role: nullStrVal(role),
 			lat: nullFloat(lat), lon: nullFloat(lon),
 		})
-		if regionNodeKeys == nil && len(nodes) >= limit {
+		if regionNodeKeys == nil && areaNodes == nil && len(nodes) >= limit {
 			break
 		}
 	}
-	if regionNodeKeys != nil && len(nodes) > limit {
+	// Only cap to limit in the global (no-filter) case; area/region returns full filtered set
+	if regionNodeKeys != nil && areaNodes == nil && len(nodes) > limit {
 		nodes = nodes[:limit]
 	}
 
@@ -7049,7 +9066,12 @@ func (s *PacketStore) GetAnalyticsSubpathsBulk(region string, groups []subpathGr
 	// Single scan: bucket by hop length into per-group accumulators.
 	s.mu.RLock()
 	_, pm := s.getCachedNodesAndPM()
+	// Aggregate hop-disambiguation context across all packets so the
+	// resolver's tiers 1 and 2 light up even on this bulk-aggregate path
+	// (the index iterates raw subpath strings, not per-tx). See #1197.
+	contextPubkeys := buildAggregateHopContextPubkeys(s.packets, pm)
 	hopCache := make(map[string]*nodeInfo)
+	graph := s.graph.Load() // hoist out of resolver closure (PR #1208 carmack #1)
 	resolveHop := func(hop string) string {
 		if cached, ok := hopCache[hop]; ok {
 			if cached != nil {
@@ -7057,7 +9079,7 @@ func (s *PacketStore) GetAnalyticsSubpathsBulk(region string, groups []subpathGr
 			}
 			return hop
 		}
-		r, _, _ := pm.resolveWithContext(hop, nil, s.graph)
+		r, _, _ := pm.resolveWithContext(hop, contextPubkeys, graph)
 		hopCache[hop] = r
 		if r != nil {
 			return r.Name
@@ -7129,7 +9151,11 @@ func (s *PacketStore) computeAnalyticsSubpaths(region string, minLen, maxLen, li
 	defer s.mu.RUnlock()
 
 	_, pm := s.getCachedNodesAndPM()
+	// Aggregate hop-disambiguation context across all packets — bulk
+	// aggregator over s.spIndex / per-tx fallback both need it. See #1197.
+	contextPubkeys := buildAggregateHopContextPubkeys(s.packets, pm)
 	hopCache := make(map[string]*nodeInfo)
+	graph := s.graph.Load() // hoist out of resolver closure (PR #1208 carmack #1)
 	resolveHop := func(hop string) string {
 		if cached, ok := hopCache[hop]; ok {
 			if cached != nil {
@@ -7137,7 +9163,7 @@ func (s *PacketStore) computeAnalyticsSubpaths(region string, minLen, maxLen, li
 			}
 			return hop
 		}
-		r, _, _ := pm.resolveWithContext(hop, nil, s.graph)
+		r, _, _ := pm.resolveWithContext(hop, contextPubkeys, graph)
 		hopCache[hop] = r
 		if r != nil {
 			return r.Name
@@ -7271,10 +9297,24 @@ func (s *PacketStore) GetSubpathDetail(rawHops []string) map[string]interface{} 
 
 	_, pm := s.getCachedNodesAndPM()
 
+	// Build the subpath key the same way the index does (lowercase, comma-joined)
+	spKey := strings.ToLower(strings.Join(rawHops, ","))
+
+	// Direct lookup instead of scanning all packets
+	matchedTxs := s.spTxIndex[spKey]
+
+	// Hop-disambiguation context: union over the matched txs that produced
+	// this subpath. This is the right scope — those are the packets that
+	// witnessed the requested hop sequence. See #1197.
+	contextPubkeys := buildAggregateHopContextPubkeys(matchedTxs, pm)
+	// Hoist atomic graph.Load() once for the whole request (PR #1208
+	// carmack #1) — used by the rawHops loop AND the matched-tx loop below.
+	graph := s.graph.Load()
+
 	// Resolve the requested hops
 	nodes := make([]map[string]interface{}, len(rawHops))
 	for i, hop := range rawHops {
-		r, _, _ := pm.resolveWithContext(hop, nil, s.graph)
+		r, _, _ := pm.resolveWithContext(hop, contextPubkeys, graph)
 		entry := map[string]interface{}{"hop": hop, "name": hop, "lat": nil, "lon": nil, "pubkey": nil}
 		if r != nil {
 			entry["name"] = r.Name
@@ -7286,12 +9326,6 @@ func (s *PacketStore) GetSubpathDetail(rawHops []string) map[string]interface{} 
 		}
 		nodes[i] = entry
 	}
-
-	// Build the subpath key the same way the index does (lowercase, comma-joined)
-	spKey := strings.ToLower(strings.Join(rawHops, ","))
-
-	// Direct lookup instead of scanning all packets
-	matchedTxs := s.spTxIndex[spKey]
 
 	hourBuckets := make([]int, 24)
 	var snrSum, rssiSum float64
@@ -7330,11 +9364,13 @@ func (s *PacketStore) GetSubpathDetail(rawHops []string) map[string]interface{} 
 			observers[tx.ObserverName]++
 		}
 
-		// Full parent path (resolved)
+		// Full parent path (resolved). Per-tx context so the resolver picks
+		// the right candidate when prefixes are ambiguous. See #1197.
+		txCtx := buildHopContextPubkeys(tx, pm)
 		hops := txGetParsedPath(tx)
 		resolved := make([]string, len(hops))
 		for i, h := range hops {
-			r, _, _ := pm.resolveWithContext(h, nil, s.graph)
+			r, _, _ := pm.resolveWithContext(h, txCtx, graph)
 			if r != nil {
 				resolved[i] = r.Name
 			} else {

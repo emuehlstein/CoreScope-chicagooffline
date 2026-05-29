@@ -7,6 +7,36 @@
   let originalValues = {};
   let activeTab = 'branding';
 
+  // ── Brand logo swap helpers (PR #1137) ──
+  // Default brand logo is an inline <svg.brand-logo>; an operator override
+  // (branding.logoUrl) swaps it for an <img.brand-logo>. Going back to empty
+  // restores the inline default on next reload (intermediate state shows the
+  // bundled SVG via <img>). Kept in customize.js for v1 parity.
+  function _v1SetBrandLogoUrl(url) {
+    var node = document.querySelector('.nav-brand .brand-logo');
+    if (!node) return;
+    if (url) {
+      if (node.tagName.toLowerCase() === 'img') { node.setAttribute('src', url); return; }
+      var img = document.createElement('img');
+      img.className = 'brand-logo';
+      img.setAttribute('src', url);
+      img.setAttribute('alt', node.getAttribute('aria-label') || 'Brand');
+      img.setAttribute('width', '111');
+      img.setAttribute('height', '36');
+      node.parentNode.replaceChild(img, node);
+    } else if (node.tagName.toLowerCase() === 'img') {
+      node.setAttribute('src', 'img/corescope-logo.svg');
+    }
+  }
+  function _v1SetBrandAlt(alt) {
+    var node = document.querySelector('.nav-brand .brand-logo');
+    if (!node) return;
+    if (node.tagName.toLowerCase() === 'img') node.setAttribute('alt', alt);
+    else node.setAttribute('aria-label', alt);
+    var brandLink = document.querySelector('.nav-brand');
+    if (brandLink) brandLink.setAttribute('aria-label', alt + ' home');
+  }
+
   const DEFAULTS = {
     branding: {
       siteName: 'CoreScope',
@@ -513,6 +543,9 @@
     for (var key in THEME_CSS_MAP) {
       if (t[key]) document.documentElement.style.setProperty(THEME_CSS_MAP[key], t[key]);
     }
+    // Mirror accent → logo brand vars so the wordmark follows the theme.
+    if (t.accent) document.documentElement.style.setProperty('--logo-accent', t.accent);
+    if (t.accentHover) document.documentElement.style.setProperty('--logo-accent-hi', t.accentHover);
     // Derived vars that reference other vars — need explicit override
     if (t.background) {
       document.documentElement.style.setProperty('--content-bg', t.background);
@@ -1006,11 +1039,18 @@
         }
         // Live DOM updates for branding
         if (inp.dataset.key === 'branding.siteName') {
+          // Post-rebrand (PR #1137): the navbar brand is an inline <svg>;
+          // mutate aria-label (a11y label on the <svg>/<a>) + document title.
+          // Legacy .brand-text fallback retained for any operator who shipped
+          // a custom build that still uses the text node.
+          _v1SetBrandAlt(inp.value);
           var brandEl = document.querySelector('.brand-text');
           if (brandEl) brandEl.textContent = inp.value;
           document.title = inp.value;
         }
         if (inp.dataset.key === 'branding.logoUrl') {
+          // Swap the navbar logo: empty → restore inline default; URL → <img>.
+          _v1SetBrandLogoUrl(inp.value || '');
           var iconEl = document.querySelector('.brand-icon');
           if (iconEl) {
             if (inp.value) { iconEl.innerHTML = '<img src="' + inp.value + '" style="height:24px" onerror="this.style.display=\'none\'">'; }
@@ -1105,8 +1145,13 @@
       inp.addEventListener('input', function () {
         var key = inp.dataset.node;
         state.nodeColors[key] = inp.value;
-        // Sync to global role colors used by map/packets/etc
-        if (window.ROLE_COLORS) window.ROLE_COLORS[key] = inp.value;
+        // #1412: route per-key user picks through setRoleColorOverride so
+        // the explicit override map is the only place mutation happens.
+        // (Direct subscript assignment would also work via the roles.js
+        // proxy, but the explicit API is the documented contract.)
+        if (typeof window.setRoleColorOverride === 'function') {
+          window.setRoleColorOverride(key, inp.value);
+        }
         if (window.ROLE_STYLE && window.ROLE_STYLE[key]) window.ROLE_STYLE[key].color = inp.value;
         // Trigger re-render of current page
         window.dispatchEvent(new CustomEvent('theme-changed')); autoSave();
@@ -1122,7 +1167,10 @@
       btn.addEventListener('click', function () {
         var key = btn.dataset.resetNode;
         state.nodeColors[key] = DEFAULTS.nodeColors[key];
-        if (window.ROLE_COLORS) window.ROLE_COLORS[key] = DEFAULTS.nodeColors[key];
+        // #1412: clearing the override lets cb-preset CSS var win again.
+        if (typeof window.setRoleColorOverride === 'function') {
+          window.setRoleColorOverride(key, DEFAULTS.nodeColors[key]);
+        }
         if (window.ROLE_STYLE && window.ROLE_STYLE[key]) window.ROLE_STYLE[key].color = DEFAULTS.nodeColors[key];
         render(container);
       });
@@ -1410,6 +1458,9 @@
         for (const [key, val] of Object.entries(themeData)) {
           if (THEME_CSS_MAP[key]) document.documentElement.style.setProperty(THEME_CSS_MAP[key], val);
         }
+        // Mirror accent → logo brand vars (matches applyThemePreview()).
+        if (themeData.accent) document.documentElement.style.setProperty('--logo-accent', themeData.accent);
+        if (themeData.accentHover) document.documentElement.style.setProperty('--logo-accent-hi', themeData.accentHover);
         // Derived vars
         if (themeData.background) document.documentElement.style.setProperty('--content-bg', themeData.background);
         if (themeData.surface1) document.documentElement.style.setProperty('--card-bg', themeData.surface1);
@@ -1441,11 +1492,13 @@
         const userTheme = JSON.parse(saved);
         if (userTheme.branding) {
           if (userTheme.branding.siteName) {
+            _v1SetBrandAlt(userTheme.branding.siteName);
             const brandEl = document.querySelector('.brand-text');
             if (brandEl) brandEl.textContent = userTheme.branding.siteName;
             document.title = userTheme.branding.siteName;
           }
           if (userTheme.branding.logoUrl) {
+            _v1SetBrandLogoUrl(userTheme.branding.logoUrl);
             const iconEl = document.querySelector('.brand-icon');
             if (iconEl) iconEl.innerHTML = '<img src="' + userTheme.branding.logoUrl + '" style="height:24px" onerror="this.style.display=\'none\'">';
           }

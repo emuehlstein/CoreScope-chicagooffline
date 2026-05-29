@@ -2,14 +2,27 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/meshcore-analyzer/dbconfig"
 	"github.com/meshcore-analyzer/geofilter"
 )
+
+// AreaEntry defines a geographic area by polygon or bounding box.
+type AreaEntry struct {
+	Label   string       `json:"label"`
+	Polygon [][2]float64 `json:"polygon,omitempty"`
+	LatMin  *float64     `json:"latMin,omitempty"`
+	LatMax  *float64     `json:"latMax,omitempty"`
+	LonMin  *float64     `json:"lonMin,omitempty"`
+	LonMax  *float64     `json:"lonMax,omitempty"`
+}
 
 // Config mirrors the Node.js config.json structure (read-only fields).
 type Config struct {
@@ -62,16 +75,51 @@ type Config struct {
 
 	Retention *RetentionConfig `json:"retention,omitempty"`
 
+	DB *DBConfig `json:"db,omitempty"`
+
 	PacketStore *PacketStoreConfig `json:"packetStore,omitempty"`
 
 	GeoFilter *GeoFilterConfig `json:"geo_filter,omitempty"`
 
+	Areas map[string]AreaEntry `json:"areas,omitempty"`
+
 	Timestamps *TimestampConfig `json:"timestamps,omitempty"`
+
+	// CORSAllowedOrigins is the list of origins permitted to make cross-origin
+	// requests. When empty (default), no Access-Control-* headers are sent,
+	// so browsers enforce same-origin policy. Set to ["*"] to allow all origins.
+	CORSAllowedOrigins []string `json:"corsAllowedOrigins,omitempty"`
 
 	DebugAffinity bool `json:"debugAffinity,omitempty"`
 
+	// MapDarkTileProvider selects the default dark-mode basemap provider for
+	// new visitors. The client may override per-browser via the customizer
+	// (persisted to localStorage). Allowed values: "carto-dark" (default),
+	// "esri-darkgray-labels", "voyager-inverted", "positron-inverted". See
+	// public/map-tile-providers.js for the registry. #1420.
+	MapDarkTileProvider string `json:"mapDarkTileProvider,omitempty"`
+
+	// ObserverBlacklist is a list of observer public keys to exclude from API
+	// responses (defense in depth — ingestor drops at ingest, server filters
+	// any that slipped through from a prior unblocked window).
+	ObserverBlacklist []string `json:"observerBlacklist,omitempty"`
+
+	// obsBlacklistSetCached is the lazily-built set version of ObserverBlacklist.
+	obsBlacklistSetCached map[string]bool
+	obsBlacklistOnce      sync.Once
+
+	Compression   *CompressionConfig   `json:"compression,omitempty"`
 	ResolvedPath  *ResolvedPathConfig  `json:"resolvedPath,omitempty"`
 	NeighborGraph *NeighborGraphConfig `json:"neighborGraph,omitempty"`
+
+	// Observers cache settings (#1481 P0-3 / #1483).
+	ObserversCache *ObserversCacheConfig `json:"observersCache,omitempty"`
+
+	// Analytics steady-state background recompute (issue #1240).
+	Analytics *AnalyticsConfig `json:"analytics,omitempty"`
+
+	// BatteryThresholds: voltage cutoffs for low/critical alerts (#663).
+	BatteryThresholds *BatteryThresholdsConfig `json:"batteryThresholds,omitempty"`
 }
 
 // weakAPIKeys is the blocklist of known default/example API keys that must be rejected.
@@ -102,6 +150,39 @@ func IsWeakAPIKey(key string) bool {
 	return false
 }
 
+// CompressionConfig controls HTTP gzip and WebSocket permessage-deflate compression.
+// Both are disabled by default — enable only when the upstream proxy does not already compress.
+type CompressionConfig struct {
+	GZip      bool `json:"gzip"`
+	Websocket bool `json:"websocket"`
+
+	// Level is the gzip compression level (1=BestSpeed … 9=BestCompression).
+	// 0 / out-of-range means "use compress/gzip.DefaultCompression".
+	Level int `json:"level,omitempty"`
+
+	// MinSizeBytes is an advisory minimum response size below which gzip
+	// would not pay off. Currently informational — kept here so operators
+	// can express intent and so future small-body fast-paths can use it.
+	MinSizeBytes int `json:"minSizeBytes,omitempty"`
+
+	// ContentTypes overrides the default compressible-MIME allow-list. When
+	// empty, a conservative default (application/json, text/html, text/css,
+	// application/javascript, text/plain, image/svg+xml, application/xml)
+	// is used. Already-compressed types (image/*, video/*, application/zip,
+	// application/x-gzip, …) are always skipped.
+	ContentTypes []string `json:"contentTypes,omitempty"`
+}
+
+// GZipEnabled returns true when HTTP gzip compression is explicitly enabled.
+func (c *Config) GZipEnabled() bool {
+	return c.Compression != nil && c.Compression.GZip
+}
+
+// WSCompressionEnabled returns true when WebSocket permessage-deflate is explicitly enabled.
+func (c *Config) WSCompressionEnabled() bool {
+	return c.Compression != nil && c.Compression.Websocket
+}
+
 // ResolvedPathConfig controls async backfill behavior.
 type ResolvedPathConfig struct {
 	BackfillHours int `json:"backfillHours"` // how far back (hours) to scan for NULL resolved_path (default 24)
@@ -109,14 +190,31 @@ type ResolvedPathConfig struct {
 
 // NeighborGraphConfig controls neighbor edge pruning.
 type NeighborGraphConfig struct {
-	MaxAgeDays int `json:"maxAgeDays"` // edges older than this are pruned (default 5)
+	MaxAgeDays int     `json:"maxAgeDays"` // edges older than this are pruned (default 5)
+	MaxEdgeKm  float64 `json:"maxEdgeKm"`  // geo-implausibility threshold (km); 0 = default 500; negative disables (#1228)
+
+	// CacheRecomputeIntervalSeconds: cadence for the background
+	// recomputer that rebuilds the default-shape neighbor-graph
+	// response (#1481 P0-1). 0/missing = default 300 (5 min).
+	// Lower = fresher data, more CPU per minute. #1483.
+	CacheRecomputeIntervalSeconds int `json:"cacheRecomputeIntervalSeconds,omitempty"`
+}
+
+// ObserversCacheConfig controls the /api/observers default-shape cache.
+// #1481 P0-3 / #1483.
+type ObserversCacheConfig struct {
+	// TTLSeconds: how long the cached default-shape /api/observers
+	// response is served before a singleflight-collapsed refill.
+	// 0/missing = default 30. Lower = fresher data, more SQL pressure.
+	TTLSeconds int `json:"ttlSeconds,omitempty"`
 }
 
 // PacketStoreConfig controls in-memory packet store limits.
 type PacketStoreConfig struct {
-	RetentionHours float64 `json:"retentionHours"` // max age of packets in hours (0 = unlimited)
-	MaxMemoryMB                    int `json:"maxMemoryMB"`                    // hard memory ceiling in MB (0 = unlimited)
-	MaxResolvedPubkeyIndexEntries  int `json:"maxResolvedPubkeyIndexEntries"`  // warning threshold for index size (0 = 5M default)
+	RetentionHours                float64 `json:"retentionHours"`                // max age of packets in hours (0 = unlimited)
+	MaxMemoryMB                   int     `json:"maxMemoryMB"`                   // hard memory ceiling in MB (0 = unlimited)
+	MaxResolvedPubkeyIndexEntries int     `json:"maxResolvedPubkeyIndexEntries"` // warning threshold for index size (0 = 5M default)
+	HotStartupHours               float64 `json:"hotStartupHours"`               // load only this many hours synchronously; 0 = disabled
 }
 
 // GeoFilterConfig is an alias for the shared geofilter.Config type.
@@ -127,6 +225,17 @@ type RetentionConfig struct {
 	ObserverDays  int `json:"observerDays"`
 	PacketDays    int `json:"packetDays"`
 	MetricsDays   int `json:"metricsDays"`
+}
+
+// DBConfig is the shared SQLite vacuum/maintenance config (#919, #921).
+type DBConfig = dbconfig.DBConfig
+
+// IncrementalVacuumPages returns the configured pages per vacuum or 1024 default.
+func (c *Config) IncrementalVacuumPages() int {
+	if c.DB != nil && c.DB.IncrementalVacuumPages > 0 {
+		return c.DB.IncrementalVacuumPages
+	}
+	return 1024
 }
 
 // MetricsRetentionDays returns configured metrics retention or 30 days default.
@@ -151,6 +260,19 @@ func (c *Config) NeighborMaxAgeDays() int {
 		return c.NeighborGraph.MaxAgeDays
 	}
 	return 5
+}
+
+// NeighborMaxEdgeKm returns the geo-implausibility threshold in km.
+// 0 (unset) → DefaultMaxEdgeKm (500). Negative → 0 (filter disabled).
+// See issue #1228.
+func (c *Config) NeighborMaxEdgeKm() float64 {
+	if c == nil || c.NeighborGraph == nil || c.NeighborGraph.MaxEdgeKm == 0 {
+		return DefaultMaxEdgeKm
+	}
+	if c.NeighborGraph.MaxEdgeKm < 0 {
+		return 0
+	}
+	return c.NeighborGraph.MaxEdgeKm
 }
 
 type TimestampConfig struct {
@@ -193,6 +315,10 @@ type HealthThresholds struct {
 	InfraSilentHours   float64 `json:"infraSilentHours"`
 	NodeDegradedHours  float64 `json:"nodeDegradedHours"`
 	NodeSilentHours    float64 `json:"nodeSilentHours"`
+	// RelayActiveHours: how recent a path-hop appearance must be for a
+	// repeater to be considered "actively relaying" vs only "alive
+	// (advert-only)". See issue #662. Defaults to 24h.
+	RelayActiveHours float64 `json:"relayActiveHours"`
 }
 
 // ThemeFile mirrors theme.json overlay.
@@ -261,6 +387,7 @@ func (c *Config) GetHealthThresholds() HealthThresholds {
 		InfraSilentHours:   72,
 		NodeDegradedHours:  1,
 		NodeSilentHours:    24,
+		RelayActiveHours:   24,
 	}
 	if c.HealthThresholds != nil {
 		if c.HealthThresholds.InfraDegradedHours > 0 {
@@ -274,6 +401,9 @@ func (c *Config) GetHealthThresholds() HealthThresholds {
 		}
 		if c.HealthThresholds.NodeSilentHours > 0 {
 			h.NodeSilentHours = c.HealthThresholds.NodeSilentHours
+		}
+		if c.HealthThresholds.RelayActiveHours > 0 {
+			h.RelayActiveHours = c.HealthThresholds.RelayActiveHours
 		}
 	}
 	return h
@@ -387,4 +517,138 @@ func (c *Config) IsBlacklisted(pubkey string) bool {
 		return false
 	}
 	return c.blacklistSet()[strings.ToLower(strings.TrimSpace(pubkey))]
+}
+
+// SaveGeoFilter writes the geo_filter section back to config.json on disk.
+// Pass gf=nil to remove the filter. The rest of config.json is preserved as-is.
+func SaveGeoFilter(configDir string, gf *GeoFilterConfig) error {
+	var configPath string
+	for _, p := range []string{
+		filepath.Join(configDir, "config.json"),
+		filepath.Join(configDir, "data", "config.json"),
+	} {
+		if _, err := os.Stat(p); err == nil {
+			configPath = p
+			break
+		}
+	}
+	if configPath == "" {
+		return fmt.Errorf("config.json not found in %s", configDir)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	// Parse as a raw map so non-struct fields (_comment, etc.) are preserved.
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+
+	if gf == nil || len(gf.Polygon) == 0 {
+		delete(raw, "geo_filter")
+	} else {
+		// Round-trip through JSON to get a plain interface{} value.
+		b, _ := json.Marshal(gf)
+		var v interface{}
+		_ = json.Unmarshal(b, &v)
+		raw["geo_filter"] = v
+	}
+
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	out = append(out, '\n')
+
+	// Atomic write: temp file + rename.
+	tmp := configPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	if err := os.Rename(tmp, configPath); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename config: %w", err)
+	}
+	return nil
+}
+
+// obsBlacklistSet lazily builds and caches the observerBlacklist as a set for O(1) lookups.
+func (c *Config) obsBlacklistSet() map[string]bool {
+	c.obsBlacklistOnce.Do(func() {
+		if len(c.ObserverBlacklist) == 0 {
+			return
+		}
+		m := make(map[string]bool, len(c.ObserverBlacklist))
+		for _, pk := range c.ObserverBlacklist {
+			trimmed := strings.ToLower(strings.TrimSpace(pk))
+			if trimmed != "" {
+				m[trimmed] = true
+			}
+		}
+		c.obsBlacklistSetCached = m
+	})
+	return c.obsBlacklistSetCached
+}
+
+// IsObserverBlacklisted returns true if the given observer ID is in the observerBlacklist.
+func (c *Config) IsObserverBlacklisted(id string) bool {
+	if c == nil || len(c.ObserverBlacklist) == 0 {
+		return false
+	}
+	return c.obsBlacklistSet()[strings.ToLower(strings.TrimSpace(id))]
+}
+
+// AnalyticsConfig controls steady-state background recompute of
+// analytics endpoints (issue #1240).
+//
+// DefaultIntervalSeconds applies to every endpoint that does not have
+// an explicit per-endpoint override in RecomputeIntervalSeconds. The
+// project default is 300 (5 minutes): the operator's guiding principle
+// is "serving slightly stale data quickly is better than real-time
+// data slowly." Lower values give fresher data at higher CPU cost.
+//
+// RecomputeIntervalSeconds keys (all optional):
+//   topology, rf, distance, channels, hashCollisions, hashSizes, roles, observersClockSkew, nodesClockSkew
+type AnalyticsConfig struct {
+	DefaultIntervalSeconds    int            `json:"defaultIntervalSeconds,omitempty"`
+	RecomputeIntervalSeconds  map[string]int `json:"recomputeIntervalSeconds,omitempty"`
+}
+
+// AnalyticsDefaultRecomputeInterval returns the configured default
+// recompute interval, or 5 minutes if unset/invalid.
+func (c *Config) AnalyticsDefaultRecomputeInterval() time.Duration {
+	if c != nil && c.Analytics != nil && c.Analytics.DefaultIntervalSeconds > 0 {
+		return time.Duration(c.Analytics.DefaultIntervalSeconds) * time.Second
+	}
+	return 5 * time.Minute
+}
+
+// AnalyticsRecomputeIntervals returns the per-endpoint override map.
+// Returns the zero value (all defaults) if the analytics block is
+// absent or empty.
+func (c *Config) AnalyticsRecomputeIntervals() AnalyticsRecomputeIntervals {
+	out := AnalyticsRecomputeIntervals{}
+	if c == nil || c.Analytics == nil || c.Analytics.RecomputeIntervalSeconds == nil {
+		return out
+	}
+	get := func(key string) time.Duration {
+		v, ok := c.Analytics.RecomputeIntervalSeconds[key]
+		if !ok || v <= 0 {
+			return 0
+		}
+		return time.Duration(v) * time.Second
+	}
+	out.Topology = get("topology")
+	out.RF = get("rf")
+	out.Distance = get("distance")
+	out.Channels = get("channels")
+	out.HashCollisions = get("hashCollisions")
+	out.HashSizes = get("hashSizes")
+	out.Roles = get("roles")
+	out.ObserversClockSkew = get("observersClockSkew")
+	out.NodesClockSkew = get("nodesClockSkew")
+	return out
 }

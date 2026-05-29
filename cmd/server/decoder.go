@@ -106,8 +106,35 @@ type Payload struct {
 	Tag             uint32       `json:"tag,omitempty"`
 	AuthCode        uint32       `json:"authCode,omitempty"`
 	TraceFlags      *int         `json:"traceFlags,omitempty"`
+	SNRValues       []float64    `json:"snrValues,omitempty"`
 	RawHex          string       `json:"raw,omitempty"`
 	Error           string       `json:"error,omitempty"`
+	// GRP_TXT/GRP_DATA channel envelope helpers — see
+	// firmware/src/helpers/BaseChatMesh.cpp:376-391.
+	ChannelHashHex   string `json:"channelHashHex,omitempty"`
+	DecryptionStatus string `json:"decryptionStatus,omitempty"`
+	// GRP_DATA (PAYLOAD_TYPE_GRP_DATA=0x06) inner fields, per
+	// firmware/src/helpers/BaseChatMesh.cpp:382-385.
+	DataType      *int   `json:"dataType,omitempty"`
+	DataLen       *int   `json:"dataLen,omitempty"`
+	DecryptedBlob string `json:"decryptedBlob,omitempty"`
+	// MULTIPART (PAYLOAD_TYPE_MULTIPART=0x0A) inner fields, per
+	// firmware/src/Mesh.cpp:289 — byte0 = (remaining<<4) | inner_type.
+	Remaining     *int   `json:"remaining,omitempty"`
+	InnerType     *int   `json:"innerType,omitempty"`
+	InnerTypeName string `json:"innerTypeName,omitempty"`
+	InnerAckCrc   string `json:"innerAckCrc,omitempty"`
+	InnerPayload  string `json:"innerPayload,omitempty"`
+	// CONTROL (PAYLOAD_TYPE_CONTROL=0x0B) byte0 flags, per
+	// firmware/src/Mesh.cpp:69 — high-bit = zero-hop direct subset.
+	CtrlFlags   string `json:"ctrlFlags,omitempty"`
+	CtrlZeroHop *bool  `json:"ctrlZeroHop,omitempty"`
+	CtrlLength  *int   `json:"ctrlLength,omitempty"`
+	// RAW_CUSTOM (PAYLOAD_TYPE_RAW_CUSTOM=0x0F) — application-defined per
+	// firmware/src/Mesh.cpp:577 (createRawData). We expose the bare envelope
+	// shape so consumers can triage by length + leading tag byte.
+	RawLength    *int   `json:"rawLength,omitempty"`
+	FirstByteTag string `json:"firstByteTag,omitempty"`
 }
 
 // DecodedPacket is the full decoded result.
@@ -143,9 +170,35 @@ func decodeHeader(b byte) Header {
 	}
 }
 
-func decodePath(pathByte byte, buf []byte, offset int) (Path, int) {
+// Firmware-derived limits — see firmware/src/MeshCore.h:19,21.
+const (
+	maxPathSize      = 64  // MAX_PATH_SIZE — total path bytes allowed
+	maxPacketPayload = 184 // MAX_PACKET_PAYLOAD — max raw payload bytes
+)
+
+// isValidPathLen mirrors firmware Packet::isValidPathLen
+// (firmware/src/Packet.cpp:13-18). hash_size==4 is reserved; total path bytes
+// must fit within MAX_PATH_SIZE.
+func isValidPathLen(pathByte byte) bool {
+	hashCount := int(pathByte & 0x3F)
+	hashSize := int(pathByte>>6) + 1
+	if hashSize == 4 {
+		return false // reserved
+	}
+	return hashCount*hashSize <= maxPathSize
+}
+
+func decodePath(pathByte byte, buf []byte, offset int) (Path, int, error) {
 	hashSize := int(pathByte>>6) + 1
 	hashCount := int(pathByte & 0x3F)
+	// Exact mirror of firmware Packet::isValidPathLen (Packet.cpp:13-18).
+	// hash_size==4 is reserved and is rejected by firmware regardless of
+	// hash_count, so we must reject 0xC0 etc even on zero-hop packets —
+	// firmware never emits them, so an on-wire pathByte with the upper
+	// 2 bits set to 11 is by definition malformed/adversarial.
+	if !isValidPathLen(pathByte) {
+		return Path{}, 0, fmt.Errorf("invalid path encoding: pathByte 0x%02X (hash_size=%d hash_count=%d) violates firmware validity (Packet.cpp:13-18, MAX_PATH_SIZE=%d)", pathByte, hashSize, hashCount, maxPathSize)
+	}
 	totalBytes := hashSize * hashCount
 	hops := make([]string, 0, hashCount)
 
@@ -162,7 +215,7 @@ func decodePath(pathByte byte, buf []byte, offset int) (Path, int) {
 		HashSize:  hashSize,
 		HashCount: hashCount,
 		Hops:      hops,
-	}, totalBytes
+	}, totalBytes, nil
 }
 
 // isTransportRoute delegates to packetpath.IsTransportRoute.
@@ -260,6 +313,13 @@ func decodeAdvert(buf []byte, validateSignatures bool) Payload {
 			name := string(appdata[off:])
 			name = strings.TrimRight(name, "\x00")
 			name = sanitizeName(name)
+			// Firmware writes the node name into a 32-byte buffer
+			// (MAX_ADVERT_DATA_SIZE, firmware/src/MeshCore.h:11). Truncate
+			// here so adversarial on-wire adverts can't pollute Payload.Name
+			// with bytes firmware would never emit.
+			if len(name) > 32 {
+				name = name[:32]
+			}
 			p.Name = name
 		}
 	}
@@ -277,6 +337,85 @@ func decodeGrpTxt(buf []byte) Payload {
 		MAC:           hex.EncodeToString(buf[1:3]),
 		EncryptedData: hex.EncodeToString(buf[3:]),
 	}
+}
+
+// decodeGrpData decodes PAYLOAD_TYPE_GRP_DATA (0x06). Outer envelope is the
+// same shape as GRP_TXT (channel_hash(1)+MAC(2)+ciphertext) — see
+// firmware/src/helpers/BaseChatMesh.cpp:476,500. This server-side decoder has
+// no channel keys, so it surfaces the envelope only.
+func decodeGrpData(buf []byte) Payload {
+	if len(buf) < 3 {
+		return Payload{Type: "GRP_DATA", Error: "too short", RawHex: hex.EncodeToString(buf)}
+	}
+	return Payload{
+		Type:           "GRP_DATA",
+		ChannelHash:    int(buf[0]),
+		ChannelHashHex: fmt.Sprintf("%02X", buf[0]),
+		MAC:            hex.EncodeToString(buf[1:3]),
+		EncryptedData:  hex.EncodeToString(buf[3:]),
+	}
+}
+
+// decodeMultipart decodes PAYLOAD_TYPE_MULTIPART (0x0A) per
+// firmware/src/Mesh.cpp:287-310. byte0 = (remaining<<4) | inner_type;
+// when inner_type == PAYLOAD_TYPE_ACK the next 4 bytes are an ack_crc.
+func decodeMultipart(buf []byte) Payload {
+	if len(buf) < 1 {
+		return Payload{Type: "MULTIPART", Error: "too short", RawHex: hex.EncodeToString(buf)}
+	}
+	remaining := int(buf[0] >> 4)
+	innerType := int(buf[0] & 0x0F)
+	innerName := payloadTypeNames[innerType]
+	if innerName == "" {
+		innerName = "UNKNOWN"
+	}
+	p := Payload{
+		Type:          "MULTIPART",
+		Remaining:     &remaining,
+		InnerType:     &innerType,
+		InnerTypeName: innerName,
+	}
+	if innerType == PayloadACK && len(buf) >= 5 {
+		crc := binary.LittleEndian.Uint32(buf[1:5])
+		p.InnerAckCrc = fmt.Sprintf("%08x", crc)
+	} else if len(buf) > 1 {
+		p.InnerPayload = hex.EncodeToString(buf[1:])
+	}
+	return p
+}
+
+// decodeControl decodes PAYLOAD_TYPE_CONTROL (0x0B) byte0 flags per
+// firmware/src/Mesh.cpp:69 (high-bit set ⇒ zero-hop direct subset).
+func decodeControl(buf []byte) Payload {
+	if len(buf) < 1 {
+		return Payload{Type: "CONTROL", Error: "too short", RawHex: hex.EncodeToString(buf)}
+	}
+	zeroHop := buf[0]&0x80 != 0
+	length := len(buf)
+	return Payload{
+		Type:        "CONTROL",
+		CtrlFlags:   fmt.Sprintf("%02x", buf[0]),
+		CtrlZeroHop: &zeroHop,
+		CtrlLength:  &length,
+		RawHex:      hex.EncodeToString(buf),
+	}
+}
+
+// decodeRawCustom decodes PAYLOAD_TYPE_RAW_CUSTOM (0x0F). The payload bytes
+// are application-defined per firmware/src/Mesh.cpp:577 (createRawData), so
+// we only surface the bare envelope shape: total length plus the leading
+// byte, which apps commonly use as a tag/type discriminator.
+func decodeRawCustom(buf []byte) Payload {
+	length := len(buf)
+	p := Payload{
+		Type:      "RAW_CUSTOM",
+		RawLength: &length,
+		RawHex:    hex.EncodeToString(buf),
+	}
+	if length > 0 {
+		p.FirstByteTag = fmt.Sprintf("%02X", buf[0])
+	}
+	return p
 }
 
 func decodeAnonReq(buf []byte) Payload {
@@ -338,12 +477,20 @@ func decodePayload(payloadType int, buf []byte, validateSignatures bool) Payload
 		return decodeAdvert(buf, validateSignatures)
 	case PayloadGRP_TXT:
 		return decodeGrpTxt(buf)
+	case PayloadGRP_DATA:
+		return decodeGrpData(buf)
 	case PayloadANON_REQ:
 		return decodeAnonReq(buf)
 	case PayloadPATH:
 		return decodePathPayload(buf)
 	case PayloadTRACE:
 		return decodeTrace(buf)
+	case PayloadMULTIPART:
+		return decodeMultipart(buf)
+	case PayloadCONTROL:
+		return decodeControl(buf)
+	case PayloadRAW_CUSTOM:
+		return decodeRawCustom(buf)
 	default:
 		return Payload{Type: "UNKNOWN", RawHex: hex.EncodeToString(buf)}
 	}
@@ -384,10 +531,23 @@ func DecodePacket(hexString string, validateSignatures bool) (*DecodedPacket, er
 	pathByte := buf[offset]
 	offset++
 
-	path, bytesConsumed := decodePath(pathByte, buf, offset)
+	path, bytesConsumed, decodeErr := decodePath(pathByte, buf, offset)
+	if decodeErr != nil {
+		return nil, decodeErr
+	}
 	offset += bytesConsumed
 
+	// Bounds check — see cmd/ingestor/decoder.go for full rationale (#1211).
+	if offset > len(buf) {
+		return nil, fmt.Errorf("packet path length (%d bytes claimed by pathByte 0x%02X) exceeds buffer (%d bytes)", bytesConsumed, pathByte, len(buf))
+	}
+
 	payloadBuf := buf[offset:]
+	// Firmware caps payload at MAX_PACKET_PAYLOAD=184 (firmware/src/MeshCore.h:19).
+	// Anything larger cannot be a valid wire packet — drop it.
+	if len(payloadBuf) > maxPacketPayload {
+		return nil, fmt.Errorf("packet payload (%d bytes) exceeds firmware MAX_PACKET_PAYLOAD=%d (MeshCore.h:19)", len(payloadBuf), maxPacketPayload)
+	}
 	payload := decodePayload(header.PayloadType, payloadBuf, validateSignatures)
 
 	// TRACE packets store hop IDs in the payload (buf[9:]) rather than the header
@@ -407,6 +567,19 @@ func DecodePacket(hexString string, validateSignatures bool) (*DecodedPacket, er
 		}
 		// The header path hops count represents SNR entries = completed hops
 		hopsCompleted := path.HashCount
+		// Extract per-hop SNR from header path bytes (int8, quarter-dB encoding)
+		if hopsCompleted > 0 && len(path.Hops) >= hopsCompleted {
+			snrVals := make([]float64, 0, hopsCompleted)
+			for i := 0; i < hopsCompleted; i++ {
+				b, err := hex.DecodeString(path.Hops[i])
+				if err == nil && len(b) == 1 {
+					snrVals = append(snrVals, float64(int8(b[0]))/4.0)
+				}
+			}
+			if len(snrVals) > 0 {
+				payload.SNRValues = snrVals
+			}
+		}
 		pathBytes, err := hex.DecodeString(payload.PathData)
 		if err == nil && payload.TraceFlags != nil {
 			// path_sz from flags byte is a power-of-two exponent per firmware:
@@ -441,106 +614,6 @@ func DecodePacket(hexString string, validateSignatures bool) (*DecodedPacket, er
 		Raw:            strings.ToUpper(hexString),
 		Anomaly:        anomaly,
 	}, nil
-}
-
-// HexRange represents a labeled byte range for the hex breakdown visualization.
-type HexRange struct {
-	Start int    `json:"start"`
-	End   int    `json:"end"`
-	Label string `json:"label"`
-}
-
-// Breakdown holds colored byte ranges returned by the packet detail endpoint.
-type Breakdown struct {
-	Ranges []HexRange `json:"ranges"`
-}
-
-// BuildBreakdown computes labeled byte ranges for each section of a MeshCore packet.
-// The returned ranges are consumed by createColoredHexDump() and buildHexLegend()
-// in the frontend (public/app.js).
-func BuildBreakdown(hexString string) *Breakdown {
-	hexString = strings.ReplaceAll(hexString, " ", "")
-	hexString = strings.ReplaceAll(hexString, "\n", "")
-	hexString = strings.ReplaceAll(hexString, "\r", "")
-	buf, err := hex.DecodeString(hexString)
-	if err != nil || len(buf) < 2 {
-		return &Breakdown{Ranges: []HexRange{}}
-	}
-
-	var ranges []HexRange
-	offset := 0
-
-	// Byte 0: Header
-	ranges = append(ranges, HexRange{Start: 0, End: 0, Label: "Header"})
-	offset = 1
-
-	header := decodeHeader(buf[0])
-
-	// Bytes 1-4: Transport Codes (TRANSPORT_FLOOD / TRANSPORT_DIRECT only)
-	if isTransportRoute(header.RouteType) {
-		if len(buf) < offset+4 {
-			return &Breakdown{Ranges: ranges}
-		}
-		ranges = append(ranges, HexRange{Start: offset, End: offset + 3, Label: "Transport Codes"})
-		offset += 4
-	}
-
-	if offset >= len(buf) {
-		return &Breakdown{Ranges: ranges}
-	}
-
-	// Next byte: Path Length (bits 7-6 = hashSize-1, bits 5-0 = hashCount)
-	ranges = append(ranges, HexRange{Start: offset, End: offset, Label: "Path Length"})
-	pathByte := buf[offset]
-	offset++
-
-	hashSize := int(pathByte>>6) + 1
-	hashCount := int(pathByte & 0x3F)
-	pathBytes := hashSize * hashCount
-
-	// Path hops
-	if hashCount > 0 && offset+pathBytes <= len(buf) {
-		ranges = append(ranges, HexRange{Start: offset, End: offset + pathBytes - 1, Label: "Path"})
-	}
-	offset += pathBytes
-
-	if offset >= len(buf) {
-		return &Breakdown{Ranges: ranges}
-	}
-
-	payloadStart := offset
-
-	// Payload — break ADVERT into named sub-fields; everything else is one Payload range
-	if header.PayloadType == PayloadADVERT && len(buf)-payloadStart >= 100 {
-		ranges = append(ranges, HexRange{Start: payloadStart, End: payloadStart + 31, Label: "PubKey"})
-		ranges = append(ranges, HexRange{Start: payloadStart + 32, End: payloadStart + 35, Label: "Timestamp"})
-		ranges = append(ranges, HexRange{Start: payloadStart + 36, End: payloadStart + 99, Label: "Signature"})
-
-		appStart := payloadStart + 100
-		if appStart < len(buf) {
-			ranges = append(ranges, HexRange{Start: appStart, End: appStart, Label: "Flags"})
-			appFlags := buf[appStart]
-			fOff := appStart + 1
-			if appFlags&0x10 != 0 && fOff+8 <= len(buf) {
-				ranges = append(ranges, HexRange{Start: fOff, End: fOff + 3, Label: "Latitude"})
-				ranges = append(ranges, HexRange{Start: fOff + 4, End: fOff + 7, Label: "Longitude"})
-				fOff += 8
-			}
-			if appFlags&0x20 != 0 && fOff+2 <= len(buf) {
-				fOff += 2
-			}
-			if appFlags&0x40 != 0 && fOff+2 <= len(buf) {
-				fOff += 2
-			}
-			if appFlags&0x80 != 0 && fOff < len(buf) {
-				ranges = append(ranges, HexRange{Start: fOff, End: len(buf) - 1, Label: "Name"})
-			}
-		}
-	} else {
-		ranges = append(ranges, HexRange{Start: payloadStart, End: len(buf) - 1, Label: "Payload"})
-	}
-
-	return &Breakdown{Ranges: ranges}
 }
 
 // ComputeContentHash computes the SHA-256-based content hash (first 16 hex chars).
@@ -657,8 +730,13 @@ func ValidateAdvert(p *Payload) (bool, string) {
 
 	if p.Flags != nil {
 		role := advertRole(p.Flags)
-		validRoles := map[string]bool{"repeater": true, "companion": true, "room": true, "sensor": true}
-		if !validRoles[role] {
+		// Accept canonical labels plus "none" (ADV_TYPE_NONE=0) and "type-N"
+		// placeholders for ADV_TYPE 5-15 (FUTURE) — see
+		// firmware/src/helpers/AdvertDataHelpers.h:7-12.
+		validRoles := map[string]bool{
+			"repeater": true, "companion": true, "room": true, "sensor": true, "none": true,
+		}
+		if !validRoles[role] && !strings.HasPrefix(role, "type-") {
 			return false, fmt.Sprintf("unknown role: %s", role)
 		}
 	}
@@ -678,17 +756,29 @@ func sanitizeName(s string) string {
 	return b.String()
 }
 
+// advertRole returns a stable role label for an advert. Follows firmware
+// ADV_TYPE_* constants in firmware/src/helpers/AdvertDataHelpers.h:7-12:
+//   0 NONE, 1 CHAT, 2 REPEATER, 3 ROOM, 4 SENSOR, 5-15 FUTURE.
+// Previously this coerced both 0 (NONE) and 5-15 (FUTURE) to "companion",
+// silently relabelling unknown/reserved types — see issue #1279 P1 #3.
 func advertRole(f *AdvertFlags) string {
-	if f.Repeater {
+	if f == nil {
+		return "companion"
+	}
+	switch f.Type {
+	case 0:
+		return "none"
+	case 1:
+		return "companion"
+	case 2:
 		return "repeater"
-	}
-	if f.Room {
+	case 3:
 		return "room"
-	}
-	if f.Sensor {
+	case 4:
 		return "sensor"
+	default:
+		return fmt.Sprintf("type-%d", f.Type)
 	}
-	return "companion"
 }
 
 func epochToISO(epoch uint32) string {

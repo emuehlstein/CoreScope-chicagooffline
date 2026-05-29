@@ -4,7 +4,33 @@
 (function () {
   let _analyticsData = {};
   const sf = (v, d) => (v != null ? v.toFixed(d) : '–'); // safe toFixed
-  function esc(s) { return s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : ''; }
+  function esc(s) { return s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;') : ''; }
+
+  // #1085 — Roles tab helpers (hoisted from renderRolesTab so they're not
+  // re-allocated per render).
+  function _rolesEmoji(role) {
+    if (window.ROLE_EMOJI && window.ROLE_EMOJI[role]) return window.ROLE_EMOJI[role];
+    return '•';
+  }
+  function _rolesFmtSec(v) {
+    if (!v && v !== 0) return '—';
+    var abs = Math.abs(v);
+    if (abs < 1) return v.toFixed(2) + 's';
+    if (abs < 60) return v.toFixed(1) + 's';
+    if (abs < 3600) return (v / 60).toFixed(1) + 'm';
+    if (abs < 86400) return (v / 3600).toFixed(1) + 'h';
+    return (v / 86400).toFixed(1) + 'd';
+  }
+  // #1085 — auto-refresh timer for the Roles tab. Started when the Roles
+  // tab is rendered, cleared on tab switch and destroy.
+  var _rolesRefreshTimer = null;
+  function _stopRolesRefresh() {
+    if (_rolesRefreshTimer) { clearInterval(_rolesRefreshTimer); _rolesRefreshTimer = null; }
+  }
+  var _scopesRefreshTimer = null;
+  function _stopScopesRefresh() {
+    if (_scopesRefreshTimer) { clearInterval(_scopesRefreshTimer); _scopesRefreshTimer = null; }
+  }
 
   // --- Status color helpers (read from CSS variables for theme support) ---
   function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
@@ -74,7 +100,17 @@
         <div class="analytics-header">
           <h2>📊 Mesh Analytics</h2>
           <p class="text-muted">Deep dive into your mesh network data</p>
-          <div id="analyticsRegionFilter" class="region-filter-container"></div>
+          <div class="analytics-filters">
+            <div id="analyticsRegionFilter" class="region-filter-container"></div>
+            <div id="analyticsAreaFilter" style="display:none"></div>
+            <select id="analyticsTimeWindow" class="analytics-time-window-select" data-testid="analytics-time-window" aria-label="Time window">
+              <option value="">All data</option>
+              <option value="1h">Last 1 hour</option>
+              <option value="24h">Last 24 hours</option>
+              <option value="7d">Last 7 days</option>
+              <option value="30d">Last 30 days</option>
+            </select>
+          </div>
           <div class="analytics-tabs" id="analyticsTabs" role="tablist" aria-label="Analytics tabs">
             <button class="tab-btn active" data-tab="overview">Overview</button>
             <button class="tab-btn" data-tab="rf">RF / Signal</button>
@@ -88,6 +124,11 @@
             <button class="tab-btn" data-tab="neighbor-graph">Neighbor Graph</button>
             <button class="tab-btn" data-tab="rf-health">RF Health</button>
             <button class="tab-btn" data-tab="clock-health">Clock Health</button>
+            <!-- #1085 — Roles tab folded in from former /#/roles standalone page.
+                 Placed after Clock Health (clock-skew posture is shown per-role
+                 inside this tab) and before Prefix Tool (utility tabs trail). -->
+            <button class="tab-btn" data-tab="roles">Roles</button>
+            <button class="tab-btn" data-tab="scopes">Scopes</button>
             <button class="tab-btn" data-tab="prefix-tool">Prefix Tool</button>
           </div>
         </div>
@@ -96,21 +137,53 @@
         </div>
       </div>`;
 
+    // Tabs where the area filter is meaningful (transmitter GPS attribution)
+    const AREA_FILTER_TABS = new Set(['overview', 'rf', 'topology', 'hashsizes', 'collisions', 'nodes', 'clock-health']);
+
+    function setAreaFilterVisibility(tab) {
+      const el = document.getElementById('analyticsAreaFilter');
+      if (el) el.style.display = AREA_FILTER_TABS.has(tab) ? '' : 'none';
+    }
+
     // Tab handling
     const analyticsTabs = document.getElementById('analyticsTabs');
     initTabBar(analyticsTabs);
+    // #749 — keep analytics tab + window in URL for deep-linking.
+    function _updateAnalyticsUrl() {
+      if (!window.URLState) return;
+      var twElNow = document.getElementById('analyticsTimeWindow');
+      var updates = {
+        tab: _currentTab && _currentTab !== 'overview' ? _currentTab : '',
+        window: twElNow && twElNow.value ? twElNow.value : ''
+      };
+      // Drop any subview-specific keys that don't belong to the active tab
+      // so switching tabs gives a clean URL. (rf-health uses 'range', 'observer', 'from', 'to')
+      if (_currentTab !== 'rf-health') {
+        var cleared = ['range', 'observer', 'from', 'to'];
+        for (var i = 0; i < cleared.length; i++) updates[cleared[i]] = '';
+      }
+      var newHash = URLState.updateHashParams(updates, location.hash);
+      if (newHash !== location.hash) history.replaceState(null, '', newHash);
+    }
+
     analyticsTabs.addEventListener('click', e => {
       const btn = e.target.closest('.tab-btn');
       if (!btn) return;
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       _currentTab = btn.dataset.tab;
+      setAreaFilterVisibility(_currentTab);
+      // #1085 — Roles tab owns its own 60s auto-refresh; stop it on switch.
+      if (_currentTab !== 'roles') _stopRolesRefresh();
+      if (_currentTab !== 'scopes') _stopScopesRefresh();
+      _updateAnalyticsUrl();
       renderTab(_currentTab);
     });
 
-    // Deep-link: #/analytics?tab=collisions
+    // Deep-link: #/analytics?tab=collisions&window=7d
     const hashParams = location.hash.split('?')[1] || '';
-    const urlTab = new URLSearchParams(hashParams).get('tab');
+    const _ap = new URLSearchParams(hashParams);
+    const urlTab = _ap.get('tab');
     if (urlTab) {
       const tabBtn = analyticsTabs.querySelector(`[data-tab="${urlTab}"]`);
       if (tabBtn) {
@@ -119,9 +192,24 @@
         _currentTab = urlTab;
       }
     }
+    // #749 — restore time window from URL.
+    const urlWindow = _ap.get('window');
+    if (urlWindow) {
+      const twInit = document.getElementById('analyticsTimeWindow');
+      if (twInit) twInit.value = urlWindow;
+    }
 
     RegionFilter.init(document.getElementById('analyticsRegionFilter'));
+    AreaFilter.init(document.getElementById('analyticsAreaFilter'));
+    setAreaFilterVisibility(_currentTab);
     RegionFilter.onChange(function () { loadAnalytics(); });
+    AreaFilter.onChange(function () { loadAnalytics(); });
+
+    // Time-window picker (#842) — refresh analytics on change.
+    const tw = document.getElementById('analyticsTimeWindow');
+    if (tw) {
+      tw.addEventListener('change', function () { _updateAnalyticsUrl(); loadAnalytics(); });
+    }
 
     // Delegated click/keyboard handler for clickable table rows
     const analyticsContent = document.getElementById('analyticsContent');
@@ -150,14 +238,30 @@
   async function loadAnalytics() {
     try {
       _analyticsData = {};
-      const rqs = RegionFilter.regionQueryString();
-      const sep = rqs ? '?' + rqs.slice(1) : '';
+      const rqs = RegionFilter.regionQueryString(); // "&region=..." or ""
+      const aqs = AreaFilter.areaQueryString();     // "&area=..." or ""
+      // Time window picker (#842) — append &window=… when set.
+      // NOTE: only the three window-aware endpoints (rf/topology/channels)
+      // receive ?window=…; hash-sizes and hash-collisions are about node
+      // identity / hash-byte distribution and intentionally span all data.
+      const twEl = document.getElementById('analyticsTimeWindow');
+      const twVal = twEl ? twEl.value : '';
+      const tws = twVal ? '&window=' + encodeURIComponent(twVal) : '';
+      // hash-sizes / hash-collisions: region + area, no window
+      const baseQS = (rqs + aqs).slice(1);
+      const sepBase = baseQS ? '?' + baseQS : '';
+      // rf / topology: region + area + window
+      const windowedQS = (rqs + aqs + tws).slice(1);
+      const sepWin = windowedQS ? '?' + windowedQS : '';
+      // channels: region + window (no area per original PR intent)
+      const chanQS = (rqs + tws).slice(1);
+      const sepChan = chanQS ? '?' + chanQS : '';
       const [hashData, rfData, topoData, chanData, collisionData] = await Promise.all([
-        api('/analytics/hash-sizes' + sep, { ttl: CLIENT_TTL.analyticsRF }),
-        api('/analytics/rf' + sep, { ttl: CLIENT_TTL.analyticsRF }),
-        api('/analytics/topology' + sep, { ttl: CLIENT_TTL.analyticsRF }),
-        api('/analytics/channels' + sep, { ttl: CLIENT_TTL.analyticsRF }),
-        api('/analytics/hash-collisions' + sep, { ttl: CLIENT_TTL.analyticsRF }),
+        api('/analytics/hash-sizes' + sepBase, { ttl: CLIENT_TTL.analyticsRF }),
+        api('/analytics/rf' + sepWin, { ttl: CLIENT_TTL.analyticsRF }),
+        api('/analytics/topology' + sepWin, { ttl: CLIENT_TTL.analyticsRF }),
+        api('/analytics/channels' + sepChan, { ttl: CLIENT_TTL.analyticsRF }),
+        api('/analytics/hash-collisions' + sepBase, { ttl: CLIENT_TTL.analyticsRF }),
       ]);
       _analyticsData = { hashData, rfData, topoData, chanData, collisionData };
       renderTab(_currentTab);
@@ -183,7 +287,9 @@
       case 'neighbor-graph': await renderNeighborGraphTab(el); break;
       case 'rf-health': await renderRFHealthTab(el); break;
       case 'clock-health': await renderClockHealthTab(el); break;
+      case 'roles': await renderRolesTab(el); break;
       case 'prefix-tool': await renderPrefixTool(el); break;
+      case 'scopes': await renderScopesTab(el); break;
     }
     // Auto-apply column resizing to all analytics tables
     requestAnimationFrame(() => {
@@ -711,6 +817,7 @@
   // ===================== CHANNELS =====================
   var _channelSortState = null;
   var _channelData = null;
+  var _channelRenderGen = 0;
   var CHANNEL_SORT_KEY = 'meshcore-channel-sort';
 
   function loadChannelSort() {
@@ -719,6 +826,18 @@
       if (s) { var p = JSON.parse(s); if (p.col && p.dir) return p; }
     } catch (e) {}
     return { col: 'lastActivity', dir: 'desc' };
+  }
+
+  // True when the user has explicitly chosen a sort (saved in localStorage).
+  // Used by the grouped analytics view to decide whether to apply its own
+  // default ("messages desc") instead of the global flat-list default.
+  function hasSavedChannelSort() {
+    try {
+      var s = localStorage.getItem(CHANNEL_SORT_KEY);
+      if (!s) return false;
+      var p = JSON.parse(s);
+      return !!(p && p.col && p.dir);
+    } catch (e) { return false; }
   }
 
   function saveChannelSort(state) {
@@ -755,20 +874,107 @@
   }
 
   function channelRowHtml(c) {
+    var name = c.displayName || c.name || 'Unknown';
     return '<tr class="clickable-row" data-action="navigate" data-value="#/channels?ch=' + c.hash + '" tabindex="0" role="row">' +
-      '<td><strong>' + esc(c.name || 'Unknown') + '</strong></td>' +
+      '<td><strong>' + esc(name) + '</strong></td>' +
       '<td class="mono">' + (typeof c.hash === 'number' ? '0x' + c.hash.toString(16).toUpperCase().padStart(2, '0') : c.hash) + '</td>' +
       '<td>' + c.messages + '</td>' +
       '<td>' + c.senders + '</td>' +
       '<td>' + timeAgo(c.lastActivity) + '</td>' +
-      '<td>' + (c.encrypted ? '🔒' : '✅') + '</td>' +
+      '<td>' + (c.encrypted ? (c.group === 'mine' ? '🔑' : '🔒') : '✅') + '</td>' +
     '</tr>';
   }
 
-  function channelTbodyHtml(channels, col, dir) {
+  // ── PSK-aware decoration ──────────────────────────────────────────────────
+  // Server returns raw "chNNN" placeholder names for encrypted channels it
+  // doesn't know. Decorate so the UI shows a useful display name and a
+  // group bucket: mine / network / encrypted. Pure function for testability.
+  function decorateAnalyticsChannels(channels, hashByteToKeyName, labels) {
+    var keyMap = hashByteToKeyName || {};
+    var lab = labels || {};
+    var out = [];
+    for (var i = 0; i < (channels || []).length; i++) {
+      var c = channels[i];
+      var copy = Object.assign({}, c);
+      var hashNum = typeof c.hash === 'number' ? c.hash : parseInt(c.hash, 10);
+      var rawName = String(c.name || '');
+      var isPlaceholder = /^ch(\d+|\?)$/.test(rawName);
+      if (c.encrypted) {
+        var keyName = !isNaN(hashNum) ? keyMap[hashNum] : null;
+        if (keyName) {
+          copy.displayName = lab[keyName] || keyName;
+          copy.group = 'mine';
+        } else if (isPlaceholder || !rawName) {
+          // Placeholder ("chNNN") or empty name → render as opaque encrypted.
+          // Empty-name encrypted rows would otherwise leak through with an
+          // empty <strong> in the row; force the placeholder rendering.
+          copy.displayName = !isNaN(hashNum)
+            ? '🔒 Encrypted (0x' + hashNum.toString(16).toUpperCase().padStart(2, '0') + ')'
+            : '🔒 Encrypted';
+          copy.group = 'encrypted';
+        } else {
+          // Server gave us a real name (rainbow table hit) for an encrypted ch.
+          copy.displayName = rawName;
+          copy.group = 'network';
+        }
+      } else {
+        copy.displayName = rawName || 'Unknown';
+        copy.group = 'network';
+      }
+      out.push(copy);
+    }
+    return out;
+  }
+
+  // Build the (hash byte → key name) map from ChannelDecrypt's stored keys.
+  // Async because computeChannelHash uses subtle.digest. Returns {} if the
+  // module or its keys are unavailable (graceful fallback).
+  async function buildHashKeyMap() {
+    if (typeof ChannelDecrypt === 'undefined' || !ChannelDecrypt.getStoredKeys) return {};
+    var keys = ChannelDecrypt.getStoredKeys();
+    var map = {};
+    var names = Object.keys(keys || {});
+    for (var ni = 0; ni < names.length; ni++) {
+      var name = names[ni];
+      try {
+        var bytes = ChannelDecrypt.hexToBytes(keys[name]);
+        var hb = await ChannelDecrypt.computeChannelHash(bytes);
+        if (typeof hb === 'number') map[hb] = name;
+      } catch (e) { /* skip bad key */ }
+    }
+    return map;
+  }
+
+  function channelTbodyHtml(channels, col, dir, opts) {
     var sorted = sortChannels(channels, col, dir);
     var parts = [];
-    for (var i = 0; i < sorted.length; i++) parts.push(channelRowHtml(sorted[i]));
+    if (opts && opts.grouped) {
+      // Group by .group: mine → network → encrypted. Inside each group keep
+      // the active sort (caller passes col/dir; for the integration we sort
+      // by messages desc by default).
+      var groups = { mine: [], network: [], encrypted: [] };
+      for (var gi = 0; gi < sorted.length; gi++) {
+        var g = sorted[gi].group || (sorted[gi].encrypted ? 'encrypted' : 'network');
+        (groups[g] || (groups[g] = [])).push(sorted[gi]);
+      }
+      var sections = [
+        { key: 'mine', label: '🔑 My Channels' },
+        { key: 'network', label: '📻 Network' },
+        { key: 'encrypted', label: '🔒 Encrypted' },
+      ];
+      for (var si = 0; si < sections.length; si++) {
+        var rows = groups[sections[si].key] || [];
+        if (!rows.length) continue;
+        parts.push(
+          '<tr class="ch-section-row"><td colspan="6" class="ch-section-header">' +
+          esc(sections[si].label) + ' <span class="text-muted">(' + rows.length + ')</span>' +
+          '</td></tr>'
+        );
+        for (var ri = 0; ri < rows.length; ri++) parts.push(channelRowHtml(rows[ri]));
+      }
+    } else {
+      for (var i = 0; i < sorted.length; i++) parts.push(channelRowHtml(sorted[i]));
+    }
     return parts.join('');
   }
 
@@ -799,13 +1005,39 @@
     var tbody = document.getElementById('channelsTbody');
     var thead = document.querySelector('#channelsTable thead');
     if (!tbody || !_channelData) return;
-    tbody.innerHTML = channelTbodyHtml(_channelData, _channelSortState.col, _channelSortState.dir);
+    tbody.innerHTML = channelTbodyHtml(_channelData, _channelSortState.col, _channelSortState.dir, { grouped: true });
     if (thead) thead.outerHTML = channelTheadHtml(_channelSortState.col, _channelSortState.dir);
   }
 
   function renderChannels(el, ch) {
-    _channelData = ch.channels;
-    if (!_channelSortState) _channelSortState = loadChannelSort();
+    // Decorate first so grouping/display name reflect locally-stored PSK keys.
+    // buildHashKeyMap is async; render once with a sync best-effort empty map,
+    // then upgrade once keys resolve. That keeps first paint fast and avoids
+    // blocking on subtle.digest in environments where it's slow.
+    var rawChannels = ch.channels || [];
+    // Resolve the persisted sort first so the default-fallback below doesn't
+    // shadow what the user previously chose. Default for the grouped view is
+    // messages desc (matches the PR description); only used when nothing saved.
+    if (!_channelSortState) {
+      _channelSortState = hasSavedChannelSort()
+        ? loadChannelSort()
+        : { col: 'messages', dir: 'desc' };
+    }
+    var ranOnce = false;
+    // Generation token: if renderChannels is called again before
+    // buildHashKeyMap() resolves, the older promise must not clobber the
+    // newer rawChannels / decoration with stale-key data.
+    var myGen = ++_channelRenderGen;
+    function applyDecorate(map) {
+      if (myGen !== _channelRenderGen) return; // superseded
+      var labels = (typeof ChannelDecrypt !== 'undefined' && ChannelDecrypt.getLabels)
+        ? ChannelDecrypt.getLabels() : {};
+      _channelData = decorateAnalyticsChannels(rawChannels, map, labels);
+      if (ranOnce) updateChannelTable();
+    }
+    applyDecorate({});
+    ranOnce = true;
+    buildHashKeyMap().then(applyDecorate).catch(function () { /* graceful */ });
 
     var timelineHtml = renderChannelTimeline(ch.channelTimeline);
     var topSendersHtml = renderTopSenders(ch.topSenders);
@@ -818,7 +1050,7 @@
         '<table class="analytics-table" id="channelsTable">' +
           channelTheadHtml(_channelSortState.col, _channelSortState.dir) +
           '<tbody id="channelsTbody">' +
-            channelTbodyHtml(_channelData, _channelSortState.col, _channelSortState.dir) +
+            channelTbodyHtml(_channelData, _channelSortState.col, _channelSortState.dir, { grouped: true }) +
           '</tbody>' +
         '</table>' +
       '</div>' +
@@ -1147,7 +1379,7 @@
         <span style="color:var(--border)">|</span>
         <a href="#/analytics?tab=prefix-tool" style="color:var(--accent)">🔎 Check a prefix →</a>
       </nav>
-      <p class="text-muted" style="margin:0 0 12px;font-size:0.78em">This tab shows operational collisions among <strong>repeaters</strong> grouped by their configured hash size. The <a href="#/analytics?tab=prefix-tool" style="color:var(--accent)">Prefix Tool</a> checks all repeaters regardless of their configured hash size.</p>
+      <p class="text-muted" style="margin:0 0 12px;font-size:0.78em">Collisions <strong>actually observed in packet traffic</strong> — among <strong>repeaters</strong> grouped by their configured hash size. For <em>theoretical</em> address conflicts that <em>would</em> occur if all repeaters used a given hash size, see the <a href="#/analytics?tab=prefix-tool" style="color:var(--accent)">Prefix Tool</a> tab.</p>
 
       <div class="analytics-card" id="inconsistentHashSection">
         <div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0">⚠️ Inconsistent Hash Sizes</h3><a href="#/analytics?tab=collisions" style="font-size:11px;color:var(--text-muted)">↑ top</a></div>
@@ -1383,6 +1615,14 @@
     html += hashMatrixLegendHtml(legendLabels);
     el.innerHTML = html;
     initMatrixTooltip(el);
+    // #1473 — Grey out cells whose first byte the MeshCore firmware keygen
+    // routine avoids (pub_key[0] in {0x00, 0xFF}). This is a keygen
+    // CONVENTION, not a protocol-level rejection — see firmware
+    // examples/simple_repeater/main.cpp:83 (HEAD 8ede7641). Must run BEFORE
+    // we wire click handlers so .hash-active is stripped first.
+    if (typeof PrefixReserved !== 'undefined' && PrefixReserved && typeof PrefixReserved.markReservedCells === 'function') {
+      PrefixReserved.markReservedCells(el);
+    }
     el.querySelectorAll('.hash-active').forEach(td => {
       td.addEventListener('click', () => {
         clickHandlerFn(td);
@@ -1732,8 +1972,8 @@
 
         <div class="subpath-section">
           <h5>⏱️ Timeline</h5>
-          <div>First seen: ${data.firstSeen ? new Date(data.firstSeen).toLocaleString() : '—'}</div>
-          <div>Last seen: ${data.lastSeen ? new Date(data.lastSeen).toLocaleString() : '—'}</div>
+          <div>First seen: ${data.firstSeen ? (typeof formatAbsoluteTimestamp === 'function' ? formatAbsoluteTimestamp(data.firstSeen) : new Date(data.firstSeen).toLocaleString()) : '—'}</div>
+          <div>Last seen: ${data.lastSeen ? (typeof formatAbsoluteTimestamp === 'function' ? formatAbsoluteTimestamp(data.lastSeen) : new Date(data.lastSeen).toLocaleString()) : '—'}</div>
         </div>
 
         ${data.observers.length ? `
@@ -1777,7 +2017,7 @@
   async function renderNodesTab(el) {
     el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading node analytics…</div>';
     try {
-      const rq = RegionFilter.regionQueryString();
+      const rq = RegionFilter.regionQueryString() + AreaFilter.areaQueryString();
       const [nodesResp, bulkHealth] = await Promise.all([
         api('/nodes?limit=10000&sortBy=lastSeen' + rq, { ttl: CLIENT_TTL.nodeList }),
         api('/nodes/bulk-health?limit=50' + rq, { ttl: CLIENT_TTL.analyticsRF })
@@ -2025,10 +2265,11 @@
     }
   }
 
-function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _ngState.animId) { cancelAnimationFrame(_ngState.animId); } _ngState = null; if (_themeRefreshHandler) { window.removeEventListener('theme-refresh', _themeRefreshHandler); _themeRefreshHandler = null; } }
+function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData = {}; _channelData = null; if (_ngState && _ngState.animId) { cancelAnimationFrame(_ngState.animId); } _ngState = null; if (_themeRefreshHandler) { window.removeEventListener('theme-refresh', _themeRefreshHandler); _themeRefreshHandler = null; } }
 
   // Expose for testing
   if (typeof window !== 'undefined') {
+    window._analyticsDecorateChannels = decorateAnalyticsChannels;
     window._analyticsSortChannels = sortChannels;
     window._analyticsLoadChannelSort = loadChannelSort;
     window._analyticsSaveChannelSort = saveChannelSort;
@@ -2509,12 +2750,18 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
   async function renderPrefixTool(el) {
     el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading prefix data…</div>';
 
-    const rq = RegionFilter.regionQueryString();
+    const rq = RegionFilter.regionQueryString() + AreaFilter.areaQueryString();
     const regionLabel = rq ? (new URLSearchParams(rq.slice(1)).get('region') || '') : '';
 
-    let nodesResp;
+    let nodesResp, hashSizesResp;
     try {
-      nodesResp = await api('/nodes?limit=10000&sortBy=lastSeen' + rq, { ttl: CLIENT_TTL.nodeList });
+      [nodesResp, hashSizesResp] = await Promise.all([
+        api('/nodes?limit=10000&sortBy=lastSeen' + rq, { ttl: CLIENT_TTL.nodeList }),
+        // #1270: fetch CONFIGURED-hash-size counts so the Network Overview
+        // tells the operational story (matching Hash Stats "By Repeaters"),
+        // not just a math-only count of unique pubkey slices.
+        api('/analytics/hash-sizes' + rq, { ttl: CLIENT_TTL.analyticsRF }).catch(() => null),
+      ]);
     } catch (e) {
       el.innerHTML = `<div class="text-muted" role="alert" style="padding:40px">Failed to load: ${esc(e.message)}</div>`;
       return;
@@ -2558,6 +2805,75 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
       };
     });
 
+    // #1270: CONFIGURED-hash-size counts (operational truth) from
+    // /api/analytics/hash-sizes — same source the Hash Stats tab uses.
+    // distributionByRepeaters keys are stringified ints ("1","2","3").
+    // "0" = no adverts observed yet, so the configured size is unknown
+    // and that node doesn't count for any tier.
+    const distByRepeaters = (hashSizesResp && hashSizesResp.distributionByRepeaters) || {};
+    const configuredCount = {
+      1: Number(distByRepeaters['1'] || 0),
+      2: Number(distByRepeaters['2'] || 0),
+      3: Number(distByRepeaters['3'] || 0),
+    };
+    const totalConfigured = configuredCount[1] + configuredCount[2] + configuredCount[3];
+
+    // Operational collisions per tier: only consider repeaters CONFIGURED
+    // for this hash size — same definition the Hash Issues tab uses.
+    // n.hash_size is enriched on the /nodes payload from GetNodeHashSizeInfo.
+    // #1306: keep the per-tier *node lists* per colliding slice so we can
+    // surface WHICH prefixes/nodes collide (not just an aggregate count).
+    const opCollisions = { 1: 0, 2: 0, 3: 0 };
+    const opIdx = { 1: new Map(), 2: new Map(), 3: new Map() };
+    [1, 2, 3].forEach(b => {
+      nodes.forEach(n => {
+        if (n.hash_size !== b) return;
+        const p = n.public_key.toUpperCase().slice(0, b * 2);
+        if (!opIdx[b].has(p)) opIdx[b].set(p, []);
+        opIdx[b].get(p).push(n);
+      });
+      opCollisions[b] = [...opIdx[b].values()].filter(arr => arr.length > 1).length;
+    });
+
+    // #1306: precompute colliding slices per tier (entries with >1 node) for
+    // the "Show N colliding slices →" expandable lists. THEORETICAL = across
+    // every repeater's pubkey prefix (math fact). OPERATIONAL = only among
+    // repeaters configured for this hash size (matches Hash Issues tab math).
+    const collEntries = { theoretical: { 1: [], 2: [], 3: [] }, operational: { 1: [], 2: [], 3: [] } };
+    [1, 2, 3].forEach(b => {
+      collEntries.theoretical[b] = [...idx[b].entries()]
+        .filter(([, arr]) => arr.length > 1)
+        .sort((a, b2) => b2[1].length - a[1].length || a[0].localeCompare(b2[0]));
+      collEntries.operational[b] = [...opIdx[b].entries()]
+        .filter(([, arr]) => arr.length > 1)
+        .sort((a, b2) => b2[1].length - a[1].length || a[0].localeCompare(b2[0]));
+    });
+
+    // #1306: render a "Prefix · Nodes sharing" table for a list of
+    // colliding entries `[ [prefix, [node, ...]], ... ]`.
+    function renderCollideTable(entries) {
+      if (!entries || !entries.length) {
+        return '<div class="text-muted" style="padding:8px;font-size:0.8em">No collisions.</div>';
+      }
+      const rows = entries.map(([prefix, arr]) => {
+        const nodeLinks = arr.map(n => {
+          const label = esc(n.name || n.public_key.slice(0, 10));
+          return `<a href="#/nodes/${encodeURIComponent(n.public_key)}" style="color:var(--accent);text-decoration:none">${label}</a>`;
+        }).join(', ');
+        return `<tr>
+          <td style="padding:4px 8px;font-family:var(--mono);font-weight:600;border-bottom:1px solid var(--border);white-space:nowrap">${esc(prefix)}</td>
+          <td style="padding:4px 8px;font-size:0.85em;border-bottom:1px solid var(--border)">${nodeLinks} <span class="text-muted" style="font-size:0.85em">(${arr.length})</span></td>
+        </tr>`;
+      }).join('');
+      return `<table style="width:100%;border-collapse:collapse;font-size:0.85em">
+        <thead><tr>
+          <th scope="col" style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border);background:var(--bg-secondary,var(--bg))">Prefix</th>
+          <th scope="col" style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border);background:var(--bg-secondary,var(--bg))">Nodes sharing it</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    }
+
     // Recommendation by network size
     const totalNodes = nodes.length;
     let rec, recDetail;
@@ -2590,29 +2906,81 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
             <div class="analytics-stat-card" style="flex:1;min-width:110px">
               <div class="analytics-stat-label">Total repeaters</div>
               <div class="analytics-stat-value">${totalNodes.toLocaleString()}</div>
+              <div class="text-muted" style="font-size:0.78em;margin-top:4px">
+                ${totalConfigured.toLocaleString()} with known hash size
+              </div>
             </div>
-            ${[1, 2, 3].map(b => `
-            <div class="analytics-stat-card" style="flex:1;min-width:150px;border-color:${stats[b].collidingPrefixes > 0 ? 'var(--status-red)' : 'var(--border)'}">
+            ${[1, 2, 3].map(b => {
+              // #1270: PRIMARY = configured-for-this-size repeater count
+              // (operational truth, matches Hash Stats "By Repeaters").
+              // SECONDARY = math fact (unique pubkey slices). OPERATIONAL
+              // address conflicts = colliding slices among configured-for-this-size repeaters only.
+              const cfg = configuredCount[b];
+              const opC = opCollisions[b];
+              const theoC = stats[b].collidingPrefixes;
+              const borderVar = opC > 0 ? 'var(--status-red)' : 'var(--border)';
+              // #1306: replace bare "collisions" with "address conflicts" to
+              // distinguish theoretical/would-collide-if-used from packet-
+              // traffic-observed collisions shown on the Hash Issues tab.
+              const opLine = opC === 0
+                ? `<span style="color:var(--status-green)">✅ No address conflicts among configured repeaters</span>`
+                : `<span style="color:var(--status-red)">⚠️ ${opC} address conflict${opC !== 1 ? 's' : ''} among configured repeaters (would-collide-if-used)</span>`;
+              // #1306: expandable WHICH-collides toggles (op + theoretical)
+              const opEntries = collEntries.operational[b];
+              const theoEntries = collEntries.theoretical[b];
+              const opTogId = `ptCollOp${b}`;
+              const theoTogId = `ptCollTheo${b}`;
+              const opToggle = opC > 0 ? `
+                <div style="margin-top:6px">
+                  <button type="button" class="pt-collide-toggle-btn" data-pt-collide-toggle="op-${b}" data-target="${opTogId}"
+                    aria-expanded="false"
+                    style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:0.82em;padding:0">
+                    Show ${opC} colliding slice${opC !== 1 ? 's' : ''} →
+                  </button>
+                  <div id="${opTogId}" data-pt-collide-panel="op-${b}" style="display:none;margin-top:6px;max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg)">
+                    ${renderCollideTable(opEntries)}
+                  </div>
+                </div>` : '';
+              const theoToggle = theoC > 0 ? `
+                <div style="margin-top:4px">
+                  <button type="button" class="pt-collide-toggle-btn" data-pt-collide-toggle="theo-${b}" data-target="${theoTogId}"
+                    aria-expanded="false"
+                    style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:0.78em;padding:0">
+                    Show ${theoC} would-collide slice${theoC !== 1 ? 's' : ''} (across all repeaters) →
+                  </button>
+                  <div id="${theoTogId}" data-pt-collide-panel="theo-${b}" style="display:none;margin-top:6px;max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg)">
+                    ${renderCollideTable(theoEntries)}
+                  </div>
+                </div>` : '';
+              return `
+            <div class="analytics-stat-card" style="flex:1;min-width:170px;border-color:${borderVar}">
               <div class="analytics-stat-label">${b}-byte prefixes</div>
-              <div class="analytics-stat-value" style="font-size:1em">
-                ${stats[b].usedPrefixes.toLocaleString()}
-                <span class="text-muted" style="font-size:0.7em"> / ${spaceSizes[b].toLocaleString()}</span>
+              <div class="analytics-stat-value" style="font-size:1em"
+                   data-pt-configured="${b}" data-value="${cfg}">
+                ${cfg.toLocaleString()}
+                <span class="text-muted" style="font-size:0.7em"> of ${totalNodes.toLocaleString()} repeaters configured</span>
               </div>
-              <div style="font-size:0.82em;margin-top:4px;color:${stats[b].collidingPrefixes > 0 ? 'var(--status-red)' : 'var(--status-green)'}">
-                ${stats[b].collidingPrefixes === 0
-                  ? '✅ No collisions'
-                  : `⚠️ ${stats[b].collidingPrefixes} prefix${stats[b].collidingPrefixes !== 1 ? 'es' : ''} collide`}
+              <div style="font-size:0.82em;margin-top:4px">${opLine}</div>
+              ${opToggle}
+              <div class="text-muted" style="font-size:0.72em;margin-top:6px;border-top:1px dashed var(--border);padding-top:4px">
+                <em>Theoretical:</em> ${stats[b].usedPrefixes.toLocaleString()} unique ${b}-byte slice${stats[b].usedPrefixes !== 1 ? 's' : ''}
+                across all repeater pubkeys (of ${spaceSizes[b].toLocaleString()} possible)${theoC > 0 ? ` — ${theoC} would-collide if every repeater used ${b}-byte` : ''}
               </div>
-            </div>`).join('')}
+              ${theoToggle}
+            </div>`;
+            }).join('')}
+          </div>
+          <div style="background:var(--bg-secondary,var(--bg));border:1px solid var(--accent);border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:0.85em">
+            <strong>ℹ️ Theoretical vs observed:</strong> These are <em>theoretical address conflicts</em> that would occur IF all repeaters used this hash size (would-collide-if-used). For collisions <em>actually observed in packet traffic</em>, see the <a href="#/analytics?tab=collisions" style="color:var(--accent)">Hash Issues</a> tab.
           </div>
           <div style="background:var(--bg-secondary,var(--bg));border:1px solid var(--border);border-radius:6px;padding:10px 14px;margin-bottom:12px">
             <strong>Recommendation: ${rec} prefixes</strong> — ${recDetail}
             <span class="text-muted" style="font-size:0.8em;display:block;margin-top:4px">Hash size is configured per-node in firmware. Changing requires reflashing.</span>
           </div>
           <div style="background:var(--bg-secondary,var(--bg));border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:0.85em">
-            <strong>ℹ️ About these numbers:</strong> This tool checks <em>repeater</em> public key prefixes regardless of their configured hash size. Only repeaters are included because they are the nodes that relay packets using hash-based addressing.
-            The <a href="#/analytics?tab=collisions" style="color:var(--accent)">Hash Issues</a> tab shows only <em>operational</em> collisions — nodes that actually use the same hash size and are repeaters.
-            A collision shown here may not appear in Hash Issues if the nodes use a different hash size.
+            <strong>ℹ️ About these numbers:</strong> The primary count is how many repeaters are <em>configured</em> for each hash size (their advertised path hash byte length), matching the
+            <a href="#/analytics?tab=hashsizes" style="color:var(--accent)">Hash Stats</a> tab. Address conflicts (would-collide-if-used) count colliding slices among repeaters configured for the same hash size — same definition the
+            <a href="#/analytics?tab=collisions" style="color:var(--accent)">Hash Issues</a> tab uses, except Hash Issues counts collisions <em>actually observed in packet traffic</em> rather than theoretical. The <em>theoretical</em> line shows the math fact: how many distinct slices appear when every repeater pubkey is truncated to N bytes, regardless of configured hash size.
           </div>
         </div>
       </div>
@@ -2632,6 +3000,12 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
       <div class="analytics-card" id="ptGenerator">
         <h3 style="margin-top:0">Generate Available Prefix</h3>
         <p class="text-muted" style="margin-top:0;font-size:0.9em">Find a prefix with zero current collisions.</p>
+        <p class="text-muted" style="margin:4px 0 10px;font-size:0.82em">
+          <span aria-hidden="true">🚫</span>
+          <strong>0x00 and 0xFF excluded</strong> as a first byte — the MeshCore firmware keygen routine re-rolls identities whose <code>pub_key[0]</code> is <code>00</code> or <code>FF</code>, so by convention you should not see those prefixes on real nodes (see
+          <a href="https://github.com/meshcore-dev/MeshCore/blob/8ede7641/examples/simple_repeater/main.cpp#L83"
+             target="_blank" rel="noopener noreferrer" style="color:var(--accent)">simple_repeater/main.cpp:83</a>).
+        </p>
         <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
             <input type="radio" name="ptGenSize" value="1" ${initGenerate === '1' ? 'checked' : ''}> 1-byte
@@ -2660,7 +3034,7 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
       const name = esc(n.name || n.public_key.slice(0, 12));
       const role = n.role ? `<span class="text-muted" style="font-size:0.82em">${esc(n.role)}</span>` : '';
       const hs = n.hash_size ? ` <span class="text-muted" style="font-size:0.78em;opacity:0.7">${n.hash_size}B hash</span>` : '';
-      const when = n.last_seen ? ` <span class="text-muted" style="font-size:0.8em">${new Date(n.last_seen).toLocaleDateString()}</span>` : '';
+      const when = n.last_seen ? ` <span class="text-muted" style="font-size:0.8em">${(typeof formatAbsoluteTimestamp === 'function') ? formatAbsoluteTimestamp(n.last_seen) : new Date(n.last_seen).toLocaleDateString()}</span>` : '';
       return `<div style="padding:3px 0"><a href="#/nodes/${encodeURIComponent(n.public_key)}" class="analytics-link">${name}</a> ${role}${hs}${when}</div>`;
     }
 
@@ -2692,6 +3066,19 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
         : [{ b: input.length / 2, prefix: input }];
 
       let html = '';
+      // #1473 — Warn when the user pastes a prefix or full pubkey whose
+      // first byte is one the MeshCore firmware keygen routine avoids
+      // (pub_key[0] in {0x00, 0xFF}). Firmware keygen CONVENTION, not a
+      // protocol-level rejection — see simple_repeater/main.cpp:83.
+      if (typeof PrefixReserved !== 'undefined' && PrefixReserved &&
+          PrefixReserved.isReservedPrefix(input)) {
+        html += `<div role="alert" style="margin-bottom:10px;padding:10px 14px;border:1px solid var(--status-yellow);border-radius:6px;background:var(--bg-secondary,var(--bg))">
+          <strong style="color:var(--status-yellow)">⚠️ Firmware avoids this first byte</strong>
+          <div class="text-muted" style="font-size:0.85em;margin-top:4px">
+            <code class="mono">${input.slice(0,2)}</code> as the first byte of a node pubkey is avoided by the MeshCore firmware keygen convention (the standard repeater re-rolls identities whose <code class="mono">pub_key[0]</code> is <code class="mono">00</code> or <code class="mono">FF</code>). You generally shouldn't see this on real nodes.
+          </div>
+        </div>`;
+      }
       if (isFullKey) {
         const inNetwork = nodes.some(n => n.public_key.toUpperCase() === input);
         html += `<p class="text-muted" style="font-size:0.85em;margin:0 0 10px">Derived prefixes: <code class="mono">${input.slice(0,2)}</code> / <code class="mono">${input.slice(0,4)}</code> / <code class="mono">${input.slice(0,6)}</code>${!inNetwork ? ' — <em>this node is not yet in the network</em>' : ''}</p>`;
@@ -2725,34 +3112,55 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
       const b = sizeInput ? parseInt(sizeInput.value) : 2;
       const hexLen = b * 2;
       const totalSpace = spaceSizes[b];
-      const available = totalSpace - idx[b].size;
+      // #1473 — Reserved prefixes (first byte 0x00 / 0xFF) are dropped from
+      // the candidate pool because the MeshCore firmware keygen routine
+      // re-rolls identities whose pub_key[0] is 0x00 or 0xFF — a keygen
+      // CONVENTION (not a protocol rejection). See firmware
+      // examples/simple_repeater/main.cpp:83 (HEAD 8ede7641).
+      // Available = space - used - reserved.
+      const reservedTotal = (typeof PrefixReserved !== 'undefined' && PrefixReserved)
+        ? PrefixReserved.reservedCount(b)
+        : 0;
+      // Count reserved prefixes that are ALREADY used so we don't subtract them twice.
+      let reservedUsed = 0;
+      if (typeof PrefixReserved !== 'undefined' && PrefixReserved) {
+        for (const p of idx[b].keys()) {
+          if (PrefixReserved.isReservedPrefix(p)) reservedUsed++;
+        }
+      }
+      const available = totalSpace - idx[b].size - (reservedTotal - reservedUsed);
 
-      if (available === 0) {
+      if (available <= 0) {
         const next = b < 3 ? (b + 1) + '-byte' : 'a different size';
         genResultEl.innerHTML = `<p style="color:var(--status-red);margin:0">No collision-free ${b}-byte prefixes available. Try ${next}.</p>`;
         return;
       }
 
+      const isReserved = (p) =>
+        (typeof PrefixReserved !== 'undefined' && PrefixReserved)
+          ? PrefixReserved.isReservedPrefix(p)
+          : false;
+
       let prefix;
       if (b === 1) {
-        // Enumerate all 256 options
+        // Enumerate all 256 options, skipping used + reserved.
         const free = [];
         for (let i = 0; i < totalSpace; i++) {
           const p = i.toString(16).toUpperCase().padStart(hexLen, '0');
-          if (!idx[b].has(p)) free.push(p);
+          if (!idx[b].has(p) && !isReserved(p)) free.push(p);
         }
         prefix = free[Math.floor(Math.random() * free.length)];
       } else {
-        // Random sampling — with 2K used / 65K space, hit rate >96%
+        // Random sampling — with 2K used / 65K space, hit rate >96%.
         let attempts = 0;
         do {
           prefix = Math.floor(Math.random() * totalSpace).toString(16).toUpperCase().padStart(hexLen, '0');
-        } while (idx[b].has(prefix) && ++attempts < 500);
-        // Fallback to enumeration if sampling kept hitting used prefixes
-        if (idx[b].has(prefix)) {
+        } while ((idx[b].has(prefix) || isReserved(prefix)) && ++attempts < 500);
+        // Fallback to enumeration if sampling kept hitting used/reserved prefixes.
+        if (idx[b].has(prefix) || isReserved(prefix)) {
           for (let i = 0; i < totalSpace; i++) {
             const p = i.toString(16).toUpperCase().padStart(hexLen, '0');
-            if (!idx[b].has(p)) { prefix = p; break; }
+            if (!idx[b].has(p) && !isReserved(p)) { prefix = p; break; }
           }
         }
       }
@@ -2791,6 +3199,21 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
       const open = body.style.display === 'none';
       body.style.display = open ? '' : 'none';
       chevron.style.transform = open ? 'rotate(90deg)' : '';
+    });
+
+    // #1306: WHICH-collides toggles
+    document.querySelectorAll('[data-pt-collide-toggle]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const panel = document.getElementById(btn.dataset.target);
+        if (!panel) return;
+        const open = panel.style.display === 'none' || panel.style.display === '';
+        // Toggle: if currently hidden ('none'), open; else close.
+        const currentlyHidden = panel.style.display === 'none';
+        panel.style.display = currentlyHidden ? 'block' : 'none';
+        btn.setAttribute('aria-expanded', String(currentlyHidden));
+        // Swap arrow direction in label
+        btn.textContent = btn.textContent.replace(currentlyHidden ? '→' : '↓', currentlyHidden ? '↓' : '→');
+      });
     });
 
     // Auto-run from URL params
@@ -3158,7 +3581,7 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
       const t = new Date(d.t);
       const x = sx(t.getTime());
       const y = sy(d.v);
-      const ts = t.toISOString().replace('T', ' ').replace(/\.\d+Z/, ' UTC');
+      const ts = (typeof formatAbsoluteTimestamp === 'function') ? formatAbsoluteTimestamp(d.t) : t.toISOString().replace('T', ' ').replace(/\.\d+Z/, ' UTC');
       const tip = `${label}: ${formatV(d.v)}${unit}\n${ts}`;
       svg += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="8" fill="transparent" stroke="none" pointer-events="all"><title>${tip}</title></circle>`;
     });
@@ -3172,7 +3595,7 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
       const idx = Math.floor(i * (data.length - 1) / Math.max(xTicks - 1, 1));
       const t = new Date(data[idx].t);
       const x = sx(t.getTime());
-      const label = t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const label = (typeof formatChartAxisLabel === 'function') ? formatChartAxisLabel(t, true) : t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       svg += `<text x="${x.toFixed(1)}" y="${h - 5}" text-anchor="middle" font-size="9" fill="var(--text-muted)">${label}</text>`;
     }
     return svg;
@@ -3464,7 +3887,8 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
   async function renderClockHealthTab(el) {
     el.innerHTML = '<div class="text-center text-muted" style="padding:40px">Loading clock health data…</div>';
     try {
-      var data = await (await fetch('/api/nodes/clock-skew')).json();
+      const aqs = AreaFilter.areaQueryString();
+      var data = await (await fetch('/api/nodes/clock-skew' + (aqs ? '?' + aqs.slice(1) : ''))).json();
       if (!Array.isArray(data) || !data.length) {
         el.innerHTML = '<div class="text-center text-muted" style="padding:40px">No clock skew data available. Nodes need recent adverts for clock analysis.</div>';
         return;
@@ -3564,6 +3988,241 @@ function destroy() { _analyticsData = {}; _channelData = null; if (_ngState && _
       render();
     } catch (err) {
       el.innerHTML = '<div class="text-center" style="color:var(--status-red);padding:40px">Failed to load clock health data: ' + esc(String(err)) + '</div>';
+    }
+  }
+
+  // ===================== SCOPES =====================
+  async function renderScopesTab(el) {
+    var winKey = 'scopes_window';
+    var selectedWindow = (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(winKey)) || '24h';
+
+    // Fix 5: write static frame only once
+    if (!el.querySelector('#scopes-cards')) {
+      el.innerHTML =
+        '<h3 style="margin:0 0 12px">Scope Statistics</h3>' +
+        '<div style="margin-bottom:12px">' +
+          ['1h', '24h', '7d'].map(function(v) {
+            return '<button class="tab-btn' + (selectedWindow === v ? ' active' : '') + '" data-win="' + v + '">' + v + '</button>';
+          }).join('') +
+        '</div>' +
+        '<div id="scopes-cards" class="stats-grid" style="margin-bottom:16px"></div>' +
+        '<div class="text-center text-muted" id="scopes-loading" style="padding:20px">Loading scope stats…</div>' +
+        '<table class="data-table analytics-table" style="margin-bottom:8px">' +
+          '<thead><tr><th>Region</th><th>Messages</th><th>% of Scoped</th></tr></thead>' +
+          '<tbody id="scopes-tbody"></tbody>' +
+        '</table>' +
+        '<div id="scopes-chart"></div>';
+
+      // Attach window-button click listeners (once)
+      el.querySelectorAll('[data-win]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          selectedWindow = btn.dataset.win;
+          if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(winKey, selectedWindow);
+          el.querySelectorAll('[data-win]').forEach(function(b) { b.classList.toggle('active', b.dataset.win === selectedWindow); });
+          load(selectedWindow);
+        });
+      });
+    }
+
+    function pct(n, total) {
+      if (!total) return '—';
+      return (n / total * 100).toFixed(1) + '%';
+    }
+
+    async function load(w) {
+      var loadingEl = document.getElementById('scopes-loading');
+      if (loadingEl) loadingEl.style.display = '';
+      try {
+        // Fix 4: use api() instead of raw fetch()
+        var data = await api('/scope-stats?window=' + encodeURIComponent(w), { ttl: 30000 });
+        if (loadingEl) loadingEl.style.display = 'none';
+        if (data.error) {
+          var cardsEl2 = document.getElementById('scopes-cards');
+          if (cardsEl2) cardsEl2.innerHTML = '<div class="text-center text-muted" style="padding:20px">' + esc(data.error) + '</div>';
+          return;
+        }
+        updateData(data, w);
+      } catch (err) {
+        if (loadingEl) loadingEl.style.display = 'none';
+        var cardsEl3 = document.getElementById('scopes-cards');
+        if (cardsEl3) cardsEl3.innerHTML = '<div class="text-center" style="color:var(--status-red);padding:20px">Failed to load scope stats: ' + esc(String(err)) + '</div>';
+      }
+    }
+
+    function updateData(d, w) {
+      var s = d.summary;
+      var total = s.transportTotal || 0;
+
+      // Summary cards
+      var cardsEl = document.getElementById('scopes-cards');
+      if (cardsEl) {
+        cardsEl.innerHTML = [
+          { label: 'Transport Total', value: total.toLocaleString(), note: '' },
+          { label: 'Scoped', value: s.scoped.toLocaleString(), note: pct(s.scoped, total) },
+          { label: 'Unscoped', value: s.unscoped.toLocaleString(), note: pct(s.unscoped, total) },
+          { label: 'Unknown Scope', value: s.unknownScope.toLocaleString(), note: pct(s.unknownScope, s.scoped) + ' of scoped' },
+        ].map(function(c) {
+          return '<div class="stat-card"><div class="stat-value">' + c.value + '</div>' +
+            '<div class="stat-label">' + c.label + '</div>' +
+            (c.note ? '<div class="stat-note text-muted" style="font-size:11px">' + c.note + '</div>' : '') +
+            '</div>';
+        }).join('');
+      }
+
+      // Per-region table
+      var tbodyEl = document.getElementById('scopes-tbody');
+      if (tbodyEl) {
+        var tableBody = '';
+        if (d.byRegion && d.byRegion.length) {
+          tableBody = d.byRegion.map(function(r) {
+            return '<tr><td><code>' + esc(r.name) + '</code></td>' +
+              '<td>' + r.count.toLocaleString() + '</td>' +
+              '<td>' + pct(r.count, s.scoped) + '</td></tr>';
+          }).join('');
+          if (s.unknownScope > 0) {
+            tableBody += '<tr><td><em class="text-muted">Unknown scope</em></td>' +
+              '<td>' + s.unknownScope.toLocaleString() + '</td>' +
+              '<td>' + pct(s.unknownScope, s.scoped) + '</td></tr>';
+          }
+        } else if (s.scoped === 0) {
+          tableBody = '<tr><td colspan="3" class="text-muted" style="text-align:center">No scoped messages in this window</td></tr>';
+        } else {
+          tableBody = '<tr><td colspan="3" class="text-muted" style="text-align:center">No regions configured — add <code>hashRegions</code> to your config</td></tr>';
+        }
+        tbodyEl.innerHTML = tableBody;
+      }
+
+      // Time-series chart (two-line SVG)
+      var chartEl = document.getElementById('scopes-chart');
+      if (chartEl) {
+        var chartHtml = '';
+        if (d.timeSeries && d.timeSeries.length > 1) {
+          var scopedVals = d.timeSeries.map(function(p) { return p.scoped; });
+          var unscopedVals = d.timeSeries.map(function(p) { return p.unscoped; });
+          var maxVal = Math.max(1, Math.max.apply(null, scopedVals.concat(unscopedVals)));
+          var W = 800, H = 180, padL = 44, padT = 10, padR = 10;
+          var plotW = W - padL - padR, plotH = H - 24 - padT;
+          var n = d.timeSeries.length;
+
+          function pts(vals) {
+            return vals.map(function(v, i) {
+              var x = padL + i * plotW / Math.max(n - 1, 1);
+              var y = padT + plotH - (v / maxVal) * plotH;
+              return x.toFixed(1) + ',' + y.toFixed(1);
+            }).join(' ');
+          }
+
+          var grid = '';
+          for (var gi = 0; gi <= 4; gi++) {
+            var gy = padT + plotH * gi / 4;
+            var gv = Math.round(maxVal * (4 - gi) / 4);
+            grid += '<line x1="' + padL + '" y1="' + gy.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + gy.toFixed(1) + '" stroke="var(--border)" stroke-dasharray="2"/>';
+            grid += '<text x="' + (padL - 4) + '" y="' + (gy + 4).toFixed(1) + '" text-anchor="end" font-size="9" fill="var(--text-muted)">' + gv + '</text>';
+          }
+
+          var legendX = padL + plotW - 120;
+          chartHtml = '<div style="margin-top:16px">' +
+            '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;max-height:' + H + 'px" role="img" aria-label="Scope time series">' +
+            grid +
+            '<polyline points="' + pts(scopedVals) + '" fill="none" stroke="var(--accent)" stroke-width="2"/>' +
+            '<polyline points="' + pts(unscopedVals) + '" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-dasharray="4"/>' +
+            '<rect x="' + legendX + '" y="' + padT + '" width="10" height="10" fill="var(--accent)"/>' +
+            '<text x="' + (legendX + 14) + '" y="' + (padT + 9) + '" font-size="10" fill="var(--text)">Scoped</text>' +
+            '<rect x="' + legendX + '" y="' + (padT + 16) + '" width="10" height="10" fill="var(--text-muted)"/>' +
+            '<text x="' + (legendX + 14) + '" y="' + (padT + 25) + '" font-size="10" fill="var(--text)">Unscoped</text>' +
+            '</svg></div>';
+        } else {
+          chartHtml = '<p class="text-muted" style="font-size:0.85em;margin:12px 0 0">Insufficient data points to render chart — wait for more observations in this window.</p>';
+        }
+        chartEl.innerHTML = chartHtml;
+      }
+    }
+
+    load(selectedWindow);
+
+    // Fix 6: auto-refresh every 60s
+    _stopScopesRefresh();
+    _scopesRefreshTimer = setInterval(function() {
+      if (_currentTab !== 'scopes') { _stopScopesRefresh(); return; }
+      var cur = document.getElementById('analyticsContent');
+      if (!cur) { _stopScopesRefresh(); return; }
+      load(selectedWindow);
+    }, 60000);
+  }
+
+  // #1085 — Roles tab (folded in from former /#/roles page).
+  // Renders distribution of node roles + per-role clock-skew posture.
+  // Auto-refreshes every 60s while the Roles tab is active (matches the
+  // behavior of the former standalone roles-page.js).
+  async function renderRolesTab(el) {
+    el.innerHTML = '<div class="text-center text-muted" style="padding:40px">Loading roles…</div>';
+    await _renderRolesTabBody(el);
+    // (Re)start the 60s auto-refresh.
+    _stopRolesRefresh();
+    _rolesRefreshTimer = setInterval(function () {
+      // Bail if the user navigated away from the Roles tab.
+      if (_currentTab !== 'roles') { _stopRolesRefresh(); return; }
+      var cur = document.getElementById('analyticsContent');
+      if (!cur) { _stopRolesRefresh(); return; }
+      _renderRolesTabBody(cur);
+    }, 60000);
+  }
+
+  async function _renderRolesTabBody(el) {
+    try {
+      var data = await api('/analytics/roles', { ttl: CLIENT_TTL.analyticsRF });
+      var roles = (data && data.roles) || [];
+      var total = (data && data.totalNodes) || 0;
+      if (!roles.length) {
+        el.innerHTML = '<div class="text-center text-muted" style="padding:40px">No roles to show.</div>';
+        return;
+      }
+      var maxCount = roles.reduce(function (m, r) { return Math.max(m, r.nodeCount || 0); }, 0) || 1;
+      var rows = roles.map(function (r) {
+        var pct = total > 0 ? ((r.nodeCount / total) * 100).toFixed(1) : '0.0';
+        var barW = Math.round((r.nodeCount / maxCount) * 100);
+        var sevCells =
+          '<span title="OK (skew &lt; 5min)" style="color:var(--color-success,#0a0)">' + (r.okCount || 0) + '</span> / ' +
+          '<span title="Warning (5min – 1h)" style="color:var(--color-warning,#e80)">' + (r.warningCount || 0) + '</span> / ' +
+          '<span title="Critical (1h – 30d)" style="color:var(--color-error,#c00)">' + (r.criticalCount || 0) + '</span> / ' +
+          '<span title="Absurd (&gt; 30d)" style="color:#a0a">' + (r.absurdCount || 0) + '</span> / ' +
+          '<span title="No clock (&gt; 365d)" style="color:#888">' + (r.noClockCount || 0) + '</span>';
+        return '' +
+          '<tr data-role="' + esc(r.role) + '">' +
+            '<td>' + _rolesEmoji(r.role) + ' <strong>' + esc(r.role) + '</strong></td>' +
+            '<td style="text-align:right">' + r.nodeCount + '</td>' +
+            '<td style="text-align:right">' + pct + '%</td>' +
+            '<td style="min-width:140px">' +
+              '<div style="background:var(--color-surface-2,#eee);height:10px;border-radius:5px;overflow:hidden">' +
+                '<div style="background:var(--color-accent,#06c);width:' + barW + '%;height:100%"></div>' +
+              '</div>' +
+            '</td>' +
+            '<td style="text-align:right">' + (r.withSkew || 0) + '</td>' +
+            '<td style="text-align:right">' + _rolesFmtSec(r.medianAbsSkewSec || 0) + '</td>' +
+            '<td style="text-align:right">' + _rolesFmtSec(r.meanAbsSkewSec || 0) + '</td>' +
+            '<td style="white-space:nowrap">' + sevCells + '</td>' +
+          '</tr>';
+      }).join('');
+      el.innerHTML =
+        '<p class="text-muted" style="margin:0 0 12px 0">Distribution of node roles across the mesh, with per-role clock-skew posture.</p>' +
+        '<div class="roles-summary" style="margin-bottom:12px;color:var(--color-text-muted,#666)">' +
+          '<strong>' + total + '</strong> nodes across <strong>' + roles.length + '</strong> roles' +
+        '</div>' +
+        '<table id="rolesTable" class="data-table analytics-table" style="width:100%">' +
+          '<thead><tr>' +
+            '<th>Role</th>' +
+            '<th style="text-align:right">Count</th>' +
+            '<th style="text-align:right">Share</th>' +
+            '<th>Distribution</th>' +
+            '<th style="text-align:right" title="Nodes with clock-skew samples">w/ Skew</th>' +
+            '<th style="text-align:right" title="Median absolute skew">Median |skew|</th>' +
+            '<th style="text-align:right" title="Mean absolute skew">Mean |skew|</th>' +
+            '<th title="OK / Warning / Critical / Absurd / No-clock">Severity</th>' +
+          '</tr></thead>' +
+          '<tbody>' + rows + '</tbody>' +
+        '</table>';
+    } catch (err) {
+      el.innerHTML = '<div class="text-center" style="color:var(--status-red);padding:40px">Failed to load roles: ' + esc(String(err.message || err)) + '</div>';
     }
   }
 

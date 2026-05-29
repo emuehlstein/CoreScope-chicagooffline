@@ -10,7 +10,7 @@
     heroTitle: 'CoreScope',
     heroSubtitle: 'Real-time MeshCore LoRa mesh network analyzer',
     steps: [
-      { emoji: '🔵', title: 'Connect via Bluetooth', description: 'Flash **BLE companion** firmware from [MeshCore Flasher](https://flasher.meshcore.co.uk/).\n- Screenless devices: default PIN `123456`\n- Screen devices: random PIN shown on display\n- If pairing fails: forget device, reboot, re-pair' },
+      { emoji: '🔵', title: 'Connect via Bluetooth', description: 'Flash **BLE companion** firmware from [MeshCore Flasher](https://flasher.meshcore.io/).\n- Screenless devices: default PIN `123456`\n- Screen devices: random PIN shown on display\n- If pairing fails: forget device, reboot, re-pair' },
       { emoji: '📻', title: 'Set the right frequency preset', description: '**US Recommended:**\n`910.525 MHz · BW 62.5 kHz · SF 7 · CR 5`\nSelect **"US Recommended"** in the app or flasher.' },
       { emoji: '📡', title: 'Advertise yourself', description: 'Tap the signal icon → **Flood** to broadcast your node to the mesh. Companions only advert when you trigger it manually.' },
       { emoji: '🔁', title: 'Check "Heard N repeats"', description: '- **"Sent"** = transmitted, no confirmation\n- **"Heard 0 repeats"** = no repeater picked it up\n- **"Heard 1+ repeats"** = you\'re on the mesh!' }
@@ -33,7 +33,7 @@
     'meshcore-live-heatmap-opacity'
   ];
 
-  var VALID_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps', 'heatmapOpacity', 'liveHeatmapOpacity', 'distanceUnit'];
+  var VALID_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps', 'heatmapOpacity', 'liveHeatmapOpacity', 'distanceUnit', 'favorites', 'myNodes'];
   var OBJECT_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps'];
   var SCALAR_SECTIONS = ['heatmapOpacity', 'liveHeatmapOpacity'];
   var DISTANCE_UNIT_VALUES = ['km', 'mi', 'auto'];
@@ -52,6 +52,54 @@
   };
 
   var THEME_COLOR_KEYS = Object.keys(THEME_CSS_MAP).filter(function (k) { return k !== 'font' && k !== 'mono'; });
+
+  // ── Brand logo swap helper (PR #1137) ──
+  // The default navbar brand logo is an inline <svg class="brand-logo"> so it
+  // inherits page CSS vars (--logo-text / --logo-accent / etc.). When an
+  // operator overrides branding.logoUrl in the customizer they expect a
+  // remote image — swap the inline <svg> for an <img>. Going back to the
+  // default URL or clearing the override swaps the <img> back to the inline
+  // <svg>. Layout dimensions (width=111 height=36) are preserved either way.
+  function _setBrandLogoUrl(url, alt) {
+    var node = document.querySelector('.nav-brand .brand-logo');
+    if (!node) return;
+    if (url) {
+      if (node.tagName.toLowerCase() === 'img') {
+        node.setAttribute('src', url);
+        if (alt != null) node.setAttribute('alt', alt);
+        return;
+      }
+      // swap inline <svg> → <img>
+      var img = document.createElement('img');
+      img.className = 'brand-logo';
+      img.setAttribute('src', url);
+      img.setAttribute('alt', alt || node.getAttribute('aria-label') || 'Brand');
+      // #1450 — DO NOT set width/height attrs. CSS img.brand-logo handles
+      // sizing (height:36px, width:auto, max-width cap) so the operator's
+      // natural image aspect ratio is preserved instead of being squished
+      // into the default SVG's 125x36 pill box.
+      node.parentNode.replaceChild(img, node);
+    } else {
+      if (node.tagName.toLowerCase() !== 'img') {
+        if (alt != null) node.setAttribute('aria-label', alt);
+        return;
+      }
+      // swap <img> → inline <svg> by clearing the src; here we just keep the
+      // <img> in place because we don't have the SVG markup at runtime
+      // (it lives in index.html). The next page reload restores the inline
+      // SVG. Setting src to the default URL is a graceful intermediate.
+      node.setAttribute('src', 'img/corescope-logo.svg');
+      if (alt != null) node.setAttribute('alt', alt);
+    }
+  }
+  function _setBrandAlt(alt) {
+    var node = document.querySelector('.nav-brand .brand-logo');
+    if (!node) return;
+    if (node.tagName.toLowerCase() === 'img') node.setAttribute('alt', alt);
+    else node.setAttribute('aria-label', alt);
+    var brandLink = document.querySelector('.nav-brand');
+    if (brandLink) brandLink.setAttribute('aria-label', alt + ' home');
+  }
 
   // ── Presets (copied from v1 customize.js) ──
   var PRESETS = {
@@ -313,9 +361,17 @@
   function readOverrides() {
     try {
       var raw = localStorage.getItem(STORAGE_KEY);
-      if (raw == null) return {};
-      var parsed = JSON.parse(raw);
-      if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      var parsed = (raw != null) ? JSON.parse(raw) : {};
+      if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) parsed = {};
+      // Include favorites and claimed nodes from their own localStorage keys
+      try {
+        var favs = JSON.parse(localStorage.getItem('meshcore-favorites') || '[]');
+        if (Array.isArray(favs) && favs.length) parsed.favorites = favs;
+      } catch (e) { /* ignore */ }
+      try {
+        var myNodes = JSON.parse(localStorage.getItem('meshcore-my-nodes') || '[]');
+        if (Array.isArray(myNodes) && myNodes.length) parsed.myNodes = myNodes;
+      } catch (e) { /* ignore */ }
       return parsed;
     } catch (e) {
       return {};
@@ -386,14 +442,28 @@
 
   function writeOverrides(delta) {
     if (delta == null || typeof delta !== 'object') return;
+    // Extract favorites/myNodes and store in their own localStorage keys
+    if (Array.isArray(delta.favorites)) {
+      try { localStorage.setItem('meshcore-favorites', JSON.stringify(delta.favorites)); } catch (e) { /* ignore */ }
+    }
+    if (Array.isArray(delta.myNodes)) {
+      try { localStorage.setItem('meshcore-my-nodes', JSON.stringify(delta.myNodes)); } catch (e) { /* ignore */ }
+    }
+    // Build theme-only delta (without favorites/myNodes)
+    var themeDelta = {};
+    for (var k in delta) {
+      if (delta.hasOwnProperty(k) && k !== 'favorites' && k !== 'myNodes') {
+        themeDelta[k] = delta[k];
+      }
+    }
     // If empty, remove key entirely
-    var keys = Object.keys(delta);
+    var keys = Object.keys(themeDelta);
     if (keys.length === 0) {
       try { localStorage.removeItem(STORAGE_KEY); } catch (e) { /* ignore */ }
       _updateSaveStatus('saved');
       return;
     }
-    var validated = _validateDelta(delta);
+    var validated = _validateDelta(themeDelta);
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(validated));
       _updateSaveStatus('saved');
@@ -446,7 +516,7 @@
     return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
   }
 
-  function applyCSS(effectiveConfig) {
+  function applyCSS(effectiveConfig, userOverrides) {
     var dark = isDarkMode();
     var themeSection = dark
       ? Object.assign({}, effectiveConfig.theme || {}, effectiveConfig.themeDark || {})
@@ -461,17 +531,80 @@
       }
     }
 
+    // Logo brand colors mirror --accent / --accent-hover ONLY when an
+    // operator has actually overridden them via the customizer. We check
+    // userOverrides (not the merged effective config), so the server-default
+    // accent (#4a9eff) does NOT clobber the sage/teal :root brand defaults
+    // out-of-the-box. When an operator picks a theme, customizer writes the
+    // override to localStorage, the override flows through here, and the
+    // wordmark recolors to follow the chosen accent.
+    var ovTheme = (userOverrides && (dark
+      ? Object.assign({}, userOverrides.theme || {}, userOverrides.themeDark || {})
+      : (userOverrides.theme || {}))) || {};
+    if (ovTheme.accent) root.setProperty('--logo-accent', ovTheme.accent);
+    if (ovTheme.accentHover) root.setProperty('--logo-accent-hi', ovTheme.accentHover);
+
     // Derived vars
     if (themeSection.background) root.setProperty('--content-bg', themeSection.contentBg || themeSection.background);
     if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface1);
 
-    // Node colors → CSS vars + global objects
+    // Node colors → --node-X CSS var only (legacy compat).
+    // #1412: do NOT push server-config nodeColors into window.ROLE_COLORS —
+    // that defeats cb-presets propagation by trapping the legacy palette in
+    // the _roleOverrides map (where the live getter prefers it over the
+    // --mc-role-X CSS vars that presets actually write). User-chosen
+    // overrides still flow through setRoleColorOverride() in customize.js.
     var nc = effectiveConfig.nodeColors;
     if (nc) {
+      // #1438 final: scope --mc-role-{role} writes to USER overrides only,
+      // UNLESS no CB preset is active (#1446). When a preset is active the
+      // server-config palette must stay out of --mc-role-* so the preset
+      // wins (preserves #1412). When NO preset is active, the cascade is:
+      //   user override > server config > built-in :root default.
+      // → server config gets to write --mc-role-{role} in that case.
+      var userNc = (userOverrides && userOverrides.nodeColors) || {};
+      var presetActive = false;
+      try {
+        var presetAttr = document.body && document.body.getAttribute && document.body.getAttribute('data-cb-preset');
+        presetActive = !!(presetAttr && presetAttr !== 'none');
+      } catch (e) {}
       for (var role in nc) {
         root.setProperty('--node-' + role, nc[role]);
-        if (window.ROLE_COLORS && role in window.ROLE_COLORS) window.ROLE_COLORS[role] = nc[role];
-        if (window.ROLE_STYLE && window.ROLE_STYLE[role]) window.ROLE_STYLE[role].color = nc[role];
+        if (Object.prototype.hasOwnProperty.call(userNc, role)) {
+          // Operator picked this color → drive --mc-role-{role} so marker
+          // SVGs (fill="var(--mc-role-X)") and other CSS-var consumers
+          // pick it up on every page load. Without this the user pick
+          // sits in localStorage but --mc-role-{role} falls back to the
+          // active preset on reload, reverting marker fills.
+          root.setProperty('--mc-role-' + role, nc[role]);
+          // #1446 — also write to body.style with !important so the user
+          // pick beats the body[data-cb-preset="X"] selector cascade when
+          // a CB preset is active. Without this, the root-level write is
+          // shadowed by the preset's body-scoped CSS rule (root cause of
+          // #1444). When no preset is active, the body write is harmless
+          // and still wins inheritance.
+          if (presetActive && document.body && document.body.style) {
+            document.body.style.setProperty('--mc-role-' + role, nc[role], 'important');
+          }
+        } else if (!presetActive) {
+          // #1446 — no preset is active; server config is the legitimate
+          // source of role colors. Write --mc-role-{role} so marker SVGs
+          // honor operator's config.json without forcing visitors to pick
+          // a CB preset to "unlock" their server palette.
+          root.setProperty('--mc-role-' + role, nc[role]);
+        } else if (presetActive && document.body && document.body.style) {
+          // Preset active AND this role has no user override:
+          // ensure any prior body inline !important is removed so the
+          // preset value (from body[data-cb-preset=X] CSS rule) takes over.
+          // Also remove the root-level --mc-role-{role} that a PREVIOUS
+          // setOverride call left behind (#1446 followup): without this,
+          // :root.style.--mc-role-{role} stays stuck at the old user-pick
+          // value even though body's cascaded preset rule now wins for
+          // descendant elements. The visible UI is correct but introspection
+          // (getComputedStyle on documentElement) reports stale color.
+          document.body.style.removeProperty('--mc-role-' + role);
+          root.removeProperty('--mc-role-' + role);
+        }
       }
     }
 
@@ -522,10 +655,12 @@
     if (br) {
       if (br.siteName) {
         document.title = br.siteName;
+        _setBrandAlt(br.siteName);
         var brandEl = document.querySelector('.brand-text');
         if (brandEl) brandEl.textContent = br.siteName;
       }
       if (br.logoUrl) {
+        _setBrandLogoUrl(br.logoUrl, br.siteName || null);
         var iconEl = document.querySelector('.brand-icon');
         if (iconEl) iconEl.innerHTML = '<img src="' + br.logoUrl + '" style="height:24px" onerror="this.style.display=\'none\'">';
       }
@@ -544,7 +679,7 @@
     var overrides = readOverrides();
     var effective = computeEffective(_serverDefaults || {}, overrides);
     window.SITE_CONFIG = effective;
-    applyCSS(effective);
+    applyCSS(effective, overrides);
   }
 
   // ── setOverride / clearOverride ──
@@ -629,7 +764,11 @@
       }
       writeOverrides(delta);
       _runPipeline();
-      _refreshPanel();
+      // Skip re-render while the user is typing inside the panel — setting
+      // innerHTML would destroy the focused input and collapse the mobile keyboard.
+      if (!(_panelEl && _panelEl.contains(document.activeElement))) {
+        _refreshPanel();
+      }
     }, 300);
   }
 
@@ -754,6 +893,17 @@
       if (key === 'distanceUnit' && DISTANCE_UNIT_VALUES.indexOf(obj[key]) === -1) {
         errors.push('Invalid distanceUnit: "' + obj[key] + '" — must be km, mi, or auto');
       }
+      // Validate favorites and myNodes arrays
+      if (key === 'favorites') {
+        if (!Array.isArray(obj[key])) {
+          errors.push('"favorites" must be an array of public key strings');
+        }
+      }
+      if (key === 'myNodes') {
+        if (!Array.isArray(obj[key])) {
+          errors.push('"myNodes" must be an array of node objects');
+        }
+      }
     }
     return { valid: errors.length === 0, errors: errors };
   }
@@ -779,6 +929,16 @@
   var _panelEl = null;
   var _activeTab = 'branding';
   var _styleEl = null;
+
+  // GeoFilter tab state
+  var _gfMap = null;
+  var _gfModalMap = null;
+  var _gfWriteEnabled = false;
+  var _gfPoints = [];
+  var _gfMarkers = [];
+  var _gfPolygon = null;
+  var _gfClosingLine = null;
+  var _gfLoaded = false; // true after initial server load
 
   function esc(s) { var d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
   function escAttr(s) { return (s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
@@ -906,6 +1066,7 @@
       { id: 'nodes', label: '🎯', title: 'Colors', badge: (function () { var n = _countOverrides('nodeColors') + _countOverrides('typeColors'); return n ? ' <span class="cv2-tab-badge">' + n + '</span>' : ''; })() },
       { id: 'home', label: '🏠', title: 'Home', badge: _tabBadge('home') },
       { id: 'display', label: '🖥️', title: 'Display', badge: (function () { var n = _countOverrides('timestamps') + (_isOverridden(null, 'distanceUnit') ? 1 : 0); return n ? ' <span class="cv2-tab-badge">' + n + '</span>' : ''; })() },
+      { id: 'geofilter', label: '🗺️', title: 'GeoFilter' },
       { id: 'export', label: '📤', title: 'Export' }
     ];
     return '<div class="cust-tabs">' + tabs.map(function (t) {
@@ -1014,6 +1175,57 @@
     '</div>';
   }
 
+  // ── #1361 Colorblind preset selector ──
+  // MVP scope: radio selector + 1-line description + WCAG warning badge.
+  // Stretch (live Brettel/Vienot simulation overlay, "Reset to default Wong"
+  // button) intentionally deferred to a follow-up issue.
+  function _renderColorblindPresetSelector() {
+    var MCP = (typeof window !== 'undefined') && window.MeshCorePresets;
+    if (!MCP || !Array.isArray(MCP.list)) return '';
+    // #1446 — currentPreset() now returns null when no preset is stored.
+    var current = MCP.currentPreset ? MCP.currentPreset() : null;
+    var clearOpt = _renderCbPresetClearOption(current);
+    var options = MCP.list.map(function (p) {
+      var checked = p.id === current ? ' checked' : '';
+      return '<label class="cust-cb-preset-row" style="display:flex;gap:8px;align-items:flex-start;margin:6px 0;cursor:pointer">' +
+        '<input type="radio" name="cv2-cb-preset" data-cv2-cb-preset value="' + escAttr(p.id) + '"' + checked + ' style="margin-top:3px">' +
+        '<div style="flex:1">' +
+          '<div style="font-weight:600">' + esc(p.label) + '</div>' +
+          '<div class="cust-hint" style="font-size:12px;color:var(--text-muted)">' + esc(p.description) + '</div>' +
+          _renderCbPresetWarning(p.id) +
+        '</div>' +
+      '</label>';
+    }).join('');
+    return '<p class="cust-section-title">Optional: Colorblind-Safe Preset</p>' +
+      '<p class="cust-hint" style="margin-bottom:8px">A CB preset is an end-user opt-in that swaps the role/status palette for color-vision variants. ' +
+      'Leave unset to use the operator\'s configured colors (or pick from above). ' +
+      'Achromatopsia uses a luminance-only ramp and relies on the shape/letter/glyph carriers from #1356/#1357.</p>' +
+      '<div class="cust-cb-presets" data-cv2-cb-preset-group>' + clearOpt + options + '</div>' +
+      '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">';
+  }
+
+  function _renderCbPresetClearOption(current) {
+    var checked = !current ? ' checked' : '';
+    return '<label class="cust-cb-preset-row" style="display:flex;gap:8px;align-items:flex-start;margin:6px 0;cursor:pointer">' +
+      '<input type="radio" name="cv2-cb-preset" data-cv2-cb-preset value="" data-cv2-cb-preset-none' + checked + ' style="margin-top:3px">' +
+      '<div style="flex:1">' +
+        '<div style="font-weight:600">No preset (use operator / custom colors)</div>' +
+        '<div class="cust-hint" style="font-size:12px;color:var(--text-muted)">Default — server-configured colors apply, then any per-role overrides above.</div>' +
+      '</div>' +
+    '</label>';
+  }
+
+  function _renderCbPresetWarning(id) {
+    var MCP = window.MeshCorePresets;
+    if (!MCP || typeof MCP.validatePreset !== 'function') return '';
+    var rep = MCP.validatePreset(id);
+    var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+    var failing = rep.filter(function (r) { return dark ? !r.passDark : !r.passLight; });
+    if (!failing.length) return '';
+    var names = failing.map(function (r) { return r.role; }).join(', ');
+    return '<div class="cust-cb-warn" style="margin-top:4px;font-size:11px;color:var(--status-yellow);background:rgba(255,200,0,0.08);padding:4px 6px;border-radius:4px">⚠ WCAG 1.4.11: ' + esc(names) + ' below 3:1 vs ' + (dark ? 'dark' : 'light') + ' tiles</div>';
+  }
+
   function _renderNodes() {
     var eff = _getEffective();
     var server = _getServer();
@@ -1051,8 +1263,11 @@
     var liveHeatPct = Math.round(liveHeatOpacity * 100);
 
     return '<div class="cust-panel' + (_activeTab === 'nodes' ? ' active' : '') + '" data-panel="nodes">' +
-      '<p class="cust-section-title">Node Role Colors</p>' + rows +
+      '<p class="cust-section-title">Node Role Colors</p>' +
+      '<p class="cust-hint" style="margin-bottom:8px">These are the canonical role colors used across the app. They inherit from your server config (or built-in defaults), and can be optionally remapped by a colorblind-safe preset below.</p>' +
+      rows +
       '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">' +
+      _renderColorblindPresetSelector() +
       '<p class="cust-section-title">Packet Type Colors</p>' + typeRows +
       '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">' +
       '<p class="cust-section-title">Heatmap Opacity</p>' +
@@ -1104,7 +1319,51 @@
           '<option value="km"' + (distUnit === 'km' ? ' selected' : '') + '>Kilometers (km)</option>' +
           '<option value="mi"' + (distUnit === 'mi' ? ' selected' : '') + '>Miles (mi)</option>' +
         '</select></div>' +
+      '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Gesture Hints</p>' +
+      '<p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Re-show first-visit gesture discoverability hints (swipe rows, swipe tabs, edge-swipe drawer, pull-to-refresh).</p>' +
+      '<button type="button" class="cust-dl-btn" data-cv2-reset-hints data-reset-gesture-hints>↺ Reset gesture hints</button>' +
+      _renderChannelsShowEncryptedToggle() +
+      _renderDarkTileProviderSelector() +
     '</div>';
+  }
+
+  // ── #1454 Show-encrypted-channels toggle ──
+  // Writes localStorage["channels-show-encrypted"]. Default OFF: key is
+  // removed (not set to "false") so the read-gate in channels.js cleanly
+  // returns false. Fires `mc-channels-show-encrypted-changed`; channels.js
+  // re-fetches the list live without a page reload.
+  function _renderChannelsShowEncryptedToggle() {
+    var on = false;
+    try { on = localStorage.getItem('channels-show-encrypted') === 'true'; } catch (_e) {}
+    return '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Channels</p>' +
+      '<p class="cust-hint" style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Encrypted channels appear as "Encrypted (0xAB)" with no name. Operators usually leave this off.</p>' +
+      '<div class="cust-field" style="display:flex;align-items:center;gap:8px">' +
+        '<input type="checkbox" id="cv2-channels-show-encrypted" data-cv2-channels-show-encrypted' +
+          (on ? ' checked' : '') +
+          ' style="width:16px;height:16px;cursor:pointer">' +
+        '<label for="cv2-channels-show-encrypted" style="cursor:pointer;margin:0">Show encrypted channels</label>' +
+      '</div>';
+  }
+
+  // ── #1420 Dark-tile provider selector ──
+  // Persists per-browser via MC_setDarkTileProvider; map.js / live.js
+  // listen for `mc-tile-provider-changed` and swap tiles live.
+  function _renderDarkTileProviderSelector() {
+    var reg = (typeof window !== 'undefined') && window.MC_TILE_PROVIDERS;
+    if (!reg) return '';
+    var active = (typeof window.MC_getDarkTileProvider === 'function') ? window.MC_getDarkTileProvider() : 'carto-dark';
+    var ids = ['carto-dark', 'esri-darkgray-labels', 'voyager-inverted', 'positron-inverted'];
+    var options = ids.filter(function (id) { return reg[id]; }).map(function (id) {
+      var label = reg[id].label || id;
+      var sel   = id === active ? ' selected' : '';
+      return '<option value="' + escAttr(id) + '"' + sel + '>' + esc(label) + '</option>';
+    }).join('');
+    return '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Dark Map Tiles</p>' +
+      '<p class="cust-hint" style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Choose the dark-mode basemap. Light mode is unaffected. Inverted variants apply a CSS filter for higher contrast.</p>' +
+      '<div class="cust-field"><label for="cv2-dark-tile-provider">Provider</label>' +
+        '<select id="cv2-dark-tile-provider" data-cv2-dark-tile-provider style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--input-bg);color:var(--text)">' +
+        options +
+        '</select></div>';
   }
 
   function _renderHome() {
@@ -1155,6 +1414,383 @@
     '</div>';
   }
 
+  function _renderGeoFilter() {
+    return '<div class="cust-panel' + (_activeTab === 'geofilter' ? ' active' : '') + '" data-panel="geofilter">' +
+      '<p class="cust-section-title">Geographic Filter</p>' +
+      '<p style="font-size:12px;color:var(--text-muted);margin-bottom:12px">Shows the active geographic filter. Nodes outside this area are excluded at ingest time and in API responses.</p>' +
+      '<div style="position:relative;margin-bottom:8px">' +
+        '<div id="cv2-gf-map" style="height:200px;border-radius:6px;border:1px solid var(--border);background:var(--surface-1);cursor:pointer"></div>' +
+        '<div style="position:absolute;top:7px;right:7px;background:rgba(255,255,255,0.88);border-radius:4px;padding:3px 8px;font-size:11px;color:#444;pointer-events:none;box-shadow:0 1px 3px rgba(0,0,0,0.15)">🔍 click to expand</div>' +
+      '</div>' +
+      '<div id="cv2-gf-status" style="font-size:12px;color:var(--text-muted);margin-bottom:10px">Loading current filter…</div>' +
+      // Edit controls — hidden until server confirms write access (writeEnabled=true)
+      '<div id="cv2-gf-edit" style="display:none">' +
+        '<div style="display:flex;gap:8px;margin-bottom:10px;align-items:center">' +
+          '<label style="font-size:12px;color:var(--text-muted)">Buffer km:</label>' +
+          '<input type="number" id="cv2-gf-buffer" value="20" min="0" max="500" style="width:64px;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--input-bg);color:var(--text);font-size:12px">' +
+        '</div>' +
+        '<div class="cust-field"><label>Server API Key</label>' +
+          '<input type="password" id="cv2-gf-apikey" placeholder="apiKey from config.json" style="width:100%;padding:5px 8px;border:1px solid var(--border);border-radius:6px;background:var(--input-bg);color:var(--text);font-size:12px">' +
+        '</div>' +
+        '<div style="display:flex;gap:8px;margin-top:12px">' +
+          '<button id="cv2-gf-save" style="padding:7px 16px;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500">Save to server</button>' +
+          '<button id="cv2-gf-remove" style="padding:7px 14px;background:var(--surface-1);color:var(--status-red);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:13px">Remove filter</button>' +
+        '</div>' +
+        '<div id="cv2-gf-msg" style="margin-top:8px;font-size:12px;display:none"></div>' +
+        // Prune section — only shown when a polygon is active (toggled in _initGeoFilterTab)
+        '<div id="cv2-gf-prune-section" style="display:none;margin-top:16px;border-top:1px solid var(--border);padding-top:14px">' +
+          '<p class="cust-section-title" style="font-size:13px;margin-bottom:6px">Prune historical nodes</p>' +
+          '<p style="font-size:11px;color:var(--text-muted);margin-bottom:10px">Remove nodes already in the database that fall outside the current filter. Run once after first enabling geo filtering.</p>' +
+          '<button id="cv2-gf-prune-preview" style="padding:6px 14px;background:var(--surface-1);color:var(--text-muted);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:12px">Preview prune</button>' +
+          '<div id="cv2-gf-prune-result" style="display:none;margin-top:10px">' +
+            '<div id="cv2-gf-prune-list" style="font-size:11px;color:var(--text-muted);max-height:100px;overflow-y:auto;margin-bottom:8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px"></div>' +
+            '<button id="cv2-gf-prune-confirm" style="padding:6px 14px;background:var(--status-red);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500">Delete nodes</button>' +
+          '</div>' +
+          '<div id="cv2-gf-prune-msg" style="margin-top:8px;font-size:12px;display:none"></div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function _gfOpenModal(container) {
+    var existing = document.getElementById('cv2-gf-modal-overlay');
+    if (existing) existing.remove();
+    if (_gfModalMap) { _gfModalMap.remove(); _gfModalMap = null; }
+
+    var overlay = document.createElement('div');
+    overlay.id = 'cv2-gf-modal-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:99999;display:flex;align-items:center;justify-content:center;';
+
+    var dialog = document.createElement('div');
+    dialog.style.cssText = 'width:92vw;height:86vh;background:#fff;border-radius:10px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+
+    var toolbarEl = document.createElement('div');
+    toolbarEl.style.cssText = 'padding:10px 14px;display:flex;gap:8px;align-items:center;border-bottom:1px solid #e0e0e0;background:#f5f5f5;flex-shrink:0;';
+    var title = document.createElement('span');
+    title.style.cssText = 'font-weight:600;color:#333;font-size:14px;';
+    title.textContent = _gfWriteEnabled ? 'Edit GeoFilter — click map to add points' : 'GeoFilter — read only';
+    toolbarEl.appendChild(title);
+
+    if (_gfWriteEnabled) {
+      var undoBtn = document.createElement('button');
+      undoBtn.id = 'cv2-gfm-undo';
+      undoBtn.textContent = '↩ Undo';
+      undoBtn.style.cssText = 'padding:5px 10px;background:#eee;color:#555;border:1px solid #ccc;border-radius:6px;cursor:pointer;font-size:12px;';
+      var clearBtn = document.createElement('button');
+      clearBtn.id = 'cv2-gfm-clear';
+      clearBtn.textContent = '✕ Clear';
+      clearBtn.style.cssText = 'padding:5px 10px;background:#fee;color:#c44;border:1px solid #fcc;border-radius:6px;cursor:pointer;font-size:12px;';
+      var countEl = document.createElement('span');
+      countEl.id = 'cv2-gfm-count';
+      countEl.style.cssText = 'font-size:12px;color:#888;';
+      var spacer = document.createElement('span');
+      spacer.style.cssText = 'flex:1;';
+      var doneBtn = document.createElement('button');
+      doneBtn.id = 'cv2-gfm-done';
+      doneBtn.textContent = 'Done';
+      doneBtn.style.cssText = 'padding:7px 18px;background:#4a9eff;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;';
+      toolbarEl.appendChild(undoBtn);
+      toolbarEl.appendChild(clearBtn);
+      toolbarEl.appendChild(countEl);
+      toolbarEl.appendChild(spacer);
+      toolbarEl.appendChild(doneBtn);
+    } else {
+      var spacer2 = document.createElement('span');
+      spacer2.style.cssText = 'flex:1;';
+      toolbarEl.appendChild(spacer2);
+    }
+
+    var closeBtn = document.createElement('button');
+    closeBtn.id = 'cv2-gfm-close';
+    closeBtn.textContent = _gfWriteEnabled ? 'Cancel' : 'Close';
+    closeBtn.style.cssText = 'padding:7px 14px;background:#eee;color:#555;border:1px solid #ccc;border-radius:6px;cursor:pointer;font-size:13px;';
+    toolbarEl.appendChild(closeBtn);
+
+    var mapDiv = document.createElement('div');
+    mapDiv.id = 'cv2-gf-modal-map';
+    mapDiv.style.cssText = 'flex:1;';
+
+    dialog.appendChild(toolbarEl);
+    dialog.appendChild(mapDiv);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    var modalPoints = _gfPoints.map(function (p) { return [p[0], p[1]]; });
+    var modalMarkers = [];
+    var modalPolygon = null;
+    var modalClosingLine = null;
+
+    _gfModalMap = L.map(mapDiv, { zoomControl: true });
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+      attribution: '© OpenStreetMap © CartoDB', maxZoom: 19
+    }).addTo(_gfModalMap);
+
+    function renderModal() {
+      if (modalPolygon) { _gfModalMap.removeLayer(modalPolygon); modalPolygon = null; }
+      if (modalClosingLine) { _gfModalMap.removeLayer(modalClosingLine); modalClosingLine = null; }
+      modalMarkers.forEach(function (m) { _gfModalMap.removeLayer(m); });
+      modalMarkers = [];
+      modalPoints.forEach(function (pt, i) {
+        var m = L.circleMarker(pt, { radius: 6, color: '#4a9eff', weight: 2, fillColor: '#4a9eff', fillOpacity: 0.9 })
+          .addTo(_gfModalMap)
+          .bindTooltip(String(i + 1), { permanent: true, direction: 'top', offset: [0, -8] });
+        modalMarkers.push(m);
+      });
+      if (modalPoints.length >= 3) {
+        modalPolygon = L.polygon(modalPoints, { color: '#4a9eff', weight: 2, fillColor: '#4a9eff', fillOpacity: 0.12 }).addTo(_gfModalMap);
+      } else if (modalPoints.length === 2) {
+        modalClosingLine = L.polyline(modalPoints, { color: '#4a9eff', weight: 2, dashArray: '5,5' }).addTo(_gfModalMap);
+      }
+      var ce = document.getElementById('cv2-gfm-count');
+      if (ce) ce.textContent = modalPoints.length + ' point' + (modalPoints.length !== 1 ? 's' : '');
+    }
+
+    function closeModal() {
+      if (_gfModalMap) { _gfModalMap.remove(); _gfModalMap = null; }
+      overlay.remove();
+    }
+
+    setTimeout(function () {
+      _gfModalMap.invalidateSize();
+      renderModal();
+      if (modalPoints.length >= 3) {
+        _gfModalMap.fitBounds(L.latLngBounds(modalPoints), { padding: [40, 40] });
+      } else {
+        _gfModalMap.setView([50.5, 4.4], 5);
+      }
+    }, 80);
+
+    if (_gfWriteEnabled) {
+      _gfModalMap.on('click', function (e) {
+        modalPoints.push([parseFloat(e.latlng.lat.toFixed(6)), parseFloat(e.latlng.lng.toFixed(6))]);
+        renderModal();
+      });
+      document.getElementById('cv2-gfm-undo').addEventListener('click', function () {
+        if (!modalPoints.length) return;
+        modalPoints.pop();
+        renderModal();
+      });
+      document.getElementById('cv2-gfm-clear').addEventListener('click', function () {
+        modalPoints = [];
+        renderModal();
+      });
+      document.getElementById('cv2-gfm-done').addEventListener('click', function () {
+        _gfPoints = modalPoints;
+        _gfRender();
+        var prune = container.querySelector('#cv2-gf-prune-section');
+        if (prune) prune.style.display = _gfPoints.length >= 3 ? '' : 'none';
+        _gfStatus(container, _gfPoints.length + ' point' + (_gfPoints.length !== 1 ? 's' : '') + '.');
+        closeModal();
+      });
+    }
+
+    closeBtn.addEventListener('click', closeModal);
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) closeModal(); });
+  }
+
+  function _gfRender() {
+    if (!_gfMap) return;
+    if (_gfPolygon) { _gfMap.removeLayer(_gfPolygon); _gfPolygon = null; }
+    if (_gfClosingLine) { _gfMap.removeLayer(_gfClosingLine); _gfClosingLine = null; }
+    _gfMarkers.forEach(function (m) { _gfMap.removeLayer(m); });
+    _gfMarkers = [];
+
+    _gfPoints.forEach(function (pt, i) {
+      var m = L.circleMarker(pt, { radius: 6, color: '#4a9eff', weight: 2, fillColor: '#4a9eff', fillOpacity: 0.9 })
+        .addTo(_gfMap)
+        .bindTooltip(String(i + 1), { permanent: true, direction: 'top', offset: [0, -8] });
+      _gfMarkers.push(m);
+    });
+
+    if (_gfPoints.length >= 3) {
+      _gfPolygon = L.polygon(_gfPoints, { color: '#4a9eff', weight: 2, fillColor: '#4a9eff', fillOpacity: 0.12 }).addTo(_gfMap);
+    } else if (_gfPoints.length === 2) {
+      _gfClosingLine = L.polyline(_gfPoints, { color: '#4a9eff', weight: 2, dashArray: '5,5' }).addTo(_gfMap);
+    }
+  }
+
+  function _gfStatus(container, msg) {
+    var el = container.querySelector('#cv2-gf-status');
+    if (el) el.textContent = msg;
+  }
+
+  function _gfMsg(container, msg, ok) {
+    var el = container.querySelector('#cv2-gf-msg');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.display = msg ? '' : 'none';
+    el.style.color = ok ? 'var(--status-green)' : 'var(--status-red)';
+  }
+
+  function _gfSave(container) {
+    if (_gfPoints.length < 3) { _gfMsg(container, 'Need at least 3 polygon points.', false); return; }
+    var apiKey = (container.querySelector('#cv2-gf-apikey') || {}).value || '';
+    if (!apiKey) { _gfMsg(container, 'API key required to save.', false); return; }
+    var bufferKm = parseFloat((container.querySelector('#cv2-gf-buffer') || {}).value) || 0;
+    fetch('/api/config/geo-filter', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+      body: JSON.stringify({ polygon: _gfPoints, bufferKm: bufferKm })
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || ('HTTP ' + r.status)); });
+      _gfMsg(container, 'Saved. Filter is active immediately.', true);
+      _gfStatus(container, _gfPoints.length + ' points · bufferKm=' + bufferKm + ' · saved');
+    }).catch(function (e) { _gfMsg(container, 'Error: ' + e.message, false); });
+  }
+
+  function _gfRemove(container) {
+    var apiKey = (container.querySelector('#cv2-gf-apikey') || {}).value || '';
+    if (!apiKey) { _gfMsg(container, 'API key required.', false); return; }
+    if (!confirm('Remove geo filter? All nodes will be allowed through.')) return;
+    fetch('/api/config/geo-filter', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+      body: JSON.stringify({ polygon: null })
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || ('HTTP ' + r.status)); });
+      _gfPoints = []; _gfLoaded = true;
+      _gfRender();
+      _gfStatus(container, 'No geo filter. Click the map to draw a polygon.');
+      _gfMsg(container, 'Geo filter removed.', true);
+    }).catch(function (e) { _gfMsg(container, 'Error: ' + e.message, false); });
+  }
+
+  var _gfPruneNodes = []; // nodes returned by last dry-run preview
+
+  function _gfPruneMsg(container, msg, ok) {
+    var el = container.querySelector('#cv2-gf-prune-msg');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.display = msg ? '' : 'none';
+    el.style.color = ok ? 'var(--status-green)' : 'var(--status-red)';
+  }
+
+  function _gfPrunePreview(container) {
+    var apiKey = (container.querySelector('#cv2-gf-apikey') || {}).value || '';
+    if (!apiKey) { _gfPruneMsg(container, 'API key required.', false); return; }
+    var btn = container.querySelector('#cv2-gf-prune-preview');
+    if (btn) btn.textContent = 'Loading…';
+    fetch('/api/admin/prune-geo-filter', {
+      method: 'POST',
+      headers: { 'X-API-Key': apiKey }
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || ('HTTP ' + r.status)); });
+      return r.json();
+    }).then(function (data) {
+      if (btn) btn.textContent = 'Preview prune';
+      _gfPruneNodes = data.nodes || [];
+      var count = data.count || 0;
+      var resultEl = container.querySelector('#cv2-gf-prune-result');
+      var listEl = container.querySelector('#cv2-gf-prune-list');
+      var confirmBtn = container.querySelector('#cv2-gf-prune-confirm');
+      if (!resultEl || !listEl || !confirmBtn) return;
+      if (count === 0) {
+        _gfPruneMsg(container, 'No nodes outside the filter. Nothing to prune.', true);
+        resultEl.style.display = 'none';
+        return;
+      }
+      listEl.innerHTML = _gfPruneNodes.map(function (n) {
+        var coords = n.lat != null ? (' · ' + n.lat.toFixed(4) + ', ' + n.lon.toFixed(4)) : '';
+        return '<div>' + (n.name || n.pubkey.slice(0, 12)) + coords + '</div>';
+      }).join('');
+      confirmBtn.textContent = 'Delete ' + count + ' node' + (count !== 1 ? 's' : '');
+      resultEl.style.display = '';
+      _gfPruneMsg(container, '', true);
+    }).catch(function (e) {
+      if (btn) btn.textContent = 'Preview prune';
+      _gfPruneMsg(container, 'Error: ' + e.message, false);
+    });
+  }
+
+  function _gfPruneConfirm(container) {
+    if (!_gfPruneNodes.length) { _gfPruneMsg(container, 'Run preview first.', false); return; }
+    var apiKey = (container.querySelector('#cv2-gf-apikey') || {}).value || '';
+    if (!apiKey) { _gfPruneMsg(container, 'API key required.', false); return; }
+    var count = _gfPruneNodes.length;
+    if (!confirm('Delete ' + count + ' node' + (count !== 1 ? 's' : '') + ' from the database? This cannot be undone.')) return;
+    var pubkeys = _gfPruneNodes.map(function (n) { return n.pubkey; });
+    fetch('/api/admin/prune-geo-filter?confirm=true', {
+      method: 'POST',
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pubkeys: pubkeys })
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || ('HTTP ' + r.status)); });
+      return r.json();
+    }).then(function (data) {
+      _gfPruneNodes = [];
+      var resultEl = container.querySelector('#cv2-gf-prune-result');
+      if (resultEl) resultEl.style.display = 'none';
+      var n = data.deleted;
+      _gfPruneMsg(container, 'Deleted ' + n + ' node' + (n !== 1 ? 's' : '') + '.', true);
+    }).catch(function (e) { _gfPruneMsg(container, 'Error: ' + e.message, false); });
+  }
+
+  function _initGeoFilterTab(container) {
+    var mapEl = container.querySelector('#cv2-gf-map');
+    if (!mapEl || typeof L === 'undefined') return;
+
+    _gfMap = L.map(mapEl, { zoomControl: false, dragging: false, scrollWheelZoom: false, doubleClickZoom: false, touchZoom: false });
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+      attribution: '© OpenStreetMap © CartoDB', maxZoom: 19
+    }).addTo(_gfMap);
+
+    if (!_gfLoaded) {
+      api('/config/geo-filter', { ttl: 0 }).then(function (gf) {
+        // Show edit controls only on servers that have a write-capable API key configured
+        if (gf && gf.writeEnabled) {
+          _gfWriteEnabled = true;
+          var editEl = container.querySelector('#cv2-gf-edit');
+          if (editEl) editEl.style.display = '';
+        }
+        if (gf && gf.polygon && gf.polygon.length >= 3) {
+          _gfPoints = gf.polygon.map(function (p) { return [p[0], p[1]]; });
+          var buf = container.querySelector('#cv2-gf-buffer');
+          if (buf) buf.value = gf.bufferKm || 0;
+          _gfRender();
+          if (_gfPolygon) _gfMap.fitBounds(_gfPolygon.getBounds(), { padding: [20, 20] });
+          _gfStatus(container, gf.polygon.length + ' points · bufferKm=' + (gf.bufferKm || 0));
+          // Show prune section when a polygon is active and write access is available
+          if (gf.writeEnabled) {
+            var pruneEl = container.querySelector('#cv2-gf-prune-section');
+            if (pruneEl) pruneEl.style.display = '';
+          }
+        } else {
+          _gfPoints = [];
+          _gfStatus(container, gf && gf.writeEnabled ? 'No geo filter. Click the map to open the editor.' : 'No geo filter configured.');
+          _gfMap.setView([50.5, 4.4], 5);
+        }
+        _gfLoaded = true;
+        setTimeout(function () { if (_gfMap) _gfMap.invalidateSize(); }, 100);
+      }).catch(function () {
+        _gfStatus(container, 'Could not load current filter.');
+        _gfMap.setView([50.5, 4.4], 5);
+        _gfLoaded = true;
+        setTimeout(function () { if (_gfMap) _gfMap.invalidateSize(); }, 100);
+      });
+    } else {
+      if (_gfPoints.length >= 3) {
+        _gfRender();
+        if (_gfPolygon) _gfMap.fitBounds(_gfPolygon.getBounds(), { padding: [20, 20] });
+        _gfStatus(container, _gfPoints.length + ' points.');
+      } else {
+        _gfMap.setView([50.5, 4.4], 5);
+        _gfStatus(container, _gfPoints.length ? _gfPoints.length + ' points (need at least 3).' : 'Click the map to draw a polygon.');
+        _gfRender();
+      }
+      setTimeout(function () { if (_gfMap) _gfMap.invalidateSize(); }, 100);
+    }
+
+    _gfMap.on('click', function () { _gfOpenModal(container); });
+
+    container.querySelector('#cv2-gf-save').addEventListener('click', function () { _gfSave(container); });
+    container.querySelector('#cv2-gf-remove').addEventListener('click', function () { _gfRemove(container); });
+
+    var prunePreviewBtn = container.querySelector('#cv2-gf-prune-preview');
+    var pruneConfirmBtn = container.querySelector('#cv2-gf-prune-confirm');
+    if (prunePreviewBtn) prunePreviewBtn.addEventListener('click', function () { _gfPrunePreview(container); });
+    if (pruneConfirmBtn) pruneConfirmBtn.addEventListener('click', function () { _gfPruneConfirm(container); });
+  }
+
   function _renderExport() {
     var delta = readOverrides();
     var json = JSON.stringify(delta, null, 2);
@@ -1189,6 +1825,7 @@
         _renderNodes() +
         _renderHome() +
         _renderDisplay() +
+        _renderGeoFilter() +
         _renderExport() +
       '</div>';
     _bindEvents(container);
@@ -1257,8 +1894,56 @@
     // Tab switching
     container.querySelectorAll('.cust-tab').forEach(function (btn) {
       btn.addEventListener('click', function () {
+        if (_gfMap) { _gfMap.remove(); _gfMap = null; _gfMarkers = []; _gfPolygon = null; _gfClosingLine = null; } if (_gfModalMap) { _gfModalMap.remove(); _gfModalMap = null; } var _ov = document.getElementById('cv2-gf-modal-overlay'); if (_ov) _ov.remove();
         _activeTab = btn.dataset.tab;
         _renderPanel(container);
+      });
+    });
+
+    // GeoFilter tab init
+    if (_activeTab === 'geofilter') _initGeoFilterTab(container);
+
+    // #1361 Colorblind preset radio — switches preset via MeshCorePresets.applyPreset
+    // #1446 — empty-value radio = "no preset" → clearPreset(), then re-run
+    // the customizer pipeline so server-config colors take over.
+    container.querySelectorAll('[data-cv2-cb-preset]').forEach(function (radio) {
+      radio.addEventListener('change', function () {
+        if (!radio.checked) return;
+        var id = radio.value;
+        var MCP = window.MeshCorePresets;
+        if (!MCP) return;
+        if (!id) {
+          if (typeof MCP.clearPreset === 'function') MCP.clearPreset();
+          _runPipeline();
+        } else if (typeof MCP.applyPreset === 'function') {
+          MCP.applyPreset(id);
+        }
+        _refreshPanel();
+      });
+    });
+
+    // #1420 Dark-tile provider dropdown — persists + fires mc-tile-provider-changed
+    container.querySelectorAll('[data-cv2-dark-tile-provider]').forEach(function (sel) {
+      sel.addEventListener('change', function () {
+        var id = sel.value;
+        if (typeof window.MC_setDarkTileProvider === 'function') {
+          window.MC_setDarkTileProvider(id);
+        }
+      });
+    });
+
+    // #1454 Show-encrypted-channels checkbox — persists + fires
+    // mc-channels-show-encrypted-changed; channels.js re-fetches live.
+    container.querySelectorAll('[data-cv2-channels-show-encrypted]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var on = !!cb.checked;
+        try {
+          if (on) localStorage.setItem('channels-show-encrypted', 'true');
+          else localStorage.removeItem('channels-show-encrypted');
+        } catch (_e) { /* private mode etc. */ }
+        window.dispatchEvent(new CustomEvent('mc-channels-show-encrypted-changed', {
+          detail: { value: on }
+        }));
       });
     });
 
@@ -1307,6 +1992,9 @@
           // Optimistic CSS update (Decision #12)
           var cssVar = THEME_CSS_MAP[key];
           if (cssVar) document.documentElement.style.setProperty(cssVar, inp.value);
+          // Mirror to logo brand vars so the wordmark recolors live too.
+          if (key === 'accent') document.documentElement.style.setProperty('--logo-accent', inp.value);
+          if (key === 'accentHover') document.documentElement.style.setProperty('--logo-accent-hi', inp.value);
           // Update hex display
           var hex = inp.parentElement.querySelector('.cust-hex');
           if (hex) hex.textContent = inp.value;
@@ -1323,11 +2011,13 @@
           setOverride(section, key, inp.value);
           // Live branding updates
           if (section === 'branding' && key === 'siteName') {
+            _setBrandAlt(inp.value);
             var el = document.querySelector('.brand-text');
             if (el) el.textContent = inp.value;
             document.title = inp.value;
           }
           if (section === 'branding' && key === 'logoUrl') {
+            _setBrandLogoUrl(inp.value || '', null);
             var iconEl = document.querySelector('.brand-icon');
             if (iconEl) {
               if (inp.value) iconEl.innerHTML = '<img src="' + inp.value + '" style="height:24px" onerror="this.style.display=\'none\'">';
@@ -1506,6 +2196,19 @@
       _runPipeline();
       _renderPanel(container);
     });
+
+    // Reset gesture hints (#1065)
+    var hintsBtn = container.querySelector('[data-cv2-reset-hints]');
+    if (hintsBtn) hintsBtn.addEventListener('click', function () {
+      if (window.GestureHints && typeof window.GestureHints.reset === 'function') {
+        window.GestureHints.reset();
+      } else {
+        // Fallback: clear known keys directly.
+        ['row-swipe', 'tab-swipe', 'edge-drawer', 'pull-refresh'].forEach(function (k) {
+          try { localStorage.removeItem('meshcore-gesture-hints-' + k); } catch (_e) {}
+        });
+      }
+    });
   }
 
   // ── Panel toggle ──
@@ -1526,7 +2229,10 @@
       '<div class="cv2-footer"><span id="cv2-save-status">All changes saved</span></div>';
     document.body.appendChild(_panelEl);
 
-    _panelEl.querySelector('.cust-close').addEventListener('click', function () { _panelEl.classList.add('hidden'); });
+    _panelEl.querySelector('.cust-close').addEventListener('click', function () {
+      if (_gfMap) { _gfMap.remove(); _gfMap = null; _gfMarkers = []; _gfPolygon = null; _gfClosingLine = null; } if (_gfModalMap) { _gfModalMap.remove(); _gfModalMap = null; } var _ov = document.getElementById('cv2-gf-modal-overlay'); if (_ov) _ov.remove();
+      _panelEl.classList.add('hidden');
+    });
 
     // Drag support
     var header = _panelEl.querySelector('.cust-header');
@@ -1553,6 +2259,18 @@
   // 1. Migration check
   migrateOldKeys();
 
+  // #1446 — when a CB preset is cleared (or applied), re-run the customizer
+  // pipeline so server-config nodeColors take over the --mc-role-{role}
+  // CSS vars (the gating logic in applyCSS checks the body[data-cb-preset]
+  // attribute to decide whether to write them).
+  try {
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('cb-preset-changed', function () {
+        if (_initDone) _runPipeline();
+      });
+    }
+  } catch (e) {}
+
   // 2. Read overrides and apply CSS immediately (before DOMContentLoaded)
   // Server defaults will be set later when /api/config/theme completes.
   // For now, apply whatever overrides exist on top of current SITE_CONFIG.
@@ -1569,13 +2287,20 @@
     for (var key in THEME_CSS_MAP) {
       if (themeSection[key]) root.setProperty(THEME_CSS_MAP[key], themeSection[key]);
     }
+    // Mirror accent → logo brand vars ONLY when present in overrides (so the
+    // server-default accent never clobbers the sage/teal :root brand defaults).
+    var ovTheme = dark
+      ? Object.assign({}, earlyOverrides.theme || {}, earlyOverrides.themeDark || {})
+      : (earlyOverrides.theme || {});
+    if (ovTheme.accent) root.setProperty('--logo-accent', ovTheme.accent);
+    if (ovTheme.accentHover) root.setProperty('--logo-accent-hi', ovTheme.accentHover);
     if (themeSection.background) root.setProperty('--content-bg', themeSection.contentBg || themeSection.background);
     if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface1);
-    // Apply node/type colors from overrides early
+    // Apply node colors from overrides early — --node-X CSS var only.
+    // #1412: do NOT write to window.ROLE_COLORS / ROLE_STYLE here.
     if (earlyOverrides.nodeColors) {
       for (var role in earlyOverrides.nodeColors) {
-        if (window.ROLE_COLORS && role in window.ROLE_COLORS) window.ROLE_COLORS[role] = earlyOverrides.nodeColors[role];
-        if (window.ROLE_STYLE && window.ROLE_STYLE[role]) window.ROLE_STYLE[role].color = earlyOverrides.nodeColors[role];
+        root.setProperty('--node-' + role, earlyOverrides.nodeColors[role]);
       }
     }
     if (earlyOverrides.typeColors && window.TYPE_COLORS) {
@@ -1595,11 +2320,13 @@
     var overrides = readOverrides();
     if (overrides.branding) {
       if (overrides.branding.siteName) {
+        _setBrandAlt(overrides.branding.siteName);
         var brandEl = document.querySelector('.brand-text');
         if (brandEl) brandEl.textContent = overrides.branding.siteName;
         document.title = overrides.branding.siteName;
       }
       if (overrides.branding.logoUrl) {
+        _setBrandLogoUrl(overrides.branding.logoUrl, overrides.branding.siteName || null);
         var iconEl = document.querySelector('.brand-icon');
         if (iconEl) iconEl.innerHTML = '<img src="' + overrides.branding.logoUrl + '" style="height:24px" onerror="this.style.display=\'none\'">';
       }

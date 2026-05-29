@@ -43,6 +43,17 @@ scripts/           — Tooling (coverage collector, fixture capture, frontend in
 2. Go server (`cmd/server/`) polls SQLite for new packets, broadcasts via WebSocket
 3. Frontend fetches via REST API (`/api/*`), filters/sorts client-side
 
+### Read/Write Separation Invariant (#1283)
+- **All DB writes live in `cmd/ingestor/`.** INSERT / UPDATE / DELETE / VACUUM /
+  schema migrations / retention all run in the ingestor process.
+- **`cmd/server/` is read-only.** It opens SQLite with `mode=ro` and must not
+  acquire a write lock. Adding a write-side helper (e.g. a `cachedRW`-style
+  RW connection) regresses this invariant and races the ingestor → SQLITE_BUSY.
+- Enforcement: `cmd/server/readonly_invariant_test.go` reflect-asserts that
+  `PruneOldPackets`, `PruneOldMetrics`, and `RemoveStaleObservers` are NOT
+  methods on the server's `*DB`. If you need a new write, add it to
+  `cmd/ingestor/`.
+
 ### What's Deprecated (DO NOT TOUCH)
 The following were part of the old Node.js backend and have been removed:
 - `server.js`, `db.js`, `decoder.js`, `server-helpers.js`, `packet-store.js`, `iata-coords.js`
@@ -370,6 +381,7 @@ Existing patterns: `#/nodes/{pubkey}?section=node-neighbors`, `#/analytics?tab=c
 
 ## What NOT to Do
 - **Don't check in private information** — no names, API keys, tokens, passwords, IP addresses, personal data, or any identifying information. This is a PUBLIC repo.
+- **Don't introduce new `map[string]interface{}` in API response builders, handler returns, or internal data structures that cross domain boundaries.** Use a named Go struct with explicit JSON tags. CoreScope already carries 694 occurrences (see #1383); the count must monotonically decrease. If your change adds even one new occurrence in a touched file, the PR is wrong-shaped — fix the design, don't paper over with `interface{}`. Exempt: third-party library boundaries that genuinely return `interface{}`, and ad-hoc test fixture assertions.
 - Don't add npm dependencies without asking
 - Don't create a build step
 - Don't add framework abstractions (React, Vue, etc.)

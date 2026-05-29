@@ -284,3 +284,203 @@ func TestLoadConfigWithAllFields(t *testing.T) {
 		t.Errorf("iataFilter=%v", src.IATAFilter)
 	}
 }
+
+func TestConnectTimeoutOrDefault(t *testing.T) {
+	// Default when unset
+	s := MQTTSource{}
+	if got := s.ConnectTimeoutOrDefault(); got != 30 {
+		t.Errorf("default: got %d, want 30", got)
+	}
+
+	// Custom value
+	s.ConnectTimeoutSec = 5
+	if got := s.ConnectTimeoutOrDefault(); got != 5 {
+		t.Errorf("custom: got %d, want 5", got)
+	}
+
+	// Zero treated as unset
+	s.ConnectTimeoutSec = 0
+	if got := s.ConnectTimeoutOrDefault(); got != 30 {
+		t.Errorf("zero: got %d, want 30", got)
+	}
+}
+
+func TestConnectTimeoutFromJSON(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := dir + "/config.json"
+	os.WriteFile(cfgPath, []byte(`{"mqttSources":[{"name":"s1","broker":"tcp://b:1883","topics":["#"],"connectTimeoutSec":5}]}`), 0644)
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.MQTTSources[0].ConnectTimeoutOrDefault(); got != 5 {
+		t.Errorf("from JSON: got %d, want 5", got)
+	}
+}
+
+func TestObserverIATAWhitelist(t *testing.T) {
+	// Config with whitelist set
+	cfg := Config{
+		ObserverIATAWhitelist: []string{"ARN", "got"},
+	}
+
+	// Matching (case-insensitive)
+	if !cfg.IsObserverIATAAllowed("ARN") {
+		t.Error("ARN should be allowed")
+	}
+	if !cfg.IsObserverIATAAllowed("arn") {
+		t.Error("arn (lowercase) should be allowed")
+	}
+	if !cfg.IsObserverIATAAllowed("GOT") {
+		t.Error("GOT should be allowed")
+	}
+
+	// Non-matching
+	if cfg.IsObserverIATAAllowed("SJC") {
+		t.Error("SJC should NOT be allowed")
+	}
+
+	// Empty string not allowed
+	if cfg.IsObserverIATAAllowed("") {
+		t.Error("empty IATA should NOT be allowed")
+	}
+}
+
+func TestObserverIATAWhitelistEmpty(t *testing.T) {
+	// No whitelist = allow all
+	cfg := Config{}
+	if !cfg.IsObserverIATAAllowed("SJC") {
+		t.Error("with no whitelist, all IATAs should be allowed")
+	}
+	if !cfg.IsObserverIATAAllowed("") {
+		t.Error("with no whitelist, even empty IATA should be allowed")
+	}
+}
+
+func TestObserverIATAWhitelistJSON(t *testing.T) {
+	json := `{
+		"dbPath": "test.db",
+		"observerIATAWhitelist": ["ARN", "GOT"]
+	}`
+	tmp := t.TempDir() + "/config.json"
+	os.WriteFile(tmp, []byte(json), 0644)
+	cfg, err := LoadConfig(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ObserverIATAWhitelist) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(cfg.ObserverIATAWhitelist))
+	}
+	if !cfg.IsObserverIATAAllowed("ARN") {
+		t.Error("ARN should be allowed after loading from JSON")
+	}
+}
+
+func TestMQTTSourceRegionField(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	os.WriteFile(cfgPath, []byte(`{
+		"dbPath": "/tmp/test.db",
+		"mqttSources": [
+			{"name": "cascadia", "broker": "tcp://localhost:1883", "topics": ["meshcore/#"], "region": "PDX"}
+		]
+	}`), 0o644)
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MQTTSources[0].Region != "PDX" {
+		t.Fatalf("expected region PDX, got %q", cfg.MQTTSources[0].Region)
+	}
+}
+
+// TestResolvedSourcesSchemeMapping verifies that mqtt:// and mqtts:// are translated
+// to the paho-native tcp:// and ssl:// schemes, while ws:// and wss:// pass through
+// unchanged (paho handles WebSocket connections natively).
+func TestResolvedSourcesSchemeMapping(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"mqtt://host:1883", "tcp://host:1883"},
+		{"mqtts://host:8883", "ssl://host:8883"},
+		{"tcp://host:1883", "tcp://host:1883"},
+		{"ssl://host:8883", "ssl://host:8883"},
+		{"ws://host:9001", "ws://host:9001"},
+		{"wss://host:9001", "wss://host:9001"},
+		{"ws://host:9001/mqtt", "ws://host:9001/mqtt"},
+		{"wss://host:9001/mqtt", "wss://host:9001/mqtt"},
+	}
+
+	for _, tt := range tests {
+		cfg := &Config{
+			MQTTSources: []MQTTSource{
+				{Name: "test", Broker: tt.input, Topics: []string{"meshcore/#"}},
+			},
+		}
+		sources := cfg.ResolvedSources()
+		if got := sources[0].Broker; got != tt.want {
+			t.Errorf("ResolvedSources(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+// TestLoadConfigWSSource verifies that a WebSocket MQTT source round-trips through
+// LoadConfig correctly — username/password preserved, scheme unchanged.
+func TestLoadConfigWSSource(t *testing.T) {
+	t.Setenv("DB_PATH", "")
+	t.Setenv("MQTT_BROKER", "")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	os.WriteFile(cfgPath, []byte(`{
+		"dbPath": "test.db",
+		"mqttSources": [
+			{
+				"name": "local-tcp",
+				"broker": "mqtt://localhost:1883",
+				"topics": ["meshcore/#"]
+			},
+			{
+				"name": "wsmqtt-ws",
+				"broker": "wss://wsmqtt.example.com/mqtt",
+				"username": "corescope",
+				"password": "s3cr3t",
+				"topics": ["meshcore/#"]
+			}
+		]
+	}`), 0o644)
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.MQTTSources) != 2 {
+		t.Fatalf("mqttSources len=%d, want 2", len(cfg.MQTTSources))
+	}
+
+	tcp := cfg.MQTTSources[0]
+	if tcp.Name != "local-tcp" {
+		t.Errorf("name=%s, want local-tcp", tcp.Name)
+	}
+
+	ws := cfg.MQTTSources[1]
+	if ws.Name != "wsmqtt-ws" {
+		t.Errorf("name=%s, want wsmqtt-ws", ws.Name)
+	}
+	if ws.Broker != "wss://wsmqtt.example.com/mqtt" {
+		t.Errorf("broker=%s, want wss://wsmqtt.example.com/mqtt", ws.Broker)
+	}
+	if ws.Username != "corescope" {
+		t.Errorf("username=%s, want corescope", ws.Username)
+	}
+	if ws.Password != "s3cr3t" {
+		t.Errorf("password=%s, want s3cr3t", ws.Password)
+	}
+
+	sources := cfg.ResolvedSources()
+	if sources[1].Broker != "wss://wsmqtt.example.com/mqtt" {
+		t.Errorf("ResolvedSources wss broker=%s, want unchanged", sources[1].Broker)
+	}
+}

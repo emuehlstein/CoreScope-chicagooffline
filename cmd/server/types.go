@@ -88,6 +88,38 @@ type StatsResponse struct {
 	ProcessRSSMB  float64 `json:"processRSSMB"`  // process RSS from /proc (Linux) or runtime.Sys fallback
 	GoHeapInuseMB float64 `json:"goHeapInuseMB"` // runtime.MemStats.HeapInuse
 	GoSysMB       float64 `json:"goSysMB"`       // runtime.MemStats.Sys (total Go-managed)
+
+	// NeighborGraphCacheRebuildFailures counts panic/marshal failures in the
+	// background neighbor-graph cache recomputer. Non-zero = stale snapshot
+	// being served indefinitely. Surfaced for operator visibility. #1483 follow-up.
+	NeighborGraphCacheRebuildFailures uint64 `json:"neighborGraphCacheRebuildFailures"`
+}
+
+// ─── Scope Stats ───────────────────────────────────────────────────────────────
+
+type ScopeStatsSummary struct {
+	TransportTotal int `json:"transportTotal"`
+	Scoped         int `json:"scoped"`
+	Unscoped       int `json:"unscoped"`
+	UnknownScope   int `json:"unknownScope"`
+}
+
+type ScopeRegionCount struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+type ScopeTimePoint struct {
+	T        string `json:"t"`
+	Scoped   int    `json:"scoped"`
+	Unscoped int    `json:"unscoped"`
+}
+
+type ScopeStatsResponse struct {
+	Window     string             `json:"window"`
+	Summary    ScopeStatsSummary  `json:"summary"`
+	ByRegion   []ScopeRegionCount `json:"byRegion"`
+	TimeSeries []ScopeTimePoint   `json:"timeSeries"`
 }
 
 // ─── Health ────────────────────────────────────────────────────────────────────
@@ -184,19 +216,23 @@ type PacketStoreIndexes struct {
 }
 
 type PerfPacketStoreStats struct {
-	TotalLoaded       int                `json:"totalLoaded"`
-	TotalObservations int                `json:"totalObservations"`
-	Evicted           int                `json:"evicted"`
-	Inserts           int64              `json:"inserts"`
-	Queries           int64              `json:"queries"`
-	InMemory          int                `json:"inMemory"`
-	SqliteOnly        bool               `json:"sqliteOnly"`
-	MaxPackets        int                `json:"maxPackets"`
-	EstimatedMB       float64            `json:"estimatedMB"`
-	TrackedMB         float64            `json:"trackedMB"`
-	AvgBytesPerPacket int64              `json:"avgBytesPerPacket"`
-	MaxMB             int                `json:"maxMB"`
-	Indexes           PacketStoreIndexes `json:"indexes"`
+	TotalLoaded              int                `json:"totalLoaded"`
+	TotalObservations        int                `json:"totalObservations"`
+	Evicted                  int                `json:"evicted"`
+	Inserts                  int64              `json:"inserts"`
+	Queries                  int64              `json:"queries"`
+	InMemory                 int                `json:"inMemory"`
+	SqliteOnly               bool               `json:"sqliteOnly"`
+	MaxPackets               int                `json:"maxPackets"`
+	EstimatedMB              float64            `json:"estimatedMB"`
+	TrackedMB                float64            `json:"trackedMB"`
+	AvgBytesPerPacket        int64              `json:"avgBytesPerPacket"`
+	MaxMB                    int                `json:"maxMB"`
+	Indexes                  PacketStoreIndexes `json:"indexes"`
+	HotStartupHours          float64            `json:"hotStartupHours"`
+	BackgroundLoadComplete   bool               `json:"backgroundLoadComplete"`
+	BackgroundLoadFailed     bool               `json:"backgroundLoadFailed"`
+	BackgroundLoadProgress   int64              `json:"backgroundLoadProgress"`
 }
 
 type WalPages struct {
@@ -260,6 +296,7 @@ type TransmissionResp struct {
 	ObservationCount int              `json:"observation_count"`
 	ObserverID       interface{}      `json:"observer_id"`
 	ObserverName     interface{}      `json:"observer_name"`
+	ObserverIATA     interface{}      `json:"observer_iata"`
 	SNR              interface{}      `json:"snr"`
 	RSSI             interface{}      `json:"rssi"`
 	PathJSON         interface{}      `json:"path_json"`
@@ -274,6 +311,7 @@ type ObservationResp struct {
 	Hash           interface{} `json:"hash,omitempty"`
 	ObserverID     interface{} `json:"observer_id"`
 	ObserverName   interface{} `json:"observer_name"`
+	ObserverIATA   interface{} `json:"observer_iata"`
 	SNR            interface{} `json:"snr"`
 	RSSI           interface{} `json:"rssi"`
 	PathJSON       interface{} `json:"path_json"`
@@ -291,6 +329,7 @@ type GroupedPacketResp struct {
 	Latest           string      `json:"latest"`
 	ObserverID       interface{} `json:"observer_id"`
 	ObserverName     interface{} `json:"observer_name"`
+	ObserverIATA     interface{} `json:"observer_iata"`
 	PathJSON         interface{} `json:"path_json"`
 	PayloadType      int         `json:"payload_type"`
 	RouteType        int         `json:"route_type"`
@@ -315,7 +354,6 @@ type PacketTimestampsResponse struct {
 type PacketDetailResponse struct {
 	Packet           interface{}       `json:"packet"`
 	Path             []interface{}     `json:"path"`
-	Breakdown        *Breakdown        `json:"breakdown"`
 	ObservationCount int               `json:"observation_count"`
 	Observations     []ObservationResp `json:"observations,omitempty"`
 }
@@ -860,10 +898,19 @@ type ObserverResp struct {
 	BatteryMv       interface{} `json:"battery_mv"`
 	UptimeSecs      interface{} `json:"uptime_secs"`
 	NoiseFloor      interface{} `json:"noise_floor"`
+	LastPacketAt    interface{} `json:"last_packet_at"`
 	PacketsLastHour int         `json:"packetsLastHour"`
 	Lat             interface{} `json:"lat"`
 	Lon             interface{} `json:"lon"`
 	NodeRole        interface{} `json:"nodeRole"`
+	// Issue #1478: surface naive-clock observers to the UI.
+	// `clock_naive` is derived from clock_last_naive_at being within the
+	// last 24h; once decayed, all three skew fields read as zero/null so the
+	// chip and banner clear automatically.
+	ClockNaive        bool        `json:"clock_naive"`
+	ClockSkewSeconds  interface{} `json:"clock_skew_seconds"`
+	ClockSkewCount24h int         `json:"clock_skew_count_24h"`
+	ClockLastNaiveAt  interface{} `json:"clock_last_naive_at"`
 }
 
 type ObserverListResponse struct {
@@ -954,6 +1001,9 @@ type ClientConfigResponse struct {
 	PropagationBufferMs float64         `json:"propagationBufferMs"`
 	Timestamps          TimestampConfig `json:"timestamps"`
 	DebugAffinity       bool            `json:"debugAffinity,omitempty"`
+	// #1420 — server default for dark-tile provider picker. Client uses this
+	// as the fallback when no localStorage override is set.
+	MapDarkTileProvider string `json:"mapDarkTileProvider,omitempty"`
 }
 
 // ─── IATA Coords ───────────────────────────────────────────────────────────────

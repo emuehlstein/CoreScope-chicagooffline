@@ -9,7 +9,11 @@
   function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
   function statusGreen() { return cssVar('--status-green') || '#22c55e'; }
 
-  let map, ws, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer;
+  let map, ws, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer, clickablePathsLayer;
+  let clickablePaths = [];
+  const CLICKABLE_PATH_TTL_MS = 30000;
+  const CLICKABLE_PATH_MAX = 50;
+  const CLICKABLE_POPUP_DISMISS_MS = 20000;
   let nodeMarkers = {};
   let nodeData = {};
   let packetCount = 0;
@@ -22,6 +26,78 @@
   let showOnlyFavorites = localStorage.getItem('live-favorites-only') === 'true';
   let matrixMode = localStorage.getItem('live-matrix-mode') === 'true';
   let matrixRain = localStorage.getItem('live-matrix-rain') === 'true';
+  let colorByHash = localStorage.getItem('meshcore-color-packets-by-hash') !== 'false';
+  /** Current theme string for hash-color functions. */
+  function _liveTheme() { return document.documentElement.dataset.theme || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); }
+  let nodeFilterKeys = (localStorage.getItem('live-node-filter') || '').split(',').map(s => s.trim()).filter(Boolean);
+  let nodeFilterTotal = 0;
+  let nodeFilterShown = 0;
+  // Region filter (#1045): observer_id → IATA code, populated from /api/observers
+  let observerIataMap = {};
+  let regionFilterChangeHandler = null;
+
+  /**
+   * Returns true if the packet group matches the selected regions.
+   * - selected null/empty → no filter active, always true.
+   * - Match if ANY observation's observer maps to an IATA in selected (case-insensitive).
+   * Pure helper exposed for unit tests.
+   */
+  function packetMatchesRegion(packets, obsMap, selected) {
+    if (!selected || !selected.length) return true;
+    if (!packets || !packets.length) return false;
+    const sel = selected.map(function(s) { return String(s).toUpperCase(); });
+    for (var i = 0; i < packets.length; i++) {
+      var oid = packets[i] && packets[i].observer_id;
+      if (oid == null) continue;
+      var iata = obsMap && obsMap[oid];
+      if (!iata) continue;
+      if (sel.indexOf(String(iata).toUpperCase()) !== -1) return true;
+    }
+    return false;
+  }
+  function setObserverIataMap(m) { observerIataMap = m || {}; }
+
+  // #1189 R2 mesh-operator fix: live feed must show the observer's IATA pill
+  // alongside the existing 👁 N badge so operators on /live can tell SAME-
+  // region from CROSS-region reception at a glance (same affordance as the
+  // /packets table). Mirrors `obsIataBadge` in public/packets.js — kept as a
+  // local helper for now (live.js and packets.js are separate IIFEs with no
+  // shared module). TODO: extract `obsIataBadge` into shared packet-helpers.js
+  // and have both surfaces import it.
+  function obsIataBadgeHtml(pkt) {
+    if (!pkt) return '';
+    var iata = pkt.observer_iata;
+    if (!iata && pkt.observer_id) iata = observerIataMap && observerIataMap[pkt.observer_id];
+    if (!iata) return '';
+    var esc = (typeof escapeHtml === 'function')
+      ? escapeHtml(iata)
+      : String(iata).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    return '<span class="badge-iata" style="font-size:10px;margin-left:4px">' + esc + '</span>';
+  }
+
+  /**
+   * Build observer_id → IATA map from the /api/observers response.
+   * The endpoint returns `{ observers: [...], server_time: "..." }`
+   * (cmd/server/types.go ObserverListResponse). Defensive: also accepts
+   * a bare array in case the API shape ever changes back, and ignores
+   * observers without an IATA. Returns a plain object (used as a hash).
+   * Exported for tests via window._liveBuildObserverIataMap.
+   * Fixes #1136 (regression introduced in #1080 which assumed array shape).
+   */
+  function buildObserverIataMap(data) {
+    var list = null;
+    if (Array.isArray(data)) list = data;
+    else if (data && Array.isArray(data.observers)) list = data.observers;
+    var m = {};
+    if (!list) return m;
+    for (var i = 0; i < list.length; i++) {
+      var o = list[i];
+      if (o && o.id != null && o.iata) m[o.id] = o.iata;
+    }
+    return m;
+  }
+  const _savedSpeed = parseFloat(localStorage.getItem('live-vcr-speed'));
+  const _initialSpeed = [0.25, 0.5, 1, 2, 4, 8].includes(_savedSpeed) ? _savedSpeed : 1;
   let rainCanvas = null, rainCtx = null, rainDrops = [], rainRAF = null;
   const propagationBuffer = new Map(); // hash -> {timer, packets[]}
   let _onResize = null;
@@ -51,7 +127,9 @@
 
   const TYPE_COLORS = window.TYPE_COLORS || {
     ADVERT: '#22c55e', GRP_TXT: '#3b82f6', TXT_MSG: '#f59e0b', ACK: '#6b7280',
-    REQUEST: '#a855f7', RESPONSE: '#06b6d4', TRACE: '#ec4899', PATH: '#14b8a6'
+    REQUEST: '#a855f7', RESPONSE: '#06b6d4', TRACE: '#ec4899', PATH: '#14b8a6',
+    ANON_REQ: '#f43f5e', GRP_DATA: '#8b5cf6', MULTIPART: '#0d9488',
+    CONTROL: '#b45309', RAW_CUSTOM: '#c026d3'
   };
 
   const PAYLOAD_ICONS = {
@@ -166,7 +244,32 @@
         // Set live-page height from JS — most reliable across all mobile browsers
         const page = document.querySelector('.live-page');
         const appEl = document.getElementById('app');
-        const h = window.innerHeight;
+        // #1267: the CSS rule for .live-page subtracts --bottom-nav-reserve
+        // (0px desktop, 56px+safe-area at ≤768px) so the fixed .bottom-nav
+        // (z-index 1200) does not occlude the VCR bar (position:absolute;
+        // bottom:0; z-index 1000). Mirror that subtraction here — otherwise
+        // this JS override clobbers the CSS height with raw window.innerHeight
+        // and the VCR bar slides under the bottom-nav (issue #1267).
+        // Prefer the bottom-nav's measured rendered height so we also cover
+        // the 1px top border and any visual chrome the --bottom-nav-reserve
+        // token doesn't account for; fall back to the token-resolved value.
+        const reserve = (() => {
+          const bn = document.querySelector('.bottom-nav');
+          if (bn) {
+            const cs = getComputedStyle(bn);
+            if (cs.display !== 'none') {
+              const r = bn.getBoundingClientRect().height;
+              if (r > 0) return r;
+            }
+          }
+          const probe = document.createElement('div');
+          probe.style.cssText = 'position:absolute;visibility:hidden;height:var(--bottom-nav-reserve,0px);pointer-events:none;';
+          (document.body || document.documentElement).appendChild(probe);
+          const px = probe.getBoundingClientRect().height || 0;
+          probe.remove();
+          return px;
+        })();
+        const h = Math.max(0, window.innerHeight - reserve);
         if (page) page.style.height = h + 'px';
         if (appEl) appEl.style.height = h + 'px';
         if (map) {
@@ -187,6 +290,45 @@
   }
 
   // === VCR Controls ===
+
+  // #1206: publish the VCR bar's measured height as --vcr-bar-height on the
+  // .live-page root so bottom-pinned overlays (feed, legend, corner panels)
+  // can reserve the right amount of space and never get occluded by the bar.
+  // Cleanup state is captured in module-scoped _vcrHeightCleanup so destroy()
+  // can disconnect the ResizeObserver + remove the resize/visualViewport
+  // listeners on SPA page navigation (otherwise re-mounts of /live would
+  // accumulate observers forever — same leak class as #1180).
+  var _vcrHeightCleanup = null;
+  function initVCRHeightTracker() {
+    // #1206 r1 (adversarial should-fix): guard against double-init —
+    // if a prior tracker is still active (re-mount race, dev hot-reload),
+    // tear it down BEFORE overwriting _vcrHeightCleanup so the previous
+    // ResizeObserver/listeners aren't orphaned.
+    if (_vcrHeightCleanup) { try { _vcrHeightCleanup(); } catch (_) {} _vcrHeightCleanup = null; }
+    var bar = document.getElementById('vcrBar');
+    var page = document.querySelector('.live-page');
+    if (!bar || !page) return;
+    function publish() {
+      var h = Math.ceil(bar.getBoundingClientRect().height) || 58;
+      page.style.setProperty('--vcr-bar-height', h + 'px');
+    }
+    publish();
+    var ro = null;
+    if (typeof ResizeObserver === 'function') {
+      try { ro = new ResizeObserver(publish); ro.observe(bar); } catch (_) { ro = null; }
+    }
+    window.addEventListener('resize', publish);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', publish);
+    }
+    _vcrHeightCleanup = function() {
+      if (ro) { try { ro.disconnect(); } catch (_) {} ro = null; }
+      window.removeEventListener('resize', publish);
+      if (window.visualViewport) {
+        window.visualViewport.removeEventListener('resize', publish);
+      }
+    };
+  }
 
   function vcrSetMode(mode) {
     VCR.mode = mode;
@@ -393,10 +535,63 @@
     if (VCR.replayTimer) { clearTimeout(VCR.replayTimer); VCR.replayTimer = null; }
   }
 
+  function buildClickablePathPopupHtml(typeName, color, hopNames, tsMs, hash) {
+    // tsMs is packet receive time — "ago" is relative to when the packet arrived, not when the animation ended
+    const secsAgo = Math.round((Date.now() - tsMs) / 1000);
+    const timeStr = secsAgo < 60 ? secsAgo + 's ago' : Math.round(secsAgo / 60) + 'm ago';
+    const chain = hopNames.join(' → ');
+    const link = hash ? `<a class="lc-path-link" href="#/packets/${hash}" style="color:${color}">full detail →</a>` : '';
+    return `<div class="lc-path-popup">
+      <span class="lc-path-badge" style="background:${color}">${typeName}</span>
+      <div class="lc-path-time">${timeStr}</div>
+      <div class="lc-path-chain">${chain}</div>
+      ${link ? '<div class="lc-path-link-wrap">' + link + '</div>' : ''}
+    </div>`;
+  }
+
+  function pruneClickablePaths(now) {
+    const cutoff = now - CLICKABLE_PATH_TTL_MS;
+    for (let i = clickablePaths.length - 1; i >= 0; i--) {
+      if (clickablePaths[i].addedAt < cutoff) {
+        try { clickablePaths[i].poly.remove(); } catch (_) {}
+        clickablePaths.splice(i, 1);
+      }
+    }
+    while (clickablePaths.length > CLICKABLE_PATH_MAX) {
+      try { clickablePaths[0].poly.remove(); } catch (_) {}
+      clickablePaths.shift();
+    }
+  }
+
+  function registerClickablePath(latLngs, typeName, color, hopNames, tsMs, hash) {
+    if (!clickablePathsLayer) return;
+    const poly = L.polyline(latLngs, { weight: 12, opacity: 0, interactive: true }).addTo(clickablePathsLayer);
+    const entry = { addedAt: Date.now(), poly };
+    clickablePaths.push(entry);
+    pruneClickablePaths(Date.now());
+    let dismissTimer = null;
+    poly.on('click', function(e) {
+      if (dismissTimer) clearTimeout(dismissTimer);
+      const html = buildClickablePathPopupHtml(typeName, color, hopNames, tsMs, hash);
+      L.popup({ maxWidth: 280, className: 'path-info-popup' })
+        .setLatLng(e.latlng)
+        .setContent(html)
+        .openOn(map);
+      dismissTimer = setTimeout(() => { if (map) map.closePopup(); }, CLICKABLE_POPUP_DISMISS_MS);
+    });
+  }
+
+  function speedLabel(s) {
+    if (s === 0.25) return '¼x';
+    if (s === 0.5) return '½x';
+    return s + 'x';
+  }
+
   function vcrSpeedCycle() {
-    const speeds = [1, 2, 4, 8];
+    const speeds = [0.25, 0.5, 1, 2, 4, 8];
     const idx = speeds.indexOf(VCR.speed);
     VCR.speed = speeds[(idx + 1) % speeds.length];
+    localStorage.setItem('live-vcr-speed', VCR.speed);
     updateVCRUI();
     // If replaying, restart with new speed
     if (VCR.mode === 'REPLAY' && VCR.replayTimer) {
@@ -532,7 +727,7 @@
       if (pauseBtn) { pauseBtn.textContent = '⏸'; pauseBtn.setAttribute('aria-label', 'Pause'); }
       if (missedEl) missedEl.classList.add('hidden');
     }
-    if (speedBtn) { speedBtn.textContent = VCR.speed + 'x'; speedBtn.setAttribute('aria-label', 'Speed ' + VCR.speed + 'x'); }
+    if (speedBtn) { speedBtn.textContent = speedLabel(VCR.speed); speedBtn.setAttribute('aria-label', 'Speed ' + speedLabel(VCR.speed)); }
     updateVCRLcd();
   }
 
@@ -808,23 +1003,41 @@
       <div class="live-page">
         <div id="liveMap" style="width:100%;height:100%;position:absolute;top:0;left:0;z-index:1"></div>
         <div class="live-overlay live-header" id="liveHeader">
-          <div class="live-title">
-            <span class="live-beacon"></span>
-            MESH LIVE
+          <div class="live-header-critical" data-live-header-critical>
+            <span class="live-beacon" aria-label="WebSocket connection beacon"></span>
+            <div class="live-stat-pill live-stat-pill--critical"><span id="livePktCount">0</span> pkts</div>
           </div>
-          <div class="live-stats-row">
-            <div class="live-stat-pill"><span id="livePktCount">0</span> pkts</div>
+          <!-- #1234: stats row promoted to a direct child of .live-header so
+               the counters are always visible inline on mobile (single-row
+               header, no MESH LIVE label, no chart toggle). At desktop
+               this also flows inline next to the title via flex. -->
+          <div class="live-stats-row" data-live-stats-row>
             <div class="live-stat-pill"><span id="liveNodeCount">0</span> nodes</div>
             <div class="live-stat-pill anim-pill"><span id="liveAnimCount">0</span> active</div>
             <div class="live-stat-pill rate-pill"><span id="livePktRate">0</span>/min</div>
           </div>
-          <div class="live-toggles">
+          <button class="live-header-toggle" data-live-header-toggle id="liveHeaderToggle"
+                  aria-expanded="false" aria-controls="liveHeaderBody"
+                  aria-label="Show live stats">📊</button>
+          <div class="live-header-body" data-live-header-body id="liveHeaderBody">
+            <div class="live-title">
+              MESH LIVE
+            </div>
+          </div>
+        <!-- #1205: settings toggles are children of the MESH LIVE panel
+             (#liveHeader), not a free-floating .live-overlay. PR #1180
+             detached them; this restores the pre-regression structure. -->
+        <div class="live-controls" id="liveControls">
+          <div class="live-controls-body" data-live-controls-body id="liveControlsBody">
+            <div class="live-toggles">
             <label><input type="checkbox" id="liveHeatToggle" checked aria-describedby="heatDesc"> Heat</label>
             <span id="heatDesc" class="sr-only">Overlay a density heat map on the mesh nodes</span>
             <label><input type="checkbox" id="liveGhostToggle" checked aria-describedby="ghostDesc"> Ghosts</label>
             <span id="ghostDesc" class="sr-only">Show interpolated ghost markers for unknown hops</span>
             <label><input type="checkbox" id="liveRealisticToggle" aria-describedby="realisticDesc"> Realistic</label>
             <span id="realisticDesc" class="sr-only">Buffer packets by hash and animate all paths simultaneously</span>
+            <label><input type="checkbox" id="liveColorHashToggle" aria-describedby="colorHashDesc"> Color by hash</label>
+            <span id="colorHashDesc" class="sr-only">Color flying-packet dots and contrails by packet hash for propagation tracing</span>
             <label><input type="checkbox" id="liveMatrixToggle" aria-describedby="matrixDesc"> Matrix</label>
             <span id="matrixDesc" class="sr-only">Animate packet hex bytes flowing along paths like the Matrix</span>
             <label><input type="checkbox" id="liveMatrixRainToggle" aria-describedby="rainDesc"> Rain</label>
@@ -833,20 +1046,35 @@
             <span id="audioDesc" class="sr-only">Sonify packets — turn raw bytes into generative music</span>
             <label><input type="checkbox" id="liveFavoritesToggle" aria-describedby="favDesc"> ⭐ Favorites</label>
             <span id="favDesc" class="sr-only">Show only favorited and claimed nodes</span>
+            <div class="live-node-filter-wrap" style="position:relative">
+              <input type="text" id="liveNodeFilterInput" placeholder="Filter by node…" autocomplete="off" class="live-node-filter-input" role="combobox" aria-expanded="false" aria-owns="liveNodeFilterDropdown" aria-autocomplete="list" aria-activedescendant="">
+              <div id="liveNodeFilterDropdown" class="live-node-filter-dropdown hidden" role="listbox"></div>
+              <button id="liveNodeFilterClear" class="vcr-btn" title="Clear node filter" style="display:none">×</button>
+            </div>
+            <div id="liveNodeFilterCount" class="live-filter-count hidden"></div>
             <label id="liveGeoFilterLabel" style="display:none"><input type="checkbox" id="liveGeoFilterToggle"> Mesh live area</label>
+            <div id="liveRegionFilter" class="region-filter-container live-region-filter-container" aria-label="Filter live packets by IATA region"></div>
+            </div>
+            <div class="audio-controls hidden" id="audioControls">
+              <label class="audio-slider-label">Voice <select id="audioVoiceSelect" class="audio-voice-select"></select></label>
+              <label class="audio-slider-label">BPM <input type="range" id="audioBpmSlider" min="40" max="300" value="120" class="audio-slider"><span id="audioBpmVal">120</span></label>
+              <label class="audio-slider-label">Vol <input type="range" id="audioVolSlider" min="0" max="100" value="30" class="audio-slider"><span id="audioVolVal">30</span></label>
+            </div>
           </div>
-          <div class="audio-controls hidden" id="audioControls">
-            <label class="audio-slider-label">Voice <select id="audioVoiceSelect" class="audio-voice-select"></select></label>
-            <label class="audio-slider-label">BPM <input type="range" id="audioBpmSlider" min="40" max="300" value="120" class="audio-slider"><span id="audioBpmVal">120</span></label>
-            <label class="audio-slider-label">Vol <input type="range" id="audioVolSlider" min="0" max="100" value="30" class="audio-slider"><span id="audioVolVal">30</span></label>
-          </div>
+          <div id="liveAreaFilter"></div>
+          <button class="live-controls-toggle" data-live-controls-toggle id="liveControlsToggle"
+                  aria-expanded="false" aria-controls="liveControlsBody"
+                  aria-label="Show live controls">⚙</button>
         </div>
+        </div><!-- /#liveHeader -->
         <div class="live-overlay live-feed" id="liveFeed">
           <div class="panel-header">
             <button class="panel-corner-btn" data-panel="liveFeed" title="Move panel to next corner" aria-label="Move panel to next corner">◫</button>
             <button class="feed-hide-btn" id="feedHideBtn" title="Hide feed">✕</button>
           </div>
-          <div class="panel-content" aria-live="polite" aria-relevant="additions" role="log"></div>
+          <div class="panel-content" aria-live="polite" aria-relevant="additions" role="log">
+            <div class="live-feed-empty" aria-hidden="true">Waiting for packets…</div>
+          </div>
         </div>
         <button class="feed-show-btn hidden" id="feedShowBtn" title="Show feed">📋</button>
         <div id="nodeDetailBackdrop" class="node-detail-backdrop"></div>
@@ -869,10 +1097,23 @@
             <li><span class="live-dot" style="background:${TYPE_COLORS.GRP_TXT}" aria-hidden="true"></span> Message — Group text</li>
             <li><span class="live-dot" style="background:${TYPE_COLORS.TXT_MSG}" aria-hidden="true"></span> Direct — Direct message</li>
             <li><span class="live-dot" style="background:${TYPE_COLORS.REQUEST}" aria-hidden="true"></span> Request — Data request</li>
+            <li><span class="live-dot" style="background:${TYPE_COLORS.RESPONSE}" aria-hidden="true"></span> Response — Data response</li>
             <li><span class="live-dot" style="background:${TYPE_COLORS.TRACE}" aria-hidden="true"></span> Trace — Route trace</li>
+            <li><span class="live-dot" style="background:${TYPE_COLORS.PATH}" aria-hidden="true"></span> Path — Path discovery</li>
+            <li><span class="live-dot" style="background:${TYPE_COLORS.ANON_REQ}" aria-hidden="true"></span> Anon Req — Anonymous request</li>
+            <li><span class="live-dot" style="background:${TYPE_COLORS.GRP_DATA}" aria-hidden="true"></span> Grp Data — Group datagram</li>
+            <li><span class="live-dot" style="background:${TYPE_COLORS.MULTIPART}" aria-hidden="true"></span> Multipart — Multi-fragment payload</li>
+            <li><span class="live-dot" style="background:${TYPE_COLORS.CONTROL}" aria-hidden="true"></span> Control — Control plane</li>
+            <li><span class="live-dot" style="background:${TYPE_COLORS.RAW_CUSTOM}" aria-hidden="true"></span> Raw Custom — Application-defined payload</li>
+            <li><span class="live-dot" style="background:${TYPE_COLORS.ACK}" aria-hidden="true"></span> Ack / Other — Acknowledgment or unknown type</li>
           </ul>
           <h3 class="legend-title" style="margin-top:8px">NODE ROLES</h3>
           <ul class="legend-list" id="roleLegendList"></ul>
+          <h3 class="legend-title" style="margin-top:8px">MARKER STYLES</h3>
+          <ul class="legend-list">
+            <li><span class="live-ring live-ring--repeater" aria-hidden="true"></span> Bright white ring — repeater</li>
+            <li><span class="live-ring live-ring--other" aria-hidden="true"></span> Faded ring — companion / sensor / room</li>
+          </ul>
           </div>
         </div>
 
@@ -889,8 +1130,16 @@
           <div class="vcr-scope-btns" role="radiogroup" aria-label="Timeline scope">
             <button class="vcr-scope-btn active" data-scope="3600000" role="radio" aria-checked="true" aria-label="Scope 1 hour">1h</button>
             <button class="vcr-scope-btn" data-scope="21600000" role="radio" aria-checked="false" aria-label="Scope 6 hours">6h</button>
-            <button class="vcr-scope-btn" data-scope="43200000" role="radio" aria-checked="false" aria-label="Scope 12 hours">12h</button>
-            <button class="vcr-scope-btn" data-scope="86400000" role="radio" aria-checked="false" aria-label="Scope 24 hours">24h</button>
+            <button class="vcr-scope-btn vcr-scope-btn--overflow" data-scope="43200000" role="radio" aria-checked="false" aria-label="Scope 12 hours">12h</button>
+            <button class="vcr-scope-btn vcr-scope-btn--overflow" data-scope="86400000" role="radio" aria-checked="false" aria-label="Scope 24 hours">24h</button>
+            <!-- #1234: at ≤640px buttons marked .vcr-scope-btn--overflow are
+                 hidden and surfaced via this More dropdown instead. -->
+            <div class="vcr-scope-more-wrap" data-vcr-scope-more-wrap>
+              <button type="button" class="vcr-scope-btn vcr-scope-more" data-vcr-scope-more
+                      aria-haspopup="true" aria-expanded="false" aria-controls="vcrScopeMoreMenu"
+                      aria-label="More timeline scopes">More ▾</button>
+              <div class="vcr-scope-more-menu" id="vcrScopeMoreMenu" role="menu" hidden></div>
+            </div>
           </div>
           <div class="vcr-timeline-container">
             <canvas id="vcrTimeline" class="vcr-timeline"></canvas>
@@ -922,26 +1171,74 @@
 
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
       (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    let tileLayer = L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { maxZoom: 19 }).addTo(map);
+    // #1420 — multi-provider dark-tile picker. Light mode unchanged.
+    let _liveDarkRefLayer = null;
+    function _liveResolveTile(dark) {
+      if (!dark) return { url: TILE_LIGHT, attribution: '© OpenStreetMap © CartoDB', refUrl: null };
+      const reg = window.MC_TILE_PROVIDERS || {};
+      const id  = (typeof window.MC_getDarkTileProvider === 'function') ? window.MC_getDarkTileProvider() : 'carto-dark';
+      const p   = reg[id] || reg['carto-dark'] || {};
+      return {
+        url: p.url || p.baseUrl || TILE_DARK,
+        attribution: p.attribution || '© OpenStreetMap © CartoDB',
+        refUrl: p.refUrl || null
+      };
+    }
+    function _liveSyncDarkTiles(dark) {
+      const r = _liveResolveTile(dark);
+      tileLayer.setUrl(r.url);
+      if (tileLayer.options) tileLayer.options.attribution = r.attribution;
+      if (dark && r.refUrl) {
+        if (!_liveDarkRefLayer) {
+          _liveDarkRefLayer = L.tileLayer(r.refUrl, { maxZoom: 19, attribution: r.attribution }).addTo(map);
+        } else {
+          _liveDarkRefLayer.setUrl(r.refUrl);
+        }
+      } else if (_liveDarkRefLayer) {
+        map.removeLayer(_liveDarkRefLayer);
+        _liveDarkRefLayer = null;
+      }
+      if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
+      // #1420 parity with map.js — refresh visible attribution credit after provider swap.
+      if (map.attributionControl) {
+        try { map.attributionControl._update && map.attributionControl._update(); } catch (_) {}
+      }
+    }
+    const _liveInitTile = _liveResolveTile(isDark);
+    let tileLayer = L.tileLayer(_liveInitTile.url, { maxZoom: 19, attribution: _liveInitTile.attribution }).addTo(map);
+    if (isDark && _liveInitTile.refUrl) {
+      _liveDarkRefLayer = L.tileLayer(_liveInitTile.refUrl, { maxZoom: 19, attribution: _liveInitTile.attribution }).addTo(map);
+    }
+    if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
 
     // Swap tiles when theme changes
     const _themeObs = new MutationObserver(function () {
       const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
         (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-      tileLayer.setUrl(dark ? TILE_DARK : TILE_LIGHT);
+      _liveSyncDarkTiles(dark);
     });
     _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    // #1420 — re-render on customizer change.
+    window.addEventListener('mc-tile-provider-changed', function () {
+      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      _liveSyncDarkTiles(dark);
+    });
     L.control.zoom({ position: 'topright' }).addTo(map);
 
     nodesLayer = L.layerGroup().addTo(map);
     pathsLayer = L.layerGroup().addTo(map);
     animLayer = L.layerGroup().addTo(map);
+    clickablePathsLayer = L.layerGroup().addTo(map);
 
     injectSVGFilters();
+    AreaFilter.init(document.getElementById('liveAreaFilter'));
+    AreaFilter.onChange(function () { loadNodes(); });
     await loadNodes();
     showHeatMap();
     connectWS();
     initResizeHandler();
+    initVCRHeightTracker();
     startRateCounter();
 
     // Check for packet replay from packets page (single or array of observations)
@@ -983,6 +1280,14 @@
       localStorage.setItem('live-realistic-propagation', realisticPropagation);
     });
 
+    const colorHashToggle = document.getElementById('liveColorHashToggle');
+    colorHashToggle.checked = colorByHash;
+    colorHashToggle.addEventListener('change', (e) => {
+      colorByHash = e.target.checked;
+      localStorage.setItem('meshcore-color-packets-by-hash', colorByHash);
+      window.dispatchEvent(new Event('storage'));
+    });
+
     const favoritesToggle = document.getElementById('liveFavoritesToggle');
     favoritesToggle.checked = showOnlyFavorites;
     favoritesToggle.addEventListener('change', (e) => {
@@ -990,6 +1295,176 @@
       localStorage.setItem('live-favorites-only', showOnlyFavorites);
       applyFavoritesFilter();
     });
+
+    // Region filter (#1045): dropdown of observer IATA regions
+    (function initLiveRegionFilter() {
+      var rfEl = document.getElementById('liveRegionFilter');
+      if (!rfEl || !window.RegionFilter) return;
+      // Fetch observer roster to build observer_id → IATA map.
+      // /api/observers returns `{observers:[...], server_time:"..."}`
+      // (cmd/server/types.go ObserverListResponse) — NOT a top-level array.
+      // Bug #1136: previously parsed as array → map empty → region filter
+      // dropped every packet.
+      fetch('/api/observers').then(function(r) { return r.json(); }).then(function(data) {
+        setObserverIataMap(buildObserverIataMap(data));
+      }).catch(function() { /* leave map empty; filter will hide all when active */ });
+      RegionFilter.init(rfEl, { dropdown: true });
+      regionFilterChangeHandler = RegionFilter.onChange(function() { /* selection persisted by RegionFilter; future packets reflect it */ });
+    })();
+
+    // Node filter input — autocomplete-as-you-type (#1110)
+    const nodeFilterInput = document.getElementById('liveNodeFilterInput');
+    const nodeFilterClear = document.getElementById('liveNodeFilterClear');
+    const nodeFilterDropdown = document.getElementById('liveNodeFilterDropdown');
+    if (nodeFilterInput) {
+      // Restore from URL param or localStorage
+      const urlNode = getHashParams && getHashParams().get('node');
+      if (urlNode) setNodeFilter(urlNode.split(',').map(s => s.trim()).filter(Boolean));
+      else if (nodeFilterKeys.length) updateNodeFilterUI();
+
+      let activeIdx = -1;
+
+      function hideDropdown() {
+        if (!nodeFilterDropdown) return;
+        nodeFilterDropdown.classList.add('hidden');
+        nodeFilterDropdown.innerHTML = '';
+        nodeFilterInput.setAttribute('aria-expanded', 'false');
+        nodeFilterInput.setAttribute('aria-activedescendant', '');
+        activeIdx = -1;
+      }
+
+      function applyFilterFromInput(rawValue) {
+        // Treat input as a single substring query rather than a list of pubkeys.
+        // setNodeFilter accepts pubkeys/prefixes/names; commit raw for live filtering.
+        const val = (rawValue || '').trim();
+        setNodeFilter(val ? [val] : []);
+        // Update URL without triggering hashchange (which would re-init the page).
+        const params = getHashParams ? getHashParams() : new URLSearchParams();
+        if (val) params.set('node', val);
+        else params.delete('node');
+        const base = location.hash.split('?')[0] || '#/live';
+        const qs = params.toString();
+        const newHash = base + (qs ? '?' + qs : '');
+        const newUrl = location.pathname + location.search + newHash;
+        try { history.replaceState(null, '', newUrl); } catch (_) {}
+      }
+
+      function selectSuggestion(opt) {
+        const key = opt.getAttribute('data-key') || '';
+        const name = opt.getAttribute('data-name') || key;
+        nodeFilterInput.value = name;
+        // Filter by pubkey prefix when available — most precise.
+        setNodeFilter(key ? [key] : (name ? [name] : []));
+        const params = getHashParams ? getHashParams() : new URLSearchParams();
+        if (key) params.set('node', key);
+        else params.delete('node');
+        const base = location.hash.split('?')[0] || '#/live';
+        const qs = params.toString();
+        const newUrl = location.pathname + location.search + base + (qs ? '?' + qs : '');
+        try { history.replaceState(null, '', newUrl); } catch (_) {}
+        hideDropdown();
+      }
+
+      const escapeHtmlLocal = (typeof escapeHtml === 'function') ? escapeHtml : function (s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+        });
+      };
+
+      async function fetchSuggestions(q) {
+        if (!nodeFilterDropdown) return;
+        if (!q || q.length < 1) { hideDropdown(); return; }
+        try {
+          const resp = await fetch('/api/nodes/search?q=' + encodeURIComponent(q));
+          if (!resp.ok) { hideDropdown(); return; }
+          const data = await resp.json();
+          const nodes = (data && data.nodes) || [];
+          if (!nodes.length) { hideDropdown(); return; }
+          nodeFilterDropdown.innerHTML = nodes.map(function (n, i) {
+            const name = n.name || (n.public_key ? n.public_key.slice(0, 8) : '?');
+            const pkShort = n.public_key ? n.public_key.slice(0, 8) : '';
+            return '<div class="live-node-filter-option" id="liveNodeFilterOpt-' + i +
+              '" role="option" data-key="' + escapeHtmlLocal(n.public_key || '') +
+              '" data-name="' + escapeHtmlLocal(name) + '">' +
+              escapeHtmlLocal(name) +
+              ' <span style="color:var(--text-muted);font-size:0.8em">' + escapeHtmlLocal(pkShort) + '</span></div>';
+          }).join('');
+          nodeFilterDropdown.classList.remove('hidden');
+          nodeFilterInput.setAttribute('aria-expanded', 'true');
+          nodeFilterDropdown.querySelectorAll('.live-node-filter-option').forEach(function (opt) {
+            opt.addEventListener('mousedown', function (ev) {
+              // Use mousedown so we run before blur hides the dropdown.
+              ev.preventDefault();
+              selectSuggestion(opt);
+            });
+          });
+        } catch (_) { hideDropdown(); }
+      }
+
+      const debouncedInput = debounce(function (e) {
+        const v = e.target.value.trim();
+        // Apply live filter immediately as user types (no Enter required).
+        applyFilterFromInput(v);
+        fetchSuggestions(v);
+      }, 200);
+
+      nodeFilterInput.addEventListener('input', debouncedInput);
+
+      nodeFilterInput.addEventListener('keydown', function (e) {
+        const opts = nodeFilterDropdown ? nodeFilterDropdown.querySelectorAll('.live-node-filter-option') : [];
+        if (e.key === 'Enter') {
+          // Critical: prevent any default form submission / navigation behavior.
+          e.preventDefault();
+          if (opts.length && activeIdx >= 0 && opts[activeIdx]) {
+            selectSuggestion(opts[activeIdx]);
+          } else {
+            // Just commit current text as a filter and close the dropdown.
+            applyFilterFromInput(nodeFilterInput.value);
+            hideDropdown();
+          }
+          return;
+        }
+        if (!opts.length || (nodeFilterDropdown && nodeFilterDropdown.classList.contains('hidden'))) return;
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          activeIdx = Math.min(activeIdx + 1, opts.length - 1);
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          activeIdx = Math.max(activeIdx - 1, 0);
+        } else if (e.key === 'Escape') {
+          hideDropdown();
+          return;
+        } else {
+          return;
+        }
+        opts.forEach(function (o, i) {
+          o.classList.toggle('live-node-filter-active', i === activeIdx);
+          o.setAttribute('aria-selected', i === activeIdx ? 'true' : 'false');
+        });
+        if (activeIdx >= 0 && opts[activeIdx]) {
+          nodeFilterInput.setAttribute('aria-activedescendant', opts[activeIdx].id);
+          opts[activeIdx].scrollIntoView({ block: 'nearest' });
+        }
+      });
+
+      nodeFilterInput.addEventListener('blur', function () {
+        // Slight delay so click on a suggestion can register first.
+        setTimeout(hideDropdown, 150);
+      });
+    }
+    if (nodeFilterClear) {
+      nodeFilterClear.addEventListener('click', () => {
+        if (nodeFilterInput) nodeFilterInput.value = '';
+        setNodeFilter([]);
+        // Drop the ?node param without re-running the SPA route handler.
+        const params = getHashParams ? getHashParams() : new URLSearchParams();
+        params.delete('node');
+        const base = location.hash.split('?')[0] || '#/live';
+        const qs = params.toString();
+        const newUrl = location.pathname + location.search + base + (qs ? '?' + qs : '');
+        try { history.replaceState(null, '', newUrl); } catch (_) {}
+      });
+    }
 
     // Geo filter overlay
     (async function () {
@@ -1143,6 +1618,78 @@
     // Legend toggle for mobile (#60)
     const legendEl = document.getElementById('liveLegend');
     const legendToggleBtn = document.getElementById('legendToggleBtn');
+
+    // ── Live header / controls toggles (#1178, #1179) ──────────────────────
+    // At narrow viewports (≤768px) the header collapses to a single
+    // toggle button revealing the stats body, and the controls collapse
+    // to a single toggle button revealing the toggles list. CSS gates
+    // visibility of the toggle buttons; JS only flips classes and the
+    // hidden attribute. At wide viewports the bodies are always shown.
+    (function wireLiveCollapseToggles() {
+      var pairs = [
+        { rootId: 'liveHeader',   togId: 'liveHeaderToggle',   bodyId: 'liveHeaderBody',
+          showLabel: 'Show live stats',   hideLabel: 'Hide live stats' },
+        { rootId: 'liveControls', togId: 'liveControlsToggle', bodyId: 'liveControlsBody',
+          showLabel: 'Show live controls', hideLabel: 'Hide live controls' },
+      ];
+      var narrowMql = window.matchMedia('(max-width: 768px)');
+      function setExpanded(p, expanded) {
+        var root = document.getElementById(p.rootId);
+        var tog  = document.getElementById(p.togId);
+        var body = document.getElementById(p.bodyId);
+        if (!root || !tog || !body) return;
+        if (expanded) {
+          root.classList.add('is-expanded'); root.classList.remove('is-collapsed');
+          body.removeAttribute('hidden');
+          tog.setAttribute('aria-expanded', 'true');
+          tog.setAttribute('aria-label', p.hideLabel);
+        } else {
+          root.classList.add('is-collapsed'); root.classList.remove('is-expanded');
+          body.setAttribute('hidden', '');
+          tog.setAttribute('aria-expanded', 'false');
+          tog.setAttribute('aria-label', p.showLabel);
+        }
+      }
+      function applyForViewport() {
+        for (var i = 0; i < pairs.length; i++) {
+          var p = pairs[i];
+          if (narrowMql.matches) {
+            // Default collapsed at narrow viewports
+            setExpanded(p, false);
+          } else {
+            // Always expanded; no hidden attr; no collapse class
+            var root = document.getElementById(p.rootId);
+            var body = document.getElementById(p.bodyId);
+            var tog  = document.getElementById(p.togId);
+            if (body) body.removeAttribute('hidden');
+            if (root) { root.classList.remove('is-collapsed'); root.classList.remove('is-expanded'); }
+            if (tog)  { tog.setAttribute('aria-expanded', 'true'); }
+          }
+        }
+      }
+      pairs.forEach(function (p) {
+        var tog = document.getElementById(p.togId);
+        if (!tog) return;
+        tog.addEventListener('click', function () {
+          var root = document.getElementById(p.rootId);
+          var nowExpanded = !(root && root.classList.contains('is-expanded'));
+          setExpanded(p, nowExpanded);
+        });
+      });
+      applyForViewport();
+      // #1180 — bind once across SPA re-mounts. MQL is process-global per
+      // query string; per-init binds accumulate handlers without bound.
+      if (!_liveNarrowMqlBound) {
+        if (narrowMql.addEventListener) narrowMql.addEventListener('change', applyForViewport);
+        else if (narrowMql.addListener) narrowMql.addListener(applyForViewport);
+        _liveNarrowMqlBound = true;
+        try {
+          window.__liveMQLBindCount = (window.__liveMQLBindCount || 0) + 1;
+        } catch (_) { /* sealed window */ }
+      }
+    })();
+    // ───────────────────────────────────────────────────────────────────────
+
     if (legendToggleBtn && legendEl) {
       // Restore legend collapsed state from localStorage (#279)
       try {
@@ -1209,7 +1756,13 @@
     if (roleLegendList) {
       for (const role of (window.ROLE_SORT || ['repeater', 'companion', 'room', 'sensor', 'observer'])) {
         const li = document.createElement('li');
-        li.innerHTML = `<span class="live-dot" style="background:${ROLE_COLORS[role] || '#6b7280'}" aria-hidden="true"></span> ${(ROLE_LABELS[role] || role).replace(/s$/, '')}`;
+        // #1293 — SVG swatch shows SHAPE + colour so colourblind ops can
+        // distinguish roles without relying on hue alone (WCAG 1.4.1).
+        const color = ROLE_COLORS[role] || '#6b7280';
+        const swatch = window.makeRoleMarkerSVG
+          ? window.makeRoleMarkerSVG(role, color, 14)
+          : `<span class="live-dot" style="background:${color}" aria-hidden="true"></span>`;
+        li.innerHTML = `<span class="live-shape-swatch" aria-hidden="true">${swatch}</span> ${(ROLE_LABELS[role] || role).replace(/s$/, '')}`;
         roleLegendList.appendChild(li);
       }
     }
@@ -1271,16 +1824,59 @@
       vcrRewind(VCR.timelineScope);
     });
 
-    // Scope buttons
-    document.querySelectorAll('.vcr-scope-btn').forEach(btn => {
+    // Scope buttons (#1234: exclude .vcr-scope-more which is the dropdown trigger)
+    document.querySelectorAll('.vcr-scope-btn[data-scope]').forEach(btn => {
       btn.addEventListener('click', () => {
-        document.querySelectorAll('.vcr-scope-btn').forEach(b => { b.classList.remove('active'); b.setAttribute('aria-checked', 'false'); });
+        document.querySelectorAll('.vcr-scope-btn[data-scope]').forEach(b => { b.classList.remove('active'); b.setAttribute('aria-checked', 'false'); });
         btn.classList.add('active');
         btn.setAttribute('aria-checked', 'true');
         VCR.timelineScope = parseInt(btn.dataset.scope);
         fetchTimelineTimestamps().then(() => updateTimeline());
       });
     });
+
+    // #1234: VCR scope "More ▾" overflow dropdown. At ≤640px, scope buttons
+    // tagged .vcr-scope-btn--overflow (12h, 24h) are hidden via CSS and
+    // surfaced through this menu. Clicking a menu item proxies the click
+    // to the underlying hidden button so the existing scope handler runs.
+    (function wireVcrScopeMore() {
+      var moreBtn = document.querySelector('[data-vcr-scope-more]');
+      var menu = document.getElementById('vcrScopeMoreMenu');
+      if (!moreBtn || !menu) return;
+      var overflowBtns = Array.from(document.querySelectorAll('.vcr-scope-btn--overflow'));
+      // Populate menu from overflow buttons (preserves label + scope).
+      menu.innerHTML = '';
+      overflowBtns.forEach(function (src) {
+        var item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'vcr-scope-more-item';
+        item.setAttribute('role', 'menuitem');
+        item.setAttribute('data-scope', src.dataset.scope);
+        item.textContent = src.textContent;
+        item.addEventListener('click', function () {
+          src.click(); // delegate to original handler — keeps single source of truth
+          menu.setAttribute('hidden', '');
+          moreBtn.setAttribute('aria-expanded', 'false');
+          // Reflect the chosen scope on the More button label so the user sees feedback.
+          moreBtn.textContent = item.textContent + ' ▾';
+        });
+        menu.appendChild(item);
+      });
+      moreBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var open = !menu.hasAttribute('hidden');
+        if (open) { menu.setAttribute('hidden', ''); moreBtn.setAttribute('aria-expanded', 'false'); }
+        else      { menu.removeAttribute('hidden');  moreBtn.setAttribute('aria-expanded', 'true');  }
+      });
+      // Click outside closes the menu.
+      document.addEventListener('click', function (e) {
+        if (menu.hasAttribute('hidden')) return;
+        if (e.target === moreBtn || moreBtn.contains(e.target) ||
+            e.target === menu   || menu.contains(e.target)) return;
+        menu.setAttribute('hidden', '');
+        moreBtn.setAttribute('aria-expanded', 'false');
+      });
+    })();
 
     // Timeline click to scrub
     // Timeline click handled by drag (mousedown+mouseup)
@@ -1493,6 +2089,11 @@
           <table style="font-size:12px;width:100%;border-collapse:collapse;">
             <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Last Seen</td><td>${lastSeen}</td></tr>
             <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Adverts</td><td>${n.advert_count || 0}</td></tr>
+            ${'default_scope' in n ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Scope</td><td>${
+  n.default_scope === null ? '<span style="color:var(--text-muted)">—</span>'
+  : n.default_scope === '' ? '<span style="color:var(--text-muted)">unknown scope</span>'
+  : `<code style="color:var(--accent)">${escapeHtml(n.default_scope)}</code>`
+}</td></tr>` : ''}
             ${hasLoc ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Location</td><td>${n.lat.toFixed(5)}, ${n.lon.toFixed(5)}</td></tr>` : ''}
             ${stats.avgSnr != null ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Avg SNR</td><td>${stats.avgSnr.toFixed(1)} dB</td></tr>` : ''}
             ${stats.avgHops != null ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Avg Hops</td><td>${stats.avgHops.toFixed(1)}</td></tr>` : ''}
@@ -1566,9 +2167,17 @@
 
   async function loadNodes(beforeTs) {
     try {
+      const aqs = AreaFilter.areaQueryString();
       const url = beforeTs
-        ? `/api/nodes?limit=2000&before=${encodeURIComponent(new Date(beforeTs).toISOString())}`
-        : '/api/nodes?limit=2000';
+        ? `/api/nodes?limit=2000&before=${encodeURIComponent(new Date(beforeTs).toISOString())}${aqs}`
+        : `/api/nodes?limit=2000${aqs}`;
+      // Full reload (no beforeTs): clear existing markers so switching areas
+      // removes nodes that no longer belong to the selected area.
+      if (!beforeTs) {
+        if (nodesLayer) nodesLayer.clearLayers();
+        nodeMarkers = {};
+        nodeData = {};
+      }
       const resp = await fetch(url);
       const nodes = await resp.json();
       const list = Array.isArray(nodes) ? nodes : (nodes.nodes || []);
@@ -1656,6 +2265,47 @@
     return getFavoritePubkeys().some(f => f === pubkey);
   }
 
+  function packetInvolvesFilterNode(pkt, filterKeys) {
+    if (!filterKeys.length) return true;
+    const hops = (pkt.decoded?.path?.hops) || [];
+    for (const hop of hops) {
+      const h = (hop.id || hop.public_key || hop).toString().toLowerCase();
+      if (filterKeys.some(f => f.toLowerCase().startsWith(h) || h.startsWith(f.toLowerCase()))) return true;
+    }
+    return false;
+  }
+
+  function setNodeFilter(keys) {
+    nodeFilterKeys = keys;
+    nodeFilterTotal = 0;
+    nodeFilterShown = 0;
+    localStorage.setItem('live-node-filter', keys.join(','));
+    updateNodeFilterUI();
+  }
+
+  function updateNodeFilterUI() {
+    const countEl = document.getElementById('liveNodeFilterCount');
+    const clearBtn = document.getElementById('liveNodeFilterClear');
+    const input = document.getElementById('liveNodeFilterInput');
+    if (nodeFilterKeys.length > 0) {
+      if (clearBtn) clearBtn.style.display = '';
+      if (countEl) { countEl.textContent = `Showing ${nodeFilterShown} of ${nodeFilterTotal}`; countEl.classList.remove('hidden'); }
+      if (input && input.value !== nodeFilterKeys.join(', ')) input.value = nodeFilterKeys.join(', ');
+    } else {
+      if (clearBtn) clearBtn.style.display = 'none';
+      if (countEl) countEl.classList.add('hidden');
+    }
+    updateNodeFilterDatalist();
+  }
+
+  function updateNodeFilterDatalist() {
+    const dl = document.getElementById('liveNodeFilterList');
+    if (!dl) return;
+    dl.innerHTML = Object.values(nodeData).map(n =>
+      `<option value="${n.public_key}">${n.name || n.public_key.slice(0, 8)}</option>`
+    ).join('');
+  }
+
   function rebuildFeedList() {
     const feed = document.getElementById('liveFeed');
     if (!feed) return;
@@ -1663,6 +2313,15 @@
     if (!feedContent) return;
     feedContent.querySelectorAll('.live-feed-item').forEach(el => el.remove());
     feedDedup.clear();
+    // #1207: ensure empty-state placeholder is present (re-add if a prior
+    // rebuild wiped everything). CSS hides it when items exist.
+    if (!feedContent.querySelector('.live-feed-empty')) {
+      var _ph = document.createElement('div');
+      _ph.className = 'live-feed-empty';
+      _ph.setAttribute('aria-hidden', 'true');
+      _ph.textContent = 'Waiting for packets…';
+      feedContent.appendChild(_ph);
+    }
 
     // Aggregate VCR buffer by hash, then create one feed item per unique hash
     const byHash = new Map();
@@ -1708,6 +2367,7 @@
       const preview = text ? ' ' + (text.length > 35 ? text.slice(0, 35) + '…' : text) : '';
       const hopStr = longestHops.length ? `<span class="feed-hops">${longestHops.length}⇢</span>` : '';
       const obsBadge = group.count > 1 ? `<span class="badge badge-obs" style="font-size:10px;margin-left:4px">👁 ${group.count}</span>` : '';
+      const iataBadge = obsIataBadgeHtml(pkt);
 
       var _ccPayload = (pkt.decoded || {}).payload || {};
       var _ccChan1 = (typeName === 'GRP_TXT' || typeName === 'CHAN') ? (_ccPayload.channel || null) : null;
@@ -1722,7 +2382,7 @@
       item.innerHTML = `
         <span class="feed-icon" style="color:${color}">${icon}</span>
         <span class="feed-type" style="color:${color}">${typeName}</span>
-        ${dotHtml1}${transportBadge(pkt.route_type)}${hopStr}${obsBadge}
+        ${dotHtml1}${transportBadge(pkt.route_type)}${hopStr}${obsBadge}${iataBadge}
         <span class="feed-text">${escapeHtml(preview)}</span>
         <span class="feed-time" data-ts="${group.latestTs || Date.now()}">${formatLiveTimestampHtml(group.latestTs || Date.now())}</span>
       `;
@@ -1745,41 +2405,114 @@
   function addNodeMarker(n) {
     if (nodeMarkers[n.public_key]) return nodeMarkers[n.public_key];
     const color = ROLE_COLORS[n.role] || ROLE_COLORS.unknown;
+    // #1438: SVG fill expression — use the live CSS var so existing
+    // markers recolor when cb-preset switches or the operator overrides.
+    // `color` (hex from ROLE_COLORS) is still tracked as `_baseColor`
+    // for matrix mode / pulse animations that need an explicit value.
+    const fillExpr = 'var(--mc-role-' + (n.role || 'companion') + ')';
     const isRepeater = n.role === 'repeater';
     const zoom = map ? map.getZoom() : 11;
     const zoomScale = Math.max(0.4, (zoom - 8) / 6);
-    const size = Math.round((isRepeater ? 6 : 4) * zoomScale);
+    // Shape-aware sizing: keep prior visual weight (~6/4 base) but
+    // route through divIcon so colourblind ops get distinct silhouettes
+    // (#1293). Size is the SVG box; circleMarker radius ~= size/3.
+    const sizePx = Math.max(10, Math.round((isRepeater ? 18 : 14) * zoomScale));
 
-    const glow = L.circleMarker([n.lat, n.lon], {
-      radius: size + 4, fillColor: color, fillOpacity: 0.12, stroke: false, interactive: false
-    }).addTo(nodesLayer);
+    const svgHtml = (window.makeRoleMarkerSVG
+      ? window.makeRoleMarkerSVG(n.role, null, sizePx)
+      : '<svg width="' + sizePx + '" height="' + sizePx + '" viewBox="0 0 ' + sizePx + ' ' + sizePx +
+        '"><circle cx="' + (sizePx/2) + '" cy="' + (sizePx/2) + '" r="' + (sizePx/2 - 2) +
+        '" fill="' + fillExpr + '" stroke="#fff" stroke-width="1"/></svg>');
 
-    const marker = L.circleMarker([n.lat, n.lon], {
-      radius: size, fillColor: color, fillOpacity: 0.85,
-      color: '#fff', weight: isRepeater ? 1.5 : 0.5, opacity: isRepeater ? 0.6 : 0.3
+    const icon = L.divIcon({
+      html: svgHtml,
+      className: 'live-node-marker live-node-' + (n.role || 'unknown'),
+      iconSize: [sizePx, sizePx],
+      iconAnchor: [sizePx / 2, sizePx / 2],
+      popupAnchor: [0, -sizePx / 2]
+    });
+    const marker = L.marker([n.lat, n.lon], { icon: icon, interactive: true }).addTo(nodesLayer);
+
+    // Highlight ring (#1293): a separate stroke-only circleMarker layered
+    // BENEATH the shape. Hidden by default; pulseNodeMarker grows/fades
+    // its radius + opacity — never fills, so same-hue concentric stacking
+    // (issue's "blue-on-blue") is impossible.
+    const ringPos = [n.lat, n.lon];
+    const ring = L.circleMarker(ringPos, {
+      radius: sizePx / 2 + 4,
+      fillOpacity: 0,
+      fill: false,
+      color: color,
+      weight: 0,
+      opacity: 0,
+      interactive: false
     }).addTo(nodesLayer);
 
     marker.bindTooltip(n.name || n.public_key.slice(0, 8), {
-      permanent: false, direction: 'top', offset: [0, -10], className: 'live-tooltip'
+      permanent: false, direction: 'top', offset: [0, -sizePx / 2], className: 'live-tooltip'
     });
 
     marker.on('click', () => showNodeDetail(n.public_key));
 
-    marker._glowMarker = glow;
+    marker._highlightRing = ring;
     marker._baseColor = color;
-    marker._baseSize = size;
+    marker._baseSize = sizePx;
+    marker._role = n.role || 'unknown';
     nodeMarkers[n.public_key] = marker;
 
-    // Apply matrix tint if active
+    // Apply matrix tint if active — re-render the SVG with matrix colour
     if (matrixMode) {
       marker._matrixPrevColor = color;
       marker._baseColor = '#008a22';
-      marker.setStyle({ fillColor: '#008a22', color: '#008a22', fillOpacity: 0.5, opacity: 0.5 });
-      glow.setStyle({ fillColor: '#008a22', fillOpacity: 0.15 });
+      const mxHtml = window.makeRoleMarkerSVG
+        ? window.makeRoleMarkerSVG(marker._role, '#008a22', sizePx)
+        : svgHtml;
+      const el = marker.getElement();
+      if (el) el.innerHTML = mxHtml;
     }
 
     return marker;
   }
+
+  // #1293 — divIcon helpers. The live-map node marker is now an
+  // L.marker (divIcon SVG), not an L.circleMarker, so setStyle /
+  // setRadius are no-ops. These helpers update the DOM element
+  // directly so existing call-sites (rescale, stale-dim, matrix mode,
+  // highlight pulse) keep working without same-colour fill stacking.
+  function _liveMarkerEl(marker) {
+    if (!marker || typeof marker.getElement !== 'function') return null;
+    return marker.getElement();
+  }
+  function _liveSetMarkerOpacity(marker, opacity) {
+    var el = _liveMarkerEl(marker);
+    if (el) el.style.opacity = String(opacity);
+  }
+  function _liveSetMarkerSize(marker, sizePx) {
+    var el = _liveMarkerEl(marker);
+    if (!el) return;
+    var svg = el.querySelector('svg');
+    if (svg) {
+      svg.setAttribute('width', sizePx);
+      svg.setAttribute('height', sizePx);
+    }
+    marker._baseSize = sizePx;
+    if (marker._highlightRing && typeof marker._highlightRing.setRadius === 'function') {
+      marker._highlightRing.setRadius(sizePx / 2 + 4);
+    }
+  }
+  function _liveSetMarkerColor(marker, color) {
+    var el = _liveMarkerEl(marker);
+    if (!el) return;
+    if (window.makeRoleMarkerSVG) {
+      el.innerHTML = window.makeRoleMarkerSVG(marker._role || 'unknown', color, marker._baseSize || 14);
+    } else {
+      // Fallback: tweak fill on first shape
+      var shape = el.querySelector('svg > *');
+      if (shape) shape.setAttribute('fill', color);
+    }
+  }
+  window._liveSetMarkerSize = _liveSetMarkerSize;
+  window._liveSetMarkerColor = _liveSetMarkerColor;
 
   function rescaleMarkers() {
     const zoom = map.getZoom();
@@ -1787,10 +2520,8 @@
     for (const [key, marker] of Object.entries(nodeMarkers)) {
       const n = nodeData[key];
       const isRepeater = n && n.role === 'repeater';
-      const size = Math.round((isRepeater ? 6 : 4) * zoomScale);
-      marker.setRadius(size);
-      marker._baseSize = size;
-      if (marker._glowMarker) marker._glowMarker.setRadius(size + 4);
+      const sizePx = Math.max(10, Math.round((isRepeater ? 18 : 14) * zoomScale));
+      _liveSetMarkerSize(marker, sizePx);
     }
   }
 
@@ -1812,15 +2543,14 @@
           // API-loaded nodes: dim instead of removing (consistent with static map)
           if (marker && !marker._staleDimmed) {
             marker._staleDimmed = true;
-            marker.setStyle({ fillOpacity: 0.25, opacity: 0.15 });
-            if (marker._glowMarker) marker._glowMarker.setStyle({ fillOpacity: 0.04 });
+            _liveSetMarkerOpacity(marker, 0.35);
           }
         } else {
           // WS-only nodes: remove to prevent unbounded memory growth
           if (marker) {
             if (nodesLayer) {
               try { nodesLayer.removeLayer(marker); } catch (e) {}
-              if (marker._glowMarker) try { nodesLayer.removeLayer(marker._glowMarker); } catch (e) {}
+              if (marker._highlightRing) try { nodesLayer.removeLayer(marker._highlightRing); } catch (e) {}
             }
           }
           delete nodeMarkers[key];
@@ -1831,9 +2561,7 @@
       } else if (marker && marker._staleDimmed) {
         // Node became active again — restore full opacity
         marker._staleDimmed = false;
-        var isRepeater = n.role === 'repeater';
-        marker.setStyle({ fillOpacity: 0.85, opacity: isRepeater ? 0.6 : 0.3 });
-        if (marker._glowMarker) marker._glowMarker.setStyle({ fillOpacity: 0.12 });
+        _liveSetMarkerOpacity(marker, 1);
       }
     }
     if (pruned) {
@@ -1845,10 +2573,14 @@
     for (var aKey in nodeActivity) {
       if (!(aKey in nodeData)) delete nodeActivity[aKey];
     }
+    pruneClickablePaths(Date.now());
   }
 
   // Expose for testing
   window._livePruneStaleNodes = pruneStaleNodes;
+  window._liveBuildClickablePathPopupHtml = buildClickablePathPopupHtml;
+  window._livePruneClickablePaths = pruneClickablePaths;
+  window._liveClickablePaths = clickablePaths;
   window._liveNodeMarkers = function() { return nodeMarkers; };
   window._liveNodeData = function() { return nodeData; };
   window._liveNodeActivity = function() { return nodeActivity; };
@@ -1862,12 +2594,26 @@
   window._liveGetFavoritePubkeys = getFavoritePubkeys;
   window._livePacketInvolvesFavorite = packetInvolvesFavorite;
   window._liveIsNodeFavorited = isNodeFavorited;
+  window._livePacketInvolvesFilterNode = packetInvolvesFilterNode;
+  window._liveGetNodeFilterKeys = function() { return nodeFilterKeys; };
+  window._livePacketMatchesRegion = packetMatchesRegion;
+  window._liveSetObserverIataMap = setObserverIataMap;
+  window._liveBuildObserverIataMap = buildObserverIataMap;
+  window._liveGetObserverIataMap = function() { return observerIataMap; };
+  window._liveSetNodeFilter = setNodeFilter;
   window._liveFormatLiveTimestampHtml = formatLiveTimestampHtml;
   window._liveResolveHopPositions = resolveHopPositions;
   window._liveVcrSpeedCycle = vcrSpeedCycle;
+  window._liveSpeedLabel = speedLabel;
   window._liveVcrPause = vcrPause;
   window._liveVcrResumeLive = vcrResumeLive;
   window._liveVcrSetMode = vcrSetMode;
+  // #1207 test seams: expose production feed mutators so E2E can exercise
+  // the real eviction guard / placeholder re-add path (not a test-local copy).
+  window._liveAddFeedItem = function(icon, typeName, payload, hops, color, pkt) {
+    return addFeedItem(icon, typeName, payload, hops, color, pkt);
+  };
+  window._liveRebuildFeedList = function() { return rebuildFeedList(); };
 
   async function replayRecent() {
     try {
@@ -1951,6 +2697,20 @@
 
     // --- Favorites filter ---
     if (showOnlyFavorites && !packets.some(function(p) { return packetInvolvesFavorite(p); })) return;
+
+    // --- Node filter ---
+    if (nodeFilterKeys.length) {
+      nodeFilterTotal++;
+      if (!packets.some(function(p) { return packetInvolvesFilterNode(p, nodeFilterKeys); })) return;
+      nodeFilterShown++;
+      updateNodeFilterUI();
+    }
+
+    // --- Region filter (#1045): drop packet if no observation matches selected IATA ---
+    if (window.RegionFilter && typeof RegionFilter.getSelected === 'function') {
+      var _regionSel = RegionFilter.getSelected();
+      if (_regionSel && _regionSel.length && !packetMatchesRegion(packets, observerIataMap, _regionSel)) return;
+    }
 
     // --- Ensure ADVERT nodes appear on map ---
     for (var pi = 0; pi < packets.length; pi++) {
@@ -2050,6 +2810,7 @@
 
     // --- Animate all unique paths simultaneously ---
     // First path gets audio sync hook, rest are visual-only
+    var pktMeta = { hash: first.hash, ts: first._ts || Date.now() };
     var firstPathDone = false;
     for (var ai = 0; ai < allPaths.length; ai++) {
       var onHop = null;
@@ -2068,7 +2829,7 @@
         var completedPositions = allPaths[ai].hopPositions.slice(0, hopsCompleted + 1);
         var remainingPositions = allPaths[ai].hopPositions.slice(hopsCompleted);
         if (completedPositions.length >= 2) {
-          animatePath(completedPositions, typeName, color, allPaths[ai].raw, onHop);
+          animatePath(completedPositions, typeName, color, allPaths[ai].raw, onHop, pktMeta);
         } else if (completedPositions.length === 1) {
           pulseNode(completedPositions[0].key, completedPositions[0].pos, typeName);
         }
@@ -2076,7 +2837,7 @@
           drawDashedPath(remainingPositions, color);
         }
       } else {
-        animatePath(allPaths[ai].hopPositions, typeName, color, allPaths[ai].raw, onHop);
+        animatePath(allPaths[ai].hopPositions, typeName, color, allPaths[ai].raw, onHop, pktMeta);
       }
     }
   }
@@ -2185,7 +2946,7 @@
     return raw.filter(h => h.pos != null);
   }
 
-  function animatePath(hopPositions, typeName, color, rawHex, onHop) {
+  function animatePath(hopPositions, typeName, color, rawHex, onHop, pktMeta) {
     if (!animLayer || !pathsLayer) return;
     if (activeAnims >= MAX_CONCURRENT_ANIMS) return;
     activeAnims++;
@@ -2197,6 +2958,14 @@
         activeAnims = Math.max(0, activeAnims - 1);
         const countEl = document.getElementById('liveAnimCount');
         if (countEl) countEl.textContent = activeAnims;
+        if (pktMeta && hopPositions.length >= 2) {
+          const latLngs = [], hopNames = [];
+          for (const hp of hopPositions) {
+            latLngs.push(hp.pos);
+            hopNames.push(hp.name || (hp.key ? hp.key.slice(0, 8) : '?'));
+          }
+          registerClickablePath(latLngs, typeName, color, hopNames, pktMeta.ts, pktMeta.hash);
+        }
         return;
       }
       if (!animLayer) return;
@@ -2237,7 +3006,7 @@
         const nextGhost = hopPositions[hopIndex + 1].ghost;
         const lineColor = (isGhost || nextGhost) ? '#94a3b8' : color;
         const lineOpacity = (isGhost || nextGhost) ? 0.3 : undefined;
-        drawAnimatedLine(hp.pos, nextPos, lineColor, () => { hopIndex++; nextHop(); }, lineOpacity, rawHex);
+        drawAnimatedLine(hp.pos, nextPos, lineColor, () => { hopIndex++; nextHop(); }, lineOpacity, rawHex, pktMeta?.hash);
       } else {
         if (!isGhost) pulseNode(hp.key, hp.pos, typeName);
         hopIndex++; nextHop();
@@ -2297,16 +3066,25 @@
     requestAnimationFrame(animatePulse);
 
     const baseColor = marker._baseColor || '#6b7280';
-    const baseSize = marker._baseSize || 6;
-    marker.setStyle({ fillColor: '#fff', fillOpacity: 1, radius: baseSize + 2, color: color, weight: 2 });
+    const baseSize = marker._baseSize || 14;
 
-    if (marker._glowMarker) {
-      marker._glowMarker.setStyle({ fillColor: color, fillOpacity: 0.2, radius: baseSize + 6 });
-      setTimeout(() => marker._glowMarker.setStyle({ fillColor: baseColor, fillOpacity: 0.08, radius: baseSize + 3 }), 500);
+    // #1293 — highlight via OUTLINE ring (no same-colour concentric
+    // fill). Use the marker's pre-allocated _highlightRing; grow + fade
+    // it. Marker shape/colour is left untouched so colourblind silhouette
+    // stays distinguishable during the pulse.
+    const ringHl = marker._highlightRing;
+    if (ringHl && typeof ringHl.setStyle === 'function') {
+      try {
+        ringHl.setStyle({ color: color, weight: 3, opacity: 0.95, fillOpacity: 0, fill: false });
+        ringHl.setRadius(baseSize / 2 + 4);
+        setTimeout(() => {
+          try { ringHl.setStyle({ opacity: 0.4, weight: 2 }); ringHl.setRadius(baseSize / 2 + 8); } catch (e) {}
+        }, 200);
+        setTimeout(() => {
+          try { ringHl.setStyle({ opacity: 0, weight: 0 }); } catch (e) {}
+        }, 700);
+      } catch (e) { /* circleMarker absent — ignore */ }
     }
-
-    setTimeout(() => marker.setStyle({ fillColor: color, fillOpacity: 0.95, radius: baseSize + 1, weight: 1.5 }), 150);
-    setTimeout(() => marker.setStyle({ fillColor: baseColor, fillOpacity: 0.85, radius: baseSize, color: '#fff', weight: marker._baseSize > 6 ? 1.5 : 0.5 }), 700);
 
     nodeActivity[key] = (nodeActivity[key] || 0) + 1;
   }
@@ -2461,8 +3239,7 @@
       for (const [key, marker] of Object.entries(nodeMarkers)) {
         marker._matrixPrevColor = marker._baseColor;
         marker._baseColor = '#008a22';
-        marker.setStyle({ fillColor: '#008a22', color: '#008a22', fillOpacity: 0.5, opacity: 0.5 });
-        if (marker._glowMarker) marker._glowMarker.setStyle({ fillColor: '#008a22', fillOpacity: 0.15 });
+        _liveSetMarkerColor(marker, '#008a22');
       }
     } else {
       container.classList.remove('matrix-theme');
@@ -2483,8 +3260,7 @@
       for (const [key, marker] of Object.entries(nodeMarkers)) {
         if (marker._matrixPrevColor) {
           marker._baseColor = marker._matrixPrevColor;
-          marker.setStyle({ fillColor: marker._matrixPrevColor, color: '#fff', fillOpacity: 0.85, opacity: 1 });
-          if (marker._glowMarker) marker._glowMarker.setStyle({ fillColor: marker._matrixPrevColor });
+          _liveSetMarkerColor(marker, marker._matrixPrevColor);
           delete marker._matrixPrevColor;
         }
       }
@@ -2504,7 +3280,7 @@
 
     const matrixGreen = '#00ff41';
     const TRAIL_LEN = Math.min(6, bytes.length);
-    const DURATION_MS = 1100; // total hop duration
+    const DURATION_MS = VCR.mode === 'REPLAY' ? 1100 / VCR.speed : 1100;
     const CHAR_INTERVAL = 0.06; // spawn a char every 6% of progress
     const charMarkers = [];
     let nextCharAt = CHAR_INTERVAL;
@@ -2592,7 +3368,7 @@
     requestAnimationFrame(tick);
   }
 
-  function drawAnimatedLine(from, to, color, onComplete, overrideOpacity, rawHex) {
+  function drawAnimatedLine(from, to, color, onComplete, overrideOpacity, rawHex, hash) {
     if (!animLayer || !pathsLayer) { if (onComplete) onComplete(); return; }
     if (matrixMode) return drawMatrixLine(from, to, color, onComplete, rawHex);
     const steps = 20;
@@ -2603,17 +3379,30 @@
     const mainOpacity = overrideOpacity ?? 0.8;
     const isDashed = overrideOpacity != null;
 
+    // Hash-derived color for fill + contrail + outline (when toggle ON and not ghost/dashed line)
+    var hashFill = '#fff';
+    var hashOutline = color;
+    var contrailColor = color;
+    if (colorByHash && hash && !isDashed && window.HashColor) {
+      var hsl = HashColor.hashToHsl(hash, _liveTheme());
+      hashFill = hsl;
+      hashOutline = HashColor.hashToOutline(hash, _liveTheme());
+      contrailColor = hsl;
+    }
+
     const contrail = L.polyline([from], {
-      color: color, weight: 6, opacity: mainOpacity * 0.2, lineCap: 'round'
+      color: contrailColor, weight: 6, opacity: mainOpacity * 0.2, lineCap: 'round'
     }).addTo(pathsLayer);
 
     const line = L.polyline([from], {
-      color: color, weight: isDashed ? 1.5 : 2, opacity: mainOpacity, lineCap: 'round',
-      dashArray: isDashed ? '4 6' : null
+      color: (colorByHash && hash && !isDashed && window.HashColor) ? hashFill : color,
+      weight: isDashed ? 1.5 : 2, opacity: mainOpacity, lineCap: 'round',
+      dashArray: isDashed ? '4 6' : null,
+      className: 'live-packet-trace'
     }).addTo(pathsLayer);
 
     const dot = L.circleMarker(from, {
-      radius: 3.5, fillColor: '#fff', fillOpacity: 1, color: color, weight: 1.5
+      radius: 3.5, fillColor: hashFill, fillOpacity: 1, color: hashOutline, weight: 1.5
     }).addTo(animLayer);
 
     let lastStep = performance.now();
@@ -2623,8 +3412,9 @@
         return;
       }
       const elapsed = now - lastStep;
-      if (elapsed >= 33) {
-        const ticks = Math.min(Math.floor(elapsed / 33), 4);
+      const stepMs = VCR.mode === 'REPLAY' ? 33 / VCR.speed : 33;
+      if (elapsed >= stepMs) {
+        const ticks = Math.min(Math.floor(elapsed / stepMs), 4);
         lastStep = now;
         for (let t = 0; t < ticks && step < steps; t++) {
           step++;
@@ -2728,7 +3518,7 @@
     var style = c
       ? 'background:' + bg + ';border:1px solid ' + border
       : 'background:transparent;border:1px dashed ' + border;
-    return '<span class="feed-color-dot" data-channel="' + escapeHtml(channel) + '" style="display:inline-block;width:12px;height:12px;border-radius:50%;' + style + ';cursor:pointer;vertical-align:middle;margin-left:4px;flex-shrink:0" title="Set color for ' + escapeHtml(channel) + '"></span>';
+    return '<span class="feed-color-dot" data-channel="' + escapeHtml(channel) + '" style="display:inline-block;width:18px;height:18px;border-radius:50%;' + style + ';cursor:pointer;vertical-align:middle;margin-left:4px;flex-shrink:0" title="Set color for ' + escapeHtml(channel) + '"></span>';
   }
 
   function addFeedItemDOM(icon, typeName, payload, hops, color, pkt, feed) {
@@ -2736,6 +3526,7 @@
     const preview = text ? ' ' + (text.length > 35 ? text.slice(0, 35) + '…' : text) : '';
     const hopStr = hops.length ? `<span class="feed-hops">${hops.length}⇢</span>` : '';
     const obsBadge = pkt.observation_count > 1 ? `<span class="badge badge-obs" style="font-size:10px;margin-left:4px">👁 ${pkt.observation_count}</span>` : '';
+    const iataBadge = obsIataBadgeHtml(pkt);
     const anomalyIcon = (pkt.decoded && pkt.decoded.anomaly) ? '<span title="Anomaly detected" style="margin-left:4px">⚠️</span>' : '';
     var _ccPayload2 = (pkt.decoded || {}).payload || {};
     var _ccChan = (typeName === 'GRP_TXT' || typeName === 'CHAN') ? (_ccPayload2.channel || null) : null;
@@ -2745,13 +3536,17 @@
     item.setAttribute('tabindex', '0');
     item.setAttribute('role', 'button');
     item.style.cursor = 'pointer';
+    // Hash-color stripe for feed items (mirrors packets table border-left)
+    if (colorByHash && pkt.hash && window.HashColor) {
+      item.style.borderLeft = '4px solid ' + HashColor.hashToHsl(pkt.hash, _liveTheme());
+    }
     // Channel color highlighting for GRP_TXT packets (#271)
     var _cs = _getChannelStyle(pkt);
     if (_cs) item.style.cssText += _cs;
     item.innerHTML = `
       <span class="feed-icon" style="color:${color}">${icon}</span>
       <span class="feed-type" style="color:${color}">${typeName}</span>
-      ${dotHtml}${transportBadge(pkt.route_type)}${hopStr}${obsBadge}${anomalyIcon}
+      ${dotHtml}${transportBadge(pkt.route_type)}${hopStr}${obsBadge}${iataBadge}${anomalyIcon}
       <span class="feed-text">${escapeHtml(preview)}</span>
       <span class="feed-time" data-ts="${pkt._ts || Date.now()}">${formatLiveTimestampHtml(pkt._ts || Date.now())}</span>
     `;
@@ -2818,6 +3613,7 @@
     const preview = text ? ' ' + (text.length > 35 ? text.slice(0, 35) + '…' : text) : '';
     const hopStr = hops.length ? `<span class="feed-hops">${hops.length}⇢</span>` : '';
     const obsBadge = incomingObs > 1 ? `<span class="badge badge-obs" style="font-size:10px;margin-left:4px">👁 ${incomingObs}</span>` : '';
+    const iataBadge = obsIataBadgeHtml(pkt);
     var _ccPayload3 = (pkt.decoded || {}).payload || {};
     var _ccChan3 = (typeName === 'GRP_TXT' || typeName === 'CHAN') ? (_ccPayload3.channel || null) : null;
     var dotHtml3 = _ccChan3 ? _feedColorDot(_ccChan3) : '';
@@ -2828,13 +3624,17 @@
     item.setAttribute('role', 'button');
     if (hash) item.setAttribute('data-hash', hash);
     item.style.cursor = 'pointer';
+    // Hash-color stripe for feed items (mirrors packets table border-left)
+    if (colorByHash && hash && window.HashColor) {
+      item.style.borderLeft = '4px solid ' + HashColor.hashToHsl(hash, _liveTheme());
+    }
     // Channel color highlighting for GRP_TXT packets (#271)
     var _chanStyle = _getChannelStyle(pkt);
     if (_chanStyle) item.style.cssText += _chanStyle;
     item.innerHTML = `
       <span class="feed-icon" style="color:${color}">${icon}</span>
       <span class="feed-type" style="color:${color}">${typeName}</span>
-      ${dotHtml3}${transportBadge(pkt.route_type)}${hopStr}${obsBadge}
+      ${dotHtml3}${transportBadge(pkt.route_type)}${hopStr}${obsBadge}${iataBadge}
       <span class="feed-text">${escapeHtml(preview)}</span>
       <span class="feed-time" data-ts="${pkt._ts || Date.now()}">${formatLiveTimestampHtml(pkt._ts || Date.now())}</span>
     `;
@@ -2842,7 +3642,11 @@
     item.addEventListener('click', () => showFeedCard(item, pkt, color));
     feed.prepend(item);
     requestAnimationFrame(() => requestAnimationFrame(() => item.classList.remove('live-feed-enter')));
-    while (feed.children.length > 25) feed.removeChild(feed.lastChild);
+    // #1207: trim to 25 items, but never evict the empty-state placeholder.
+    while (feed.querySelectorAll('.live-feed-item').length > 25) {
+      var _items = feed.querySelectorAll('.live-feed-item');
+      feed.removeChild(_items[_items.length - 1]);
+    }
 
     // Register
     if (hash) {
@@ -2916,12 +3720,17 @@
     if (_feedTimestampInterval) { clearInterval(_feedTimestampInterval); _feedTimestampInterval = null; }
     if (_affinityInterval) { clearInterval(_affinityInterval); _affinityInterval = null; }
     if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    if (regionFilterChangeHandler && window.RegionFilter && typeof RegionFilter.offChange === 'function') {
+      RegionFilter.offChange(regionFilterChangeHandler);
+      regionFilterChangeHandler = null;
+    }
     if (map) { map.remove(); map = null; }
     if (_onResize) {
       window.removeEventListener('resize', _onResize);
       window.removeEventListener('orientationchange', _onResize);
       if (window.visualViewport) window.visualViewport.removeEventListener('resize', _onResize);
     }
+    if (_vcrHeightCleanup) { try { _vcrHeightCleanup(); } catch (_) {} _vcrHeightCleanup = null; }
     // Restore #app height to CSS default
     const appEl = document.getElementById('app');
     if (appEl) appEl.style.height = '';
@@ -2939,7 +3748,8 @@
       }
       _navCleanup = null;
     }
-    nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = null;
+    nodesLayer = pathsLayer = animLayer = heatLayer = geoFilterLayer = clickablePathsLayer = null;
+    clickablePaths = [];
     stopMatrixRain();
     nodeMarkers = {}; nodeData = {};
     activeNodeDetailKey = null;
@@ -2947,10 +3757,18 @@
     packetCount = 0; activeAnims = 0;
     nodeActivity = {}; pktTimestamps = [];
     feedDedup.clear();
-    VCR.buffer = []; VCR.playhead = -1; VCR.mode = 'LIVE'; VCR.missedCount = 0; VCR.speed = 1; VCR.replayGen = 0;
+    VCR.buffer = []; VCR.playhead = -1; VCR.mode = 'LIVE'; VCR.missedCount = 0; VCR.speed = _initialSpeed; VCR.replayGen = 0;
   }
 
   let _themeRefreshHandler = null;
+
+  // #1180 — singleton guard for the wireLiveCollapseToggles() narrow-viewport
+  // MQL listener. MediaQueryList is process-global per query string; without
+  // this gate, every SPA re-mount of /live registers a new 'change' handler.
+  // The handler reads from current DOM each time, so a one-shot bind is safe
+  // across re-mounts. window.__liveMQLBindCount is a debug seam consumed by
+  // test-live-mql-leak-1180-e2e.js and otherwise unused.
+  var _liveNarrowMqlBound = false;
 
   registerPage('live', {
     init: function(app, routeParam) {

@@ -32,7 +32,8 @@ func setupTestDB(t *testing.T) *DB {
 			first_seen TEXT,
 			advert_count INTEGER DEFAULT 0,
 			battery_mv INTEGER,
-			temperature_c REAL
+			temperature_c REAL,
+			foreign_advert INTEGER DEFAULT 0
 		);
 
 		CREATE TABLE observers (
@@ -48,7 +49,12 @@ func setupTestDB(t *testing.T) *DB {
 			radio TEXT,
 			battery_mv INTEGER,
 			uptime_secs INTEGER,
-			noise_floor REAL
+			noise_floor REAL,
+			inactive INTEGER DEFAULT 0,
+			last_packet_at TEXT DEFAULT NULL,
+			clock_skew_seconds INTEGER DEFAULT NULL,
+			clock_skew_count_24h INTEGER DEFAULT 0,
+			clock_last_naive_at TEXT DEFAULT NULL
 		);
 
 		CREATE TABLE transmissions (
@@ -61,6 +67,7 @@ func setupTestDB(t *testing.T) *DB {
 			payload_version INTEGER,
 			decoded_json TEXT,
 			channel_hash TEXT DEFAULT NULL,
+			from_pubkey TEXT DEFAULT NULL,
 			created_at TEXT DEFAULT (datetime('now'))
 		);
 
@@ -93,6 +100,39 @@ func setupTestDB(t *testing.T) *DB {
 
 		CREATE INDEX IF NOT EXISTS idx_observer_metrics_timestamp ON observer_metrics(timestamp);
 
+		-- Auto-populate from_pubkey for ADVERT rows so existing test fixtures
+		-- (which only set decoded_json) still attribute correctly under #1143's
+		-- exact-match column. Production migration handles legacy data; the
+		-- ingestor sets the column at write time.
+		--
+		-- m4 alignment: prod ingest leaves from_pubkey NULL when pubKey is
+		-- missing or empty (cmd/ingestor/db.go ~1289 guards PubKey != empty-string).
+		-- The trigger mirrors that: only assign when json_extract yields a
+		-- non-empty string. json_extract returns NULL for missing keys, so
+		-- the explicit IS NOT NULL AND <> empty-string guard catches the empty-string
+		-- case too. UPDATE only when we have something to write.
+		CREATE TRIGGER IF NOT EXISTS test_from_pubkey_advert
+		AFTER INSERT ON transmissions
+		FOR EACH ROW
+		WHEN NEW.from_pubkey IS NULL AND NEW.payload_type = 4 AND NEW.decoded_json IS NOT NULL
+			AND json_extract(NEW.decoded_json, '$.pubKey') IS NOT NULL
+			AND json_extract(NEW.decoded_json, '$.pubKey') <> ''
+		BEGIN
+			UPDATE transmissions
+			SET from_pubkey = json_extract(NEW.decoded_json, '$.pubKey')
+			WHERE id = NEW.id;
+		END;
+		CREATE INDEX IF NOT EXISTS idx_transmissions_from_pubkey ON transmissions(from_pubkey);
+
+		-- Mirror prod indexes from internal/dbschema/dbschema.go so query plans
+		-- in tests match prod. idx_observations_transmission_id is required by
+		-- GetChannelMessages's grouped MAX(timestamp) per tx aggregate
+		-- (issue #1366 / PR #1368): without it the perf test on 1500 tx × 50 obs
+		-- blows the 1.5s budget under -race.
+		CREATE INDEX IF NOT EXISTS idx_observations_transmission_id ON observations(transmission_id);
+		CREATE INDEX IF NOT EXISTS idx_observations_timestamp ON observations(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_observations_tx_ts ON observations(transmission_id, timestamp);
+		CREATE INDEX IF NOT EXISTS idx_transmissions_channel_hash ON transmissions(channel_hash);
 	`
 	if _, err := conn.Exec(schema); err != nil {
 		t.Fatal(err)
@@ -126,13 +166,13 @@ func seedTestData(t *testing.T, db *DB) {
 		VALUES ('1122334455667788', 'TestRoom', 'room', 37.4, -121.9, ?, '2026-01-01T00:00:00Z', 5)`, twoDaysAgo)
 
 	// Seed transmissions
-	db.conn.Exec(`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, decoded_json, channel_hash)
-		VALUES ('AABB', 'abc123def4567890', ?, 1, 4, '{"pubKey":"aabbccdd11223344","name":"TestRepeater","type":"ADVERT","timestamp":1700000000,"timestampISO":"2023-11-14T22:13:20.000Z","signature":"abcdef","flags":{"isRepeater":true},"lat":37.5,"lon":-122.0}', '#test')`, recent)
+	db.conn.Exec(`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, decoded_json, channel_hash, from_pubkey)
+		VALUES ('AABB', 'abc123def4567890', ?, 1, 4, '{"pubKey":"aabbccdd11223344","name":"TestRepeater","type":"ADVERT","timestamp":1700000000,"timestampISO":"2023-11-14T22:13:20.000Z","signature":"abcdef","flags":{"isRepeater":true},"lat":37.5,"lon":-122.0}', '#test', 'aabbccdd11223344')`, recent)
 	db.conn.Exec(`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, decoded_json, channel_hash)
 		VALUES ('CCDD', '1234567890abcdef', ?, 1, 5, '{"type":"CHAN","channel":"#test","text":"Hello: World","sender":"TestUser"}', '#test')`, yesterday)
 	// Second ADVERT for same node with different hash_size (raw_hex byte 0x1F → hs=1 vs 0xBB → hs=3)
-	db.conn.Exec(`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, decoded_json)
-		VALUES ('AA1F', 'def456abc1230099', ?, 1, 4, '{"pubKey":"aabbccdd11223344","name":"TestRepeater","type":"ADVERT","timestamp":1700000100,"timestampISO":"2023-11-14T22:14:40.000Z","signature":"fedcba","flags":{"isRepeater":true},"lat":37.5,"lon":-122.0}')`, yesterday)
+	db.conn.Exec(`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, decoded_json, from_pubkey)
+		VALUES ('AA1F', 'def456abc1230099', ?, 1, 4, '{"pubKey":"aabbccdd11223344","name":"TestRepeater","type":"ADVERT","timestamp":1700000100,"timestampISO":"2023-11-14T22:14:40.000Z","signature":"fedcba","flags":{"isRepeater":true},"lat":37.5,"lon":-122.0}', 'aabbccdd11223344')`, yesterday)
 
 	// Seed observations (use unix timestamps)
 	// resolved_path contains full pubkeys parallel to path_json hops
@@ -355,6 +395,35 @@ func TestGetObservers(t *testing.T) {
 	if observers[0].ID != "obs1" {
 		t.Errorf("expected obs1 first (most recent), got %s", observers[0].ID)
 	}
+	// last_packet_at should be nil since seedTestData doesn't set it
+	if observers[0].LastPacketAt != nil {
+		t.Errorf("expected nil LastPacketAt for obs1 from seed, got %v", *observers[0].LastPacketAt)
+	}
+}
+
+// Regression: GetObservers must exclude soft-deleted (inactive=1) rows.
+// Stale observers were appearing in /api/observers despite the auto-prune
+// marking them inactive, because the SELECT query had no WHERE filter.
+func TestGetObservers_ExcludesInactive(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	seedTestData(t, db)
+	// Mark obs2 inactive — soft delete simulating a stale-observer prune.
+	if _, err := db.conn.Exec(`UPDATE observers SET inactive = 1 WHERE id = ?`, "obs2"); err != nil {
+		t.Fatalf("update inactive: %v", err)
+	}
+	observers, err := db.GetObservers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observers) != 1 {
+		t.Errorf("expected 1 observer (obs1) after marking obs2 inactive, got %d", len(observers))
+	}
+	for _, o := range observers {
+		if o.ID == "obs2" {
+			t.Errorf("inactive observer obs2 should be excluded")
+		}
+	}
 }
 
 func TestGetObserverByID(t *testing.T) {
@@ -368,6 +437,48 @@ func TestGetObserverByID(t *testing.T) {
 	}
 	if obs.ID != "obs1" {
 		t.Errorf("expected obs1, got %s", obs.ID)
+	}
+	// Verify last_packet_at is nil by default
+	if obs.LastPacketAt != nil {
+		t.Errorf("expected nil LastPacketAt, got %v", *obs.LastPacketAt)
+	}
+}
+
+func TestGetObserverLastPacketAt(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	seedTestData(t, db)
+
+	// Set last_packet_at for obs1
+	ts := "2026-04-24T12:00:00Z"
+	db.conn.Exec(`UPDATE observers SET last_packet_at = ? WHERE id = ?`, ts, "obs1")
+
+	// Verify via GetObservers
+	observers, err := db.GetObservers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obs1 *Observer
+	for i := range observers {
+		if observers[i].ID == "obs1" {
+			obs1 = &observers[i]
+			break
+		}
+	}
+	if obs1 == nil {
+		t.Fatal("obs1 not found")
+	}
+	if obs1.LastPacketAt == nil || *obs1.LastPacketAt != ts {
+		t.Errorf("expected LastPacketAt=%s via GetObservers, got %v", ts, obs1.LastPacketAt)
+	}
+
+	// Verify via GetObserverByID
+	obs, err := db.GetObserverByID("obs1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.LastPacketAt == nil || *obs.LastPacketAt != ts {
+		t.Errorf("expected LastPacketAt=%s via GetObserverByID, got %v", ts, obs.LastPacketAt)
 	}
 }
 
@@ -1100,7 +1211,8 @@ func setupTestDBV2(t *testing.T) *DB {
 			first_seen TEXT,
 			advert_count INTEGER DEFAULT 0,
 			battery_mv INTEGER,
-			temperature_c REAL
+			temperature_c REAL,
+			foreign_advert INTEGER DEFAULT 0
 		);
 
 		CREATE TABLE observers (
@@ -1109,7 +1221,8 @@ func setupTestDBV2(t *testing.T) *DB {
 			iata TEXT,
 			last_seen TEXT,
 			first_seen TEXT,
-			packet_count INTEGER DEFAULT 0
+			packet_count INTEGER DEFAULT 0,
+			last_packet_at TEXT DEFAULT NULL
 		);
 
 		CREATE TABLE transmissions (
@@ -1122,6 +1235,7 @@ func setupTestDBV2(t *testing.T) *DB {
 			payload_version INTEGER,
 			decoded_json TEXT,
 			channel_hash TEXT DEFAULT NULL,
+			from_pubkey TEXT DEFAULT NULL,
 			created_at TEXT DEFAULT (datetime('now'))
 		);
 
@@ -1138,6 +1252,19 @@ func setupTestDBV2(t *testing.T) *DB {
 			timestamp INTEGER NOT NULL,
 			raw_hex TEXT
 		);
+
+		CREATE TRIGGER IF NOT EXISTS test_from_pubkey_advert
+		AFTER INSERT ON transmissions
+		FOR EACH ROW
+		WHEN NEW.from_pubkey IS NULL AND NEW.payload_type = 4 AND NEW.decoded_json IS NOT NULL
+			AND json_extract(NEW.decoded_json, '$.pubKey') IS NOT NULL
+			AND json_extract(NEW.decoded_json, '$.pubKey') <> ''
+		BEGIN
+			UPDATE transmissions
+			SET from_pubkey = json_extract(NEW.decoded_json, '$.pubKey')
+			WHERE id = NEW.id;
+		END;
+		CREATE INDEX IF NOT EXISTS idx_transmissions_from_pubkey ON transmissions(from_pubkey);
 	`
 	if _, err := conn.Exec(schema); err != nil {
 		t.Fatal(err)
@@ -1352,6 +1479,73 @@ func TestOpenDBInvalidPath(t *testing.T) {
 	_, err := OpenDB(filepath.Join(t.TempDir(), "nonexistent", "sub", "dir", "test.db"))
 	if err == nil {
 		t.Error("expected error for invalid path")
+	}
+}
+
+// TestDetectSchemaScopeName verifies that OpenDB sets hasScopeName and
+// hasDefaultScope via the real detectSchema path when the columns are present.
+// The existing ScopeStats tests set these flags manually — this test ensures
+// the flag-setting code itself is covered.
+func TestDetectSchemaScopeName(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "detect.db")
+
+	// Create file-based DB with the scope_name and default_scope columns.
+	conn, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.SetMaxOpenConns(1)
+	if _, err := conn.Exec(`CREATE TABLE transmissions (id INTEGER PRIMARY KEY, hash TEXT, scope_name TEXT)`); err != nil {
+		conn.Close()
+		t.Fatalf("create transmissions: %v", err)
+	}
+	if _, err := conn.Exec(`CREATE TABLE nodes (public_key TEXT PRIMARY KEY, default_scope TEXT)`); err != nil {
+		conn.Close()
+		t.Fatalf("create nodes: %v", err)
+	}
+	if _, err := conn.Exec(`CREATE TABLE observations (id INTEGER PRIMARY KEY)`); err != nil {
+		conn.Close()
+		t.Fatalf("create observations: %v", err)
+	}
+	conn.Close()
+
+	db, err := OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	if !db.hasScopeName {
+		t.Error("hasScopeName should be true when scope_name column exists")
+	}
+	if !db.hasDefaultScope {
+		t.Error("hasDefaultScope should be true when default_scope column exists")
+	}
+
+	// Verify the flags stay false when the columns are absent.
+	dbPath2 := filepath.Join(dir, "detect2.db")
+	conn2, err := sql.Open("sqlite", dbPath2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn2.SetMaxOpenConns(1)
+	conn2.Exec(`CREATE TABLE transmissions (id INTEGER PRIMARY KEY, hash TEXT)`)
+	conn2.Exec(`CREATE TABLE nodes (public_key TEXT PRIMARY KEY)`)
+	conn2.Exec(`CREATE TABLE observations (id INTEGER PRIMARY KEY)`)
+	conn2.Close()
+
+	db2, err := OpenDB(dbPath2)
+	if err != nil {
+		t.Fatalf("OpenDB2: %v", err)
+	}
+	defer db2.Close()
+
+	if db2.hasScopeName {
+		t.Error("hasScopeName should be false when scope_name column is absent")
+	}
+	if db2.hasDefaultScope {
+		t.Error("hasDefaultScope should be false when default_scope column is absent")
 	}
 }
 
@@ -2031,5 +2225,100 @@ func TestPerObservationRawHexEnrich(t *testing.T) {
 				t.Errorf("obs without raw_hex: got %q, want %q (tx fallback)", rh, txHex)
 			}
 		}
+	}
+}
+
+func TestGetScopeStats(t *testing.T) {
+	conn, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	db := &DB{conn: conn}
+	defer db.conn.Close()
+
+	// Create minimal schema
+	db.conn.Exec(`CREATE TABLE IF NOT EXISTS transmissions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		raw_hex TEXT, hash TEXT, first_seen TEXT, route_type INTEGER,
+		payload_type INTEGER, payload_version INTEGER, decoded_json TEXT,
+		scope_name TEXT DEFAULT NULL
+	)`)
+	// Manually set hasScopeName since we bypassed the detector
+	db.hasScopeName = true
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	// Transport scoped, known region
+	db.conn.Exec(`INSERT INTO transmissions (hash, first_seen, route_type, scope_name) VALUES ('a', ?, 0, '#belgium')`, now)
+	// Transport scoped, unknown
+	db.conn.Exec(`INSERT INTO transmissions (hash, first_seen, route_type, scope_name) VALUES ('b', ?, 0, '')`, now)
+	// Transport unscoped (NULL)
+	db.conn.Exec(`INSERT INTO transmissions (hash, first_seen, route_type, scope_name) VALUES ('c', ?, 0, NULL)`, now)
+	// Non-transport (should not count)
+	db.conn.Exec(`INSERT INTO transmissions (hash, first_seen, route_type, scope_name) VALUES ('d', ?, 1, NULL)`, now)
+
+	stats, err := db.GetScopeStats("24h")
+	if err != nil {
+		t.Fatalf("GetScopeStats: %v", err)
+	}
+	if stats.Summary.TransportTotal != 3 {
+		t.Errorf("TransportTotal = %d, want 3", stats.Summary.TransportTotal)
+	}
+	if stats.Summary.Scoped != 2 {
+		t.Errorf("Scoped = %d, want 2", stats.Summary.Scoped)
+	}
+	if stats.Summary.Unscoped != 1 {
+		t.Errorf("Unscoped = %d, want 1", stats.Summary.Unscoped)
+	}
+	if stats.Summary.UnknownScope != 1 {
+		t.Errorf("UnknownScope = %d, want 1", stats.Summary.UnknownScope)
+	}
+	if len(stats.ByRegion) != 1 || stats.ByRegion[0].Name != "#belgium" || stats.ByRegion[0].Count != 1 {
+		t.Errorf("ByRegion = %+v, want [{#belgium 1}]", stats.ByRegion)
+	}
+}
+
+// TestLoadIndexesRelayHopsFromResolvedPath verifies that after Load(), relay
+// nodes that appear only in resolved_path (not in decoded_json) are indexed
+// in byNode. Regression for #692: indexByNode was called before observations
+// were appended, so tx.ResolvedPath was nil at index time — #806 fixed this
+// by indexing inline during the scan, this test locks it in.
+func TestLoadIndexesRelayHopsFromResolvedPath(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	now := time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339)
+	epoch := time.Now().UTC().Add(-1 * time.Hour).Unix()
+
+	// Insert a node whose pubkey does NOT appear in any decoded_json —
+	// it only relays traffic (appears in resolved_path of other packets).
+	const relayPubkey = "relay000aabbccddeeff0011"
+	const senderPubkey = "sender00112233445566"
+
+	db.conn.Exec(`INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, decoded_json)
+		VALUES ('FF01', 'relaytest0001hash', ?, 1, 4, ?)`,
+		now, `{"pubKey":"`+senderPubkey+`","name":"Sender","type":"ADVERT"}`)
+
+	// Observer hears the packet via the relay node.
+	db.conn.Exec(`INSERT INTO observations (transmission_id, observer_idx, snr, rssi, path_json, timestamp, resolved_path)
+		VALUES (1, 1, 10.0, -90, '["rr"]', ?, ?)`,
+		epoch, `["`+relayPubkey+`"]`)
+
+	store := NewPacketStore(db, nil)
+	if err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The sender should be in byNode via decoded_json.
+	if len(store.byNode[senderPubkey]) == 0 {
+		t.Errorf("sender not indexed in byNode via decoded_json")
+	}
+
+	// The relay node must be in byNode via resolved_path — this was the bug.
+	if len(store.byNode[relayPubkey]) == 0 {
+		t.Errorf("relay node not indexed in byNode after Load() — resolved_path indexing broken")
+	}
+	if store.byNode[relayPubkey][0].Hash != "relaytest0001hash" {
+		t.Errorf("relay byNode entry has wrong hash: %s", store.byNode[relayPubkey][0].Hash)
 	}
 }

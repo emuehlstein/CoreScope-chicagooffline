@@ -1,6 +1,459 @@
 /* === CoreScope — packets.js === */
 'use strict';
 
+/* === #1056: TableResponsive — fluid columns + "+N hidden" pill ============
+ * Tiny helper, defined once, used by packets/nodes/observers tables.
+ *
+ * Usage: TableResponsive.apply(tableEl)
+ *
+ * Each <th> may carry a `data-priority` attribute (1=keep always, higher
+ * numbers = drop first as viewport narrows). Default priority is 1.
+ *
+ * apply() measures the container width and progressively hides the highest-
+ * priority columns (and matching <td>s) until the table's natural scrollWidth
+ * fits, then renders a "+N hidden" pill in the last visible <th>. Click the
+ * pill to reveal all hidden columns until the next layout pass.
+ *
+ * Re-runs on window resize (debounced) and is idempotent — safe to call after
+ * every render. ResizeObserver on the wrapping element also triggers re-fit.
+ */
+(function () {
+  if (window.TableResponsive) return;
+
+  const REVEAL_FLAG = '__tr_reveal';
+  const PILL_CLASS = 'col-hidden-pill';
+  const HIDDEN_CLASS = 'col-hidden';
+
+  function thsOf(table) { return Array.from(table.querySelectorAll('thead > tr > th')); }
+
+  function clearHidden(table) {
+    table.querySelectorAll('.' + HIDDEN_CLASS).forEach(el => el.classList.remove(HIDDEN_CLASS));
+    const pill = table.querySelector('.' + PILL_CLASS);
+    if (pill) pill.remove();
+  }
+
+  function colIndexCells(table, idx) {
+    // Return the <td> at column index `idx` for every body row.
+    const out = [];
+    const rows = table.querySelectorAll('tbody > tr');
+    rows.forEach(r => {
+      // colSpan-aware mapping: walk cells, accumulate colspans.
+      let i = 0;
+      for (const cell of r.children) {
+        const span = cell.colSpan || 1;
+        if (i <= idx && idx < i + span) { out.push(cell); break; }
+        i += span;
+      }
+    });
+    return out;
+  }
+
+  function apply(table) {
+    if (!table || !table.isConnected) return;
+    if (table[REVEAL_FLAG]) {
+      // user explicitly requested reveal — clear hidden state and skip
+      clearHidden(table);
+      return;
+    }
+    clearHidden(table);
+
+    const ths = thsOf(table);
+    if (ths.length === 0) return;
+
+    // Viewport-breakpoint hiding (per issue #1056 acceptance criteria):
+    //   data-priority on each <th>:
+    //     1 → always visible
+    //     2 → hide when viewport ≤ 1280
+    //     3 → hide when viewport ≤ 1024  (per AC #1 wording)
+    //     4 → hide when viewport ≤  900
+    //     5 → hide when viewport ≤  768
+    // Higher priority numbers drop FIRST (least important).
+    // Drop direction: a column is hidden if its breakpoint ≥ current viewport.
+    const BP = { 2: 1280, 3: 1024, 4: 900, 5: 768 };
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+
+    const candidates = ths
+      .map((th, i) => ({ th, i, prio: parseInt(th.getAttribute('data-priority') || '1', 10) }))
+      .filter(c => c.prio > 1 && BP[c.prio] !== undefined && vw <= BP[c.prio])
+      // hide highest priority numbers first (drop-first), then right-to-left ties
+      .sort((a, b) => b.prio - a.prio || b.i - a.i);
+
+    let hidden = 0;
+    for (const c of candidates) {
+      c.th.classList.add(HIDDEN_CLASS);
+      colIndexCells(table, c.i).forEach(td => td.classList.add(HIDDEN_CLASS));
+      hidden++;
+    }
+
+    if (hidden > 0) {
+      const visible = ths.filter(th => !th.classList.contains(HIDDEN_CLASS));
+      const host = visible[visible.length - 1] || ths[0];
+      const pill = document.createElement('button');
+      pill.type = 'button';
+      pill.className = PILL_CLASS;
+      pill.textContent = '+' + hidden + ' hidden';
+      pill.title = 'Click to reveal hidden columns';
+      pill.setAttribute('aria-label', hidden + ' columns hidden — click to reveal');
+      pill.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        ev.preventDefault();
+        table[REVEAL_FLAG] = true;
+        clearHidden(table);
+        // Add a small "hide again" affordance after reveal so the user isn't stuck.
+        const rehide = document.createElement('button');
+        rehide.type = 'button';
+        rehide.className = PILL_CLASS + ' col-rehide-pill';
+        rehide.textContent = 'hide';
+        rehide.title = 'Re-hide collapsed columns';
+        rehide.setAttribute('aria-label', 'Re-hide previously collapsed columns');
+        rehide.addEventListener('click', function (ev2) {
+          ev2.stopPropagation();
+          ev2.preventDefault();
+          table[REVEAL_FLAG] = false;
+          apply(table);
+        });
+        rehide.addEventListener('keydown', function (ev2) {
+          // Prevent Enter/Space from bubbling up to TableSort handler on the <th>.
+          if (ev2.key === 'Enter' || ev2.key === ' ') ev2.stopPropagation();
+        });
+        host.appendChild(rehide);
+      });
+      // MAJOR-3: prevent Enter/Space keydown on the pill from bubbling to the
+      // <th>'s TableSort keydown handler (which would also trigger a sort).
+      pill.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') ev.stopPropagation();
+      });
+      host.appendChild(pill);
+    }
+  }
+
+  // Track tables we've wired up so resize triggers re-apply.
+  // Map<table, ResizeObserver|null> — we need the RO ref so SPA remounts can
+  // disconnect the orphaned observer when its <table> leaves the DOM.
+  // Pre-#1213 fix this was a Set and each /nodes (or /packets/observers)
+  // remount registered a fresh RO against a freshly-rendered table while the
+  // previous table+RO sat detached but observed → 1 leaked RO per remount.
+  const wired = new Map();
+  // Track last-seen wrap width per table so we only treat ACTUAL container
+  // resizes as a reason to drop the user's reveal state. Hiding/showing
+  // columns and removing the pill mutate layout and re-trigger ResizeObserver,
+  // which would otherwise immediately stomp on the reveal the user just asked for.
+  const lastWrapW = new WeakMap();
+  // Sweep tables that have been detached from the DOM (e.g. SPA destroyed
+  // their page) and release their ResizeObserver. Called opportunistically on
+  // every register() — cheap O(n) over wired tables, n is tiny in practice.
+  function sweepDetached() {
+    wired.forEach((ro, t) => {
+      if (!t || !t.isConnected) {
+        if (ro) { try { ro.disconnect(); } catch (_) {} }
+        wired.delete(t);
+      }
+    });
+  }
+  function register(table) {
+    sweepDetached();
+    if (!table || wired.has(table)) { apply(table); return; }
+    let ro = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      const wrap = table.closest('.table-fluid-wrap, .obs-table-scroll, .table-scroll-wrap') || table.parentElement;
+      if (wrap) {
+        lastWrapW.set(table, wrap.clientWidth || 0);
+        ro = new ResizeObserver(() => {
+          const prev = lastWrapW.get(table) || 0;
+          const cur = wrap.clientWidth || 0;
+          // Ignore self-induced layout reflows from apply()/clearHidden() —
+          // they don't change the wrap width. Only real viewport/container
+          // changes (>2px) clear the reveal flag.
+          if (Math.abs(cur - prev) <= 2) return;
+          lastWrapW.set(table, cur);
+          table[REVEAL_FLAG] = false;
+          apply(table);
+        });
+        ro.observe(wrap);
+      }
+    }
+    wired.set(table, ro);
+    apply(table);
+  }
+
+  let _winTimer = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(_winTimer);
+    _winTimer = setTimeout(() => {
+      wired.forEach((ro, t) => {
+        if (!t.isConnected) {
+          if (ro) { try { ro.disconnect(); } catch (_) {} }
+          wired.delete(t);
+          return;
+        }
+        t[REVEAL_FLAG] = false;
+        apply(t);
+      });
+    }, 120);
+  });
+
+  window.TableResponsive = { apply, register, sweep: sweepDetached };
+})();
+
+/* === #1056 AC#4: SlideOver — narrow-viewport row-detail overlay ============
+ * Singleton backdrop + right-anchored panel injected into <body>. Used by
+ * packets/nodes/observers when window.innerWidth <= SLIDE_OVER_BP (1023,
+ * matching the data-priority="3" breakpoint reused by TableResponsive).
+ *
+ *   SlideOver.shouldUse()   → boolean (current viewport <= breakpoint)
+ *   SlideOver.open(opts)    → returns the inner content element. opts:
+ *     { title?: string, onClose?: function, restoreFocus?: () => Element|null }
+ *     `restoreFocus` (optional) overrides the auto-captured
+ *     `document.activeElement` and is invoked at close time to look up the
+ *     element to focus. Use this when the caller re-renders the originating
+ *     row before/after opening (which would otherwise detach the focused
+ *     row from the DOM and leave nothing for auto-restore to find).
+ *   SlideOver.close()       → close + dispatch onClose
+ *   SlideOver.isOpen()      → boolean
+ *
+ * Close affordances: X button (.slide-over-close), backdrop click, Escape.
+ * Reuses `slideInRight` keyframe in style.css.
+ */
+(function () {
+  if (window.SlideOver) return;
+
+  // #1168 Munger #3: shared, ref-counted scroll-lock helper. Multiple
+  // modal surfaces (SlideOver, ChannelColorPicker, future modals) call
+  // acquire()/release() with their own token; the body keeps the
+  // `scroll-locked` class (CSS supplies overflow:hidden in style.css)
+  // for as long as the count > 0. Last release removes the class.
+  // This replaces the previous capture-and-restore-string approach
+  // which corrupted body.style.overflow under last-writer-wins races.
+  if (!window.__scrollLock) {
+    let count = 0;
+    let next = 1;
+    const live = new Set();
+    function acquire() {
+      const token = next++;
+      live.add(token);
+      count++;
+      if (count === 1) document.body.classList.add('scroll-locked');
+      return token;
+    }
+    function release(token) {
+      if (token == null || !live.has(token)) return;
+      live.delete(token);
+      count--;
+      if (count <= 0) {
+        count = 0;
+        document.body.classList.remove('scroll-locked');
+      }
+    }
+    window.__scrollLock = { acquire: acquire, release: release };
+  }
+
+  const BP = 1023;
+  let backdrop = null, panel = null, content = null, closeCb = null;
+  let prevFocus = null, prevFocusResolver = null;
+  // #1168 Munger #1: openSeq counter so a stale rAF from close() can
+  // detect a newer open() happened in between and skip its focus call.
+  let openSeq = 0;
+  // #1168 Munger #3: ref-counted scroll-lock token held by THIS surface
+  // (multiple SlideOver opens reuse the same token; only paired with a
+  // matching release on close).
+  let scrollLockToken = null;
+
+  function ensureNodes() {
+    if (panel && backdrop) return;
+    backdrop = document.createElement('div');
+    backdrop.className = 'slide-over-backdrop';
+    backdrop.hidden = true;
+    // Backdrop is decorative — assistive tech should not announce it.
+    backdrop.setAttribute('aria-hidden', 'true');
+    backdrop.addEventListener('click', function () { close(); });
+
+    panel = document.createElement('aside');
+    panel.className = 'slide-over-panel';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    // #1168 must-fix #4: a static aria-label="Detail" would override the
+    // meaningful <h3 id="slideOverTitle"> (e.g. "Packet ab12cd…", node name)
+    // for screen-reader users. Use aria-labelledby so the announced name
+    // is the actual title rendered into the panel.
+    panel.setAttribute('aria-labelledby', 'slideOverTitle');
+    panel.hidden = true;
+    panel.tabIndex = -1;
+    panel.innerHTML =
+      '<div class="slide-over-header">' +
+        '<h3 class="slide-over-title" id="slideOverTitle"></h3>' +
+        '<button type="button" class="slide-over-close" aria-label="Close detail (Esc)" title="Close">✕</button>' +
+      '</div>' +
+      '<div class="slide-over-content"></div>';
+    panel.querySelector('.slide-over-close').addEventListener('mousedown', function (e) {
+      // Prevent the X from stealing focus on pointer-press. Without this,
+      // Chromium focuses the button on mousedown → close() runs while X has
+      // focus → hiding the panel triggers an implicit blur to <body> that
+      // races with (and clobbers) our row-focus-restore. With this guard,
+      // the originating row keeps focus throughout the click → the post-
+      // close rAF restore runs unopposed.
+      e.preventDefault();
+    });
+    panel.querySelector('.slide-over-close').addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    });
+    // Focus trap: keep Tab cycling inside the panel while open.
+    panel.addEventListener('keydown', function (e) {
+      if (e.key !== 'Tab' || !isOpen()) return;
+      const focusables = panel.querySelectorAll(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      if (!focusables.length) return;
+      const first = focusables[0], last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey && (active === first || active === panel)) {
+        e.preventDefault();
+        try { last.focus(); } catch {}
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        try { first.focus(); } catch {}
+      }
+    });
+    document.body.appendChild(backdrop);
+    document.body.appendChild(panel);
+
+    // Single Escape handler shared across all uses.
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && isOpen()) {
+        e.stopPropagation();
+        close();
+      }
+    });
+
+    // #1168 Munger #2: hashchange cleanup. Without this, navigating from
+    // /#/packets to /#/nodes via location.hash leaves panel + backdrop +
+    // scroll-lock dangling across pages. Registered once with the other
+    // singleton listeners.
+    //
+    // Scope: only close on PAGE-route changes (first hash segment), not
+    // on within-page detail navigation. Observers (and others) write
+    // /#/observers/<id> when opening a row; that hashchange must NOT
+    // close the slide-over we just opened.
+    window.addEventListener('hashchange', function (e) {
+      if (!isOpen()) return;
+      function pageOf(hash) {
+        var m = String(hash || '').match(/^#?\/?([^\/?#]+)/);
+        return m ? m[1] : '';
+      }
+      var oldPage = pageOf(e && e.oldURL ? e.oldURL.split('#')[1] || '' : '');
+      var newPage = pageOf(e && e.newURL ? e.newURL.split('#')[1] || '' : location.hash);
+      if (oldPage !== newPage) close();
+    });
+  }
+
+  function shouldUse() {
+    return (window.innerWidth || document.documentElement.clientWidth) <= BP;
+  }
+
+  function isOpen() {
+    return !!(panel && !panel.hidden);
+  }
+
+  function open(opts) {
+    // If already open, properly close the prior caller first so its onClose
+    // (which clears `selectedKey`/hash state) fires before we replace it.
+    if (isOpen()) close();
+    ensureNodes();
+    opts = opts || {};
+    // #1168 Munger #1: bump open sequence so any pending rAF from a
+    // prior close() can detect that a newer open has happened and skip
+    // its stale focus-restore.
+    openSeq++;
+    closeCb = typeof opts.onClose === 'function' ? opts.onClose : null;
+    // If the caller passes restoreFocus(), it owns lookup at close-time —
+    // useful when the caller re-renders the row table (which would detach
+    // any auto-captured prevFocus DOM node).
+    prevFocusResolver = typeof opts.restoreFocus === 'function' ? opts.restoreFocus : null;
+    // Remember what was focused so we can restore on close.
+    prevFocus = (document.activeElement && document.activeElement !== document.body)
+      ? document.activeElement : null;
+    // #1168 Munger #3: ref-counted scroll-lock — class-based, not value-restore.
+    // Survives interleaved lockers (other modals can also acquire/release).
+    if (scrollLockToken == null) {
+      scrollLockToken = window.__scrollLock.acquire();
+    }
+    const title = panel.querySelector('.slide-over-title');
+    title.textContent = opts.title || 'Detail';
+    content = panel.querySelector('.slide-over-content');
+    content.innerHTML = '';
+    backdrop.hidden = false;
+    panel.hidden = false;
+    // Focus the close button so Esc/Enter works without an extra tab.
+    const x = panel.querySelector('.slide-over-close');
+    if (x) try { x.focus(); } catch {}
+    return content;
+  }
+
+  function close() {
+    if (!panel || panel.hidden) return;
+    panel.hidden = true;
+    if (backdrop) backdrop.hidden = true;
+    // #1168 Munger #3: release the ref-counted scroll-lock token.
+    if (scrollLockToken != null) {
+      window.__scrollLock.release(scrollLockToken);
+      scrollLockToken = null;
+    }
+    const cb = closeCb;
+    closeCb = null;
+    if (content) content.innerHTML = '';
+    // Restore focus to whatever opened us (typically the table row), so
+    // keyboard users don't get dumped at the top of the document.
+    let toFocus = prevFocus;
+    const resolver = prevFocusResolver;
+    prevFocus = null;
+    prevFocusResolver = null;
+    // #1168 Munger #1: capture the open-sequence at close-time. If a NEW
+    // open() happens before our deferred rAF fires, openSeq will have
+    // advanced past this value and the stale rAF must no-op (otherwise
+    // it would steal focus back to row A's originating row AFTER row B
+    // is open — clobbering B's focus).
+    const seqAtClose = openSeq;
+    if (cb) try { cb(); } catch {}
+    // Resolver runs AFTER cb (cb may re-render the table and reattach the row).
+    if (resolver) {
+      try {
+        const resolved = resolver();
+        if (resolved) toFocus = resolved;
+      } catch {}
+    }
+    if (toFocus && typeof toFocus.focus === 'function' && document.body.contains(toFocus)) {
+      // Defer to next microtask + rAF so the focus call lands AFTER any
+      // event-handler bookkeeping (e.g. an Escape keydown chain that would
+      // otherwise see focus snap back to <body> as the key event unwinds).
+      const target = toFocus;
+      const tryFocus = function () {
+        // Munger #1: bail if a newer open() has happened since close-time.
+        if (openSeq !== seqAtClose) return;
+        if (document.body.contains(target)) {
+          try { target.focus(); } catch {}
+        }
+      };
+      tryFocus();
+      requestAnimationFrame(tryFocus);
+    }
+  }
+
+  // If the viewport grows past the breakpoint while open, close the slide-over
+  // so callers can re-route into the wide-viewport side panel.
+  let _resizeT = null;
+  window.addEventListener('resize', function () {
+    if (!isOpen()) return;
+    clearTimeout(_resizeT);
+    _resizeT = setTimeout(function () {
+      if (isOpen() && !shouldUse()) close();
+    }, 120);
+  });
+
+  window.SlideOver = { open: open, close: close, isOpen: isOpen, shouldUse: shouldUse, BP: BP };
+})();
+
+
 (function () {
   let packets = [];
   let hashIndex = new Map(); // hash → packet group for O(1) dedup
@@ -12,7 +465,79 @@
     if (!o) return id;
     return o.iata ? `${o.name} (${o.iata})` : o.name;
   }
+  // Compact IATA pill (#1188) — renders next to observer name. Prefers
+  // packet.observer_iata (now joined on the server) and falls back to the
+  // observer lookup map for callers that haven't been updated yet.
+  function obsIataBadge(packet) {
+    if (!packet) return '';
+    let iata = packet.observer_iata;
+    if (!iata) {
+      const o = packet.observer_id ? observerMap.get(packet.observer_id) : null;
+      iata = o && o.iata;
+    }
+    return iata ? `<span class="badge-iata">${escapeHtml(iata)}</span>` : '';
+  }
+  // Plain observer name without the trailing IATA — used when the IATA is
+  // rendered separately as a badge (so the cell doesn't show "Name (SJC) SJC").
+  function obsNameOnly(id) {
+    if (!id) return '—';
+    const o = observerMap.get(id);
+    if (!o) return id;
+    return o.name;
+  }
+  // #1189 R1 mesh-operator feedback: in a grouped row the old cell showed ONE
+  // observer's IATA + `+N` — operators couldn't tell whether the N additional
+  // observers were SAME-region (redundant copies) or CROSS-region (interesting
+  // multi-site reception). This helper returns the cell's badge HTML showing
+  // the DISTINCT IATA set: `<badge>SJC</badge>` or `<badge>SJC</badge><badge>SFO</badge>+1`
+  // (capped at 2 visible, remainder rolled into +N of distinct-region count).
+  // Returns '' when no observer in the group carries any IATA.
+  //
+  // #1189 R2: source of truth is `p.distinct_iatas` from the server
+  // (added to /api/packets?groupByHash=true so the default collapsed view
+  // works without needing to expand a row). Falls back to walking
+  // p._children + observerMap for legacy callers and for client-side groups
+  // synthesised by the websocket appender.
+  function groupedObserverIataBadgesHtml(p) {
+    if (!p) return '';
+    const seen = new Set();
+    // R2 happy path: server-provided distinct_iatas.
+    if (Array.isArray(p.distinct_iatas)) {
+      for (const code of p.distinct_iatas) {
+        if (code) seen.add(String(code).toUpperCase());
+      }
+    }
+    // Fallback / supplement: walk header + children (covers in-memory groups
+    // built client-side from websocket events before any server round-trip).
+    if (!seen.size) {
+      const pushIata = (rec) => {
+        if (!rec) return;
+        let iata = rec.observer_iata;
+        if (!iata && rec.observer_id) {
+          const o = observerMap.get(rec.observer_id);
+          iata = o && o.iata;
+        }
+        if (iata) seen.add(String(iata).toUpperCase());
+      };
+      pushIata(p);
+      if (p._children && p._children.length) {
+        for (const c of p._children) pushIata(c);
+      }
+    }
+    if (!seen.size) return '';
+    const list = Array.from(seen).sort();
+    const visible = list.slice(0, 2);
+    const extra = list.length - visible.length;
+    let html = visible
+      .map(code => `<span class="badge-iata">${escapeHtml(code)}</span>`)
+      .join('');
+    if (extra > 0) html += ` +${extra}`;
+    return html;
+  }
   let selectedId = null;
+  function _isColorByHash() { return localStorage.getItem('meshcore-color-packets-by-hash') !== 'false'; }
+  function _currentTheme() { return document.documentElement.dataset.theme || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); }
+  function _hashStripeStyle(hash) { return _isColorByHash() && hash && window.HashColor ? 'border-left:4px solid ' + HashColor.hashToHsl(hash, _currentTheme()) + ';' : ''; }
   let groupByHash = true;
   let filters = {};
   { const o = localStorage.getItem('meshcore-observer-filter'); if (o) filters.observer = o;
@@ -23,7 +548,7 @@
   let observers = [];
   let observerMap = new Map(); // id → observer for O(1) lookups (#383)
   let regionMap = {};
-  const TYPE_NAMES = { 0:'Request', 1:'Response', 2:'Direct Msg', 3:'ACK', 4:'Advert', 5:'Channel Msg', 7:'Anon Req', 8:'Path', 9:'Trace', 11:'Control' };
+  const TYPE_NAMES = { 0:'Request', 1:'Response', 2:'Direct Msg', 3:'ACK', 4:'Advert', 5:'Channel Msg', 6:'Group Data', 7:'Anon Req', 8:'Path', 9:'Trace', 10:'Multipart', 11:'Control', 15:'Raw Custom' };
   function typeName(t) { return TYPE_NAMES[t] ?? `Type ${t}`; }
   const isMobile = window.innerWidth <= 1024;
   const PACKET_LIMIT = isMobile ? 1000 : 50000;
@@ -41,21 +566,42 @@
 
   var DEFAULT_TIME_WINDOW = 15;
 
-  function buildPacketsQuery(timeWindowMin, regionParam) {
+  function buildPacketsQuery(timeWindowMin, regionParam, skipHash) {
     var parts = [];
     if (timeWindowMin && timeWindowMin !== DEFAULT_TIME_WINDOW) parts.push('timeWindow=' + timeWindowMin);
     if (regionParam) parts.push('region=' + encodeURIComponent(regionParam));
-    if (filters.hash) parts.push('hash=' + encodeURIComponent(filters.hash));
+    if (!skipHash && filters.hash) parts.push('hash=' + encodeURIComponent(filters.hash));
     if (filters.node) parts.push('node=' + encodeURIComponent(filters.node));
     if (filters.observer) parts.push('observer=' + encodeURIComponent(filters.observer));
     if (filters.channel) parts.push('channel=' + encodeURIComponent(filters.channel));
     if (filters._filterExpr) parts.push('filter=' + encodeURIComponent(filters._filterExpr));
+    // Sort state (#749) — encode as 'col[:asc]'; default 'time:desc' is omitted.
+    if (_packetSortColumn) {
+      var sortDefault = _packetSortColumn === 'time' && _packetSortDirection === 'desc';
+      if (!sortDefault && window.URLState) {
+        var sortToken = URLState.serializeSort(_packetSortColumn, _packetSortDirection);
+        if (sortToken) parts.push('sort=' + encodeURIComponent(sortToken));
+      }
+    }
     return parts.length ? '?' + parts.join('&') : '';
   }
   window.buildPacketsQuery = buildPacketsQuery;
 
   function updatePacketsUrl() {
-    history.replaceState(null, '', '#/packets' + buildPacketsQuery(savedTimeWindowMin, RegionFilter.getRegionParam()));
+    // Preserve any subpath after /packets (e.g. #/packets/<hash>).
+    var cur = String(location.hash || '');
+    var subpath = '';
+    var m = cur.match(/^#\/packets(\/[^?]*)?/);
+    if (m && m[1]) subpath = m[1];
+    // Don't double-encode filters.hash when it's already the path segment.
+    var skipHash = !!(filters.hash && subpath === '/' + filters.hash);
+    history.replaceState(null, '', '#/packets' + subpath + buildPacketsQuery(savedTimeWindowMin, RegionFilter.getRegionParam(), skipHash));
+    // Update clear-filters button visibility
+    var cb = document.getElementById('clearFiltersBtn');
+    if (cb) {
+      var active = !!(filters.hash || filters.node || filters.observer || filters.channel || filters.type || filters._filterExpr || filters.myNodes) || !!RegionFilter.getRegionParam() || savedTimeWindowMin !== DEFAULT_TIME_WINDOW;
+      cb.style.display = active ? '' : 'none';
+    }
   }
 
   let filtersBuilt = false;
@@ -357,6 +903,17 @@
     if (_urlChannel) filters.channel = _urlChannel;
     var _urlFilterExpr = _initUrlParams.get('filter');
     if (_urlFilterExpr) filters._filterExpr = _urlFilterExpr;
+    // #749 — restore sort state from URL (overrides localStorage).
+    var _urlSort = _initUrlParams.get('sort');
+    if (_urlSort && window.URLState) {
+      var _parsed = URLState.parseSort(_urlSort);
+      if (_parsed) {
+        _packetSortColumn = _parsed.column;
+        _packetSortDirection = _parsed.direction;
+        // Persist so TableSort init picks it up.
+        try { localStorage.setItem('meshcore-packets-sort', JSON.stringify({ column: _parsed.column, direction: _parsed.direction })); } catch {}
+      }
+    }
 
     app.innerHTML = `<div class="split-layout detail-collapsed">
       <div class="panel-left" id="pktLeft" aria-live="polite" aria-relevant="additions removals"></div>
@@ -389,7 +946,7 @@
               expandedHashes.add(h);
               const obsPacket = {...data.packet, observer_id: obs.observer_id, observer_name: obs.observer_name, snr: obs.snr, rssi: obs.rssi, path_json: obs.path_json, resolved_path: obs.resolved_path, direction: obs.direction, timestamp: obs.timestamp, first_seen: obs.timestamp};
               clearParsedCache(obsPacket);
-              selectPacket(obs.id, h, {packet: obsPacket, breakdown: data.breakdown, observations: data.observations}, obs.id);
+              selectPacket(obs.id, h, {packet: obsPacket, observations: data.observations}, obs.id);
             } else {
               selectPacket(data.packet.id, h, data);
             }
@@ -468,6 +1025,9 @@
 
       // Check if new packets pass current filters
       const filtered = newPkts.filter(p => {
+        // When user pinned a hash, accept ONLY that exact packet — bypass all
+        // other filters (window/region/type/observer/node).
+        if (filters.hash) return p.hash === filters.hash;
         // Respect time window filter — drop packets outside the selected window
         const windowMin = savedTimeWindowMin;
         if (windowMin > 0) {
@@ -477,7 +1037,6 @@
         }
         if (filters.type) { const types = filters.type.split(',').map(Number); if (!types.includes(p.payload_type)) return false; }
         if (filters.observer) { const obsSet = new Set(filters.observer.split(',')); if (!obsSet.has(p.observer_id) && !(p._children && p._children.some(c => obsSet.has(String(c.observer_id))))) return false; }
-        if (filters.hash && p.hash !== filters.hash) return false;
         if (RegionFilter.getRegionParam()) {
           const selectedRegions = RegionFilter.getRegionParam().split(',');
           const obs = observerMap.get(p.observer_id);
@@ -610,27 +1169,54 @@
     } catch {}
   }
 
-  async function loadPackets() {
-    try {
-      const params = new URLSearchParams();
-      const selectedWindow = Number(document.getElementById('fTimeWindow')?.value);
-      const windowMin = Number.isFinite(selectedWindow) ? selectedWindow : savedTimeWindowMin;
-      if (windowMin > 0 && !filters.hash) {
-        const since = new Date(Date.now() - windowMin * 60000).toISOString();
-        params.set('since', since);
-      }
-      params.set('limit', String(PACKET_LIMIT));
-      const regionParam = RegionFilter.getRegionParam();
-      if (regionParam) params.set('region', regionParam);
-      if (filters.hash) params.set('hash', filters.hash);
-      if (filters.node) params.set('node', filters.node);
-      if (filters.observer) params.set('observer', filters.observer);
-      if (filters.channel) params.set('channel', filters.channel);
+  // Build URLSearchParams for /api/packets given UI state. Pure function for
+  // testability — returns the params object the next call to /api/packets
+  // would use. The hash filter is an exact identifier: when present it
+  // suppresses ALL other filters (region, time window, observer, node,
+  // channel). The user is asking for THAT packet regardless of saved
+  // selections.
+  function buildPacketsParams({ filters, regionParam, areaParam, windowMin, groupByHash, limit }) {
+    const params = new URLSearchParams();
+    if (filters.hash) {
+      params.set('hash', filters.hash);
+      params.set('limit', String(limit));
       if (groupByHash) {
         params.set('groupByHash', 'true');
       } else {
         params.set('expand', 'observations');
       }
+      return params;
+    }
+    if (windowMin > 0) {
+      const since = new Date(Date.now() - windowMin * 60000).toISOString();
+      params.set('since', since);
+    }
+    params.set('limit', String(limit));
+    if (regionParam) params.set('region', regionParam);
+    if (areaParam) params.set('area', areaParam);
+    if (filters.node) params.set('node', filters.node);
+    if (filters.observer) params.set('observer', filters.observer);
+    if (filters.channel) params.set('channel', filters.channel);
+    if (groupByHash) {
+      params.set('groupByHash', 'true');
+    } else {
+      params.set('expand', 'observations');
+    }
+    return params;
+  }
+
+  async function loadPackets() {
+    try {
+      const selectedWindow = Number(document.getElementById('fTimeWindow')?.value);
+      const windowMin = Number.isFinite(selectedWindow) ? selectedWindow : savedTimeWindowMin;
+      const params = buildPacketsParams({
+        filters,
+        regionParam: RegionFilter.getRegionParam(),
+        areaParam: AreaFilter.getAreaParam(),
+        windowMin,
+        groupByHash,
+        limit: PACKET_LIMIT,
+      });
 
       const data = await api('/packets?' + params.toString());
       packets = data.packets || [];
@@ -706,7 +1292,7 @@
             group._children = obs.length
               ? obs.map(o => clearParsedCache({...pkt, ...o, _isObservation: true}))
               : [pkt];
-            group._fetchedData = { packet: pkt, observations: obs, breakdown: data.breakdown };
+            group._fetchedData = { packet: pkt, observations: obs };
             sortGroupChildren(group);
           }
         }
@@ -718,6 +1304,10 @@
       console.error('Failed to load packets:', e);
       const tbody = document.getElementById('pktBody');
       if (tbody) tbody.innerHTML = '<tr><td colspan="' + _getColCount() + '" class="text-center" style="padding:24px;color:var(--error,#ef4444)"><div role="alert" aria-live="polite">Failed to load packets. Please try again.</div></td></tr>';
+    } finally {
+      // Always signal data-loaded — even on error — so E2E tests can proceed.
+      var pktContainer = document.getElementById('pktLeft') || document.getElementById('pktBody');
+      if (pktContainer) pktContainer.setAttribute('data-loaded', 'true');
     }
   }
 
@@ -741,7 +1331,7 @@
           <button class="btn-icon" data-action="pkt-byop" title="Bring Your Own Packet" aria-label="Bring Your Own Packet - paste raw packet hex for analysis" aria-haspopup="dialog">📦 BYOP</button>
         </div>
       </div>
-      <div class="filter-group" style="flex:1;margin-bottom:8px">
+      <div class="filter-group pkt-filter-expr" style="flex:1;margin-bottom:8px;position:relative">
         <input type="text" id="packetFilterInput" class="packet-filter-input"
           placeholder='Filter: type == Advert && snr > 5 · payload.name contains "Gilroy"'
           aria-label="Packet filter expression"
@@ -751,32 +1341,25 @@
       </div>
       <div class="filter-bar" id="pktFilters">
         <button class="btn filter-toggle-btn" id="filterToggleBtn">Filters ▾</button>
-        <div class="filter-group">
+        <!-- #1124 (MAJOR-3) Group 1: Filter input + Clear -->
+        <div class="filter-group filter-group-clear">
+          <button class="btn btn-clear-filters" id="clearFiltersBtn" title="Clear all filters" style="display:none;font-size:12px;padding:2px 8px;color:var(--text-muted);border:1px solid var(--border);border-radius:4px;background:transparent;cursor:pointer">✕ Clear</button>
+        </div>
+        <!-- Group 2: Quick filters (hash, node name) -->
+        <div class="filter-group filter-group-quick">
           <input type="text" placeholder="Packet hash…" id="fHash" aria-label="Filter by packet hash" title="Filter packets by hex hash prefix">
           <div class="node-filter-wrap" style="position:relative">
             <input type="text" placeholder="Node name…" id="fNode" autocomplete="off" role="combobox" aria-expanded="false" aria-owns="fNodeDropdown" aria-activedescendant="" aria-autocomplete="list" title="Filter packets involving this node (sender or path)">
             <div class="node-filter-dropdown hidden" id="fNodeDropdown" role="listbox"></div>
           </div>
-          <div class="multi-select-wrap" id="observerFilterWrap">
-            <button class="multi-select-trigger" id="observerTrigger" title="Show only packets seen by selected observer stations">All Observers ▾</button>
-            <div class="multi-select-menu" id="observerMenu"></div>
-          </div>
-          <div id="packetsRegionFilter" class="region-filter-container" style="display:inline-block;vertical-align:middle"></div>
-          <div class="multi-select-wrap" id="typeFilterWrap">
-            <button class="multi-select-trigger" id="typeTrigger" title="Filter by packet type">All Types ▾</button>
-            <div class="multi-select-menu" id="typeMenu"></div>
-          </div>
-          <div class="filter-group" style="display:inline-flex;align-items:center;gap:4px">
-            <select id="fChannel" class="filter-select" aria-label="Filter by channel" title="Filter Channel Messages (GRP_TXT) by channel">
-              <option value="">All Channels</option>
-            </select>
-          </div>
         </div>
-        <div class="filter-group">
+        <!-- Group 3: Quick toggles (time range, Group by Hash, ★ My Nodes)
+             — #1128 Bug 5: placed BEFORE the Observer/Region/Type/Channel
+             dropdowns so the most-frequently-used controls sit next to
+             the search input where the eye lands first. -->
+        <div class="filter-group filter-group-toggles">
           <button class="btn ${groupByHash ? 'active' : ''}" id="fGroup" title="Collapse duplicate observations of the same packet into expandable groups">Group by Hash</button>
           <button class="btn" id="fMyNodes" title="Show only packets from your favorited/claimed nodes">★ My Nodes</button>
-        </div>
-        <div class="filter-group">
           <select id="fTimeWindow" class="filter-select" aria-label="Time window filter">
             <option value="15">Last 15 min</option>
             <option value="30">Last 30 min</option>
@@ -788,7 +1371,24 @@
             ${isMobile ? '' : '<option value="0">All time</option>'}
           </select>
         </div>
-        <div class="filter-group">
+        <!-- Group 4: Dropdowns (observers, regions, types, channels) -->
+        <div class="filter-group filter-group-dropdowns">
+          <div class="multi-select-wrap" id="observerFilterWrap">
+            <button class="multi-select-trigger" id="observerTrigger" title="Show only packets seen by selected observer stations">All Observers ▾</button>
+            <div class="multi-select-menu" id="observerMenu"></div>
+          </div>
+          <div id="packetsRegionFilter" class="region-filter-container" style="display:inline-block;vertical-align:middle"></div>
+          <div id="packetsAreaFilter" style="display:none;vertical-align:middle"></div>
+          <div class="multi-select-wrap" id="typeFilterWrap">
+            <button class="multi-select-trigger" id="typeTrigger" title="Filter by packet type">All Types ▾</button>
+            <div class="multi-select-menu" id="typeMenu"></div>
+          </div>
+          <select id="fChannel" class="filter-select" aria-label="Filter by channel" title="Filter Channel Messages (GRP_TXT) by channel">
+            <option value="">All Channels</option>
+          </select>
+        </div>
+        <!-- Group 5: Sort + Columns -->
+        <div class="filter-group filter-group-sort">
           <select id="fObsSort" aria-label="Observation sort order" title="Controls how observations are ordered within packet groups and which observation appears in the header row. Observer: Groups by observer station, earliest first. Path: Orders by hop count. Time: Orders by observation timestamp.">
             <option value="observer">Sort: Observer</option>
             <option value="path-asc">Sort: Path ↑ (shortest)</option>
@@ -796,9 +1396,7 @@
             <option value="chrono-asc">Sort: Time ↑ (earliest)</option>
             <option value="chrono-desc">Sort: Time ↓ (latest)</option>
           </select>
-          <span class="sort-help" id="sortHelpIcon">ⓘ</span>
-        </div>
-        <div class="filter-group">
+          <span class="sort-help" id="sortHelpIcon" tabindex="0" role="button" aria-label="Sort help">ⓘ</span>
           <div class="col-toggle-wrap">
             <button class="col-toggle-btn" id="colToggleBtn" title="Show/hide table columns">Columns ▾</button>
             <div class="col-toggle-menu" id="colToggleMenu"></div>
@@ -806,23 +1404,25 @@
           <button class="btn btn-icon${showHexHashes ? ' active' : ''}" id="hexHashToggle" title="Show raw hex hash prefixes instead of resolved node names in the path column">Hex Paths</button>
         </div>
       </div>
-      <table class="data-table" id="pktTable">
+      <div class="table-fluid-wrap"><table class="data-table" id="pktTable">
         <thead><tr>
-          <th scope="col"></th><th scope="col" class="col-region" data-sort-key="region">Region</th><th scope="col" class="col-time" data-sort-key="time" data-type="date">Time</th><th scope="col" class="col-hash" data-sort-key="hash">Hash</th><th scope="col" class="col-size" data-sort-key="size" data-type="numeric">Size</th>
-          <th scope="col" class="col-hashsize" data-sort-key="hb" data-type="numeric">HB</th>
-          <th scope="col" class="col-type" data-sort-key="type">Type</th><th scope="col" class="col-observer" data-sort-key="observer">Observer</th><th scope="col" class="col-path" data-sort-key="path">Path</th><th scope="col" class="col-rpt" data-sort-key="rpt" data-type="numeric">Rpt</th><th scope="col" class="col-details">Details</th>
+          <th scope="col" class="col-expand" data-priority="1"></th><th scope="col" class="col-region" data-sort-key="region" data-priority="3">Region</th><th scope="col" class="col-time" data-sort-key="time" data-type="date" data-priority="1">Time</th><th scope="col" class="col-hash" data-sort-key="hash" data-priority="3">Hash</th><th scope="col" class="col-size" data-sort-key="size" data-type="numeric" data-priority="4">Size</th>
+          <th scope="col" class="col-hashsize" data-sort-key="hb" data-type="numeric" data-priority="5">HB</th>
+          <th scope="col" class="col-type" data-sort-key="type" data-priority="1">Type</th><th scope="col" class="col-observer" data-sort-key="observer" data-priority="3">Observer</th><th scope="col" class="col-path" data-sort-key="path" data-priority="5">Path</th><th scope="col" class="col-rpt" data-sort-key="rpt" data-type="numeric" data-priority="3">Rpt</th><th scope="col" class="col-details" data-priority="1">Details</th>
         </tr></thead>
         <tbody id="pktBody"></tbody>
-      </table>
+      </table></div>
     `;
 
     // Init shared RegionFilter component
     RegionFilter.init(document.getElementById('packetsRegionFilter'), { dropdown: true });
+    AreaFilter.init(document.getElementById('packetsAreaFilter'));
     if (_pendingUrlRegion) {
       RegionFilter.setSelected(_pendingUrlRegion.split(',').filter(Boolean));
       _pendingUrlRegion = null;
     }
     RegionFilter.onChange(function() { updatePacketsUrl(); loadPackets(); });
+    AreaFilter.onChange(function() { updatePacketsUrl(); loadPackets(); });
 
     // --- Packet Filter Language ---
     (function() {
@@ -874,6 +1474,14 @@
         }, 300);
       });
     })();
+
+    // Wireshark-style filter UX (#966): help popover, autocomplete, right-click
+    // context menu, saved-filter dropdown. Idempotent — safe to re-call.
+    if (window.FilterUX && typeof window.FilterUX.init === 'function') {
+      window.FilterUX.init();
+    }
+    // #1124 (MAJOR-1): wire the path overflow popover (delegated; idempotent).
+    _wirePathOverflowPopover();
 
     // --- Observer multi-select ---
     const obsMenu = document.getElementById('observerMenu');
@@ -933,13 +1541,20 @@
     }
     function updateTypeTrigger() {
       const total = Object.keys(typeMap).length;
+      // #1128 (Bug 3): trigger has bounded max-width so long selections like
+      // "TRACE,MULTIPART,GRP_TXT" get ellipsised. Always set the full label
+      // as the `title` attribute so the user can recover it via tooltip.
+      const fullList = [...selectedTypes].map(k => typeMap[k] || k).join(', ');
       if (selectedTypes.size === 0 || selectedTypes.size === total) {
         typeTrigger.textContent = 'All Types ▾';
+        typeTrigger.title = 'Filter by packet type';
       } else if (selectedTypes.size === 1) {
         const k = [...selectedTypes][0];
         typeTrigger.textContent = (typeMap[k] || k) + ' ▾';
+        typeTrigger.title = 'Selected: ' + fullList;
       } else {
         typeTrigger.textContent = selectedTypes.size + ' Types ▾';
+        typeTrigger.title = 'Selected: ' + fullList;
       }
     }
     buildTypeMenu();
@@ -1031,6 +1646,63 @@
       this.textContent = bar.classList.contains('filters-expanded') ? 'Filters ▴' : 'Filters ▾';
     });
 
+    // --- Clear filters button ---
+    const clearBtn = document.getElementById('clearFiltersBtn');
+    if (clearBtn) clearBtn.addEventListener('click', function() {
+      // Reset filters object
+      filters.hash = undefined;
+      filters.node = undefined;
+      filters.nodeName = undefined;
+      filters.observer = undefined;
+      filters.channel = undefined;
+      filters.type = undefined;
+      filters._filterExpr = undefined;
+      filters._packetFilter = null;
+      filters.myNodes = false;
+      _observerFilterSet = null;
+
+      // Clear localStorage filter entries
+      localStorage.removeItem('meshcore-observer-filter');
+      localStorage.removeItem('meshcore-type-filter');
+
+      // Reset DOM inputs
+      document.getElementById('fHash').value = '';
+      document.getElementById('fNode').value = '';
+      var pfInput = document.getElementById('packetFilterInput');
+      if (pfInput) { pfInput.value = ''; pfInput.classList.remove('filter-active', 'filter-error'); }
+      var pfError = document.getElementById('packetFilterError');
+      if (pfError) pfError.style.display = 'none';
+      var pfCount = document.getElementById('packetFilterCount');
+      if (pfCount) pfCount.style.display = 'none';
+      document.getElementById('fChannel').value = '';
+      document.getElementById('fMyNodes').classList.remove('active');
+
+      // Reset observer multi-select
+      var obMenu = document.getElementById('observerMenu');
+      if (obMenu) obMenu.querySelectorAll('input[type=checkbox]').forEach(function(cb) { cb.checked = false; });
+      document.getElementById('observerTrigger').textContent = 'All Observers ▾';
+
+      // Reset type multi-select
+      var typeMenu = document.getElementById('typeMenu');
+      if (typeMenu) typeMenu.querySelectorAll('input[type=checkbox]').forEach(function(cb) { cb.checked = false; });
+      document.getElementById('typeTrigger').textContent = 'All Types ▾';
+
+      // Reset time window to default
+      savedTimeWindowMin = DEFAULT_TIME_WINDOW;
+      var fTW = document.getElementById('fTimeWindow');
+      if (fTW) fTW.value = String(DEFAULT_TIME_WINDOW);
+      localStorage.removeItem('meshcore-time-window');
+
+      // Reset region filter
+      RegionFilter.setSelected([]);
+
+      // Update URL and reload
+      updatePacketsUrl();
+      loadPackets();
+    });
+    // Show clear button if page loaded with active filters (e.g. from URL params)
+    updatePacketsUrl();
+
     // Filter event listeners
     document.getElementById('fHash').value = filters.hash || '';
     document.getElementById('fHash').addEventListener('input', debounce((e) => { filters.hash = e.target.value || undefined; updatePacketsUrl(); loadPackets(); }, 300));
@@ -1117,7 +1789,10 @@
       { key: 'details', label: 'Details' },
     ];
     const isNarrow = window.innerWidth <= 640;
-    const defaultHidden = isNarrow ? ['region', 'hash', 'observer', 'path', 'rpt', 'size'] : ['region'];
+    // #1249: observer column must stay visible at narrow widths so the IATA
+    // badge (#1188) renders on mobile. Without observer in scope the user
+    // can't see who heard the packet at all.
+    const defaultHidden = isNarrow ? ['region', 'hash', 'path', 'rpt', 'size'] : ['region'];
     let visibleCols;
     try {
       visibleCols = JSON.parse(localStorage.getItem('packets-visible-cols'));
@@ -1260,7 +1935,7 @@
             const parentData = group._fetchedData;
             const obsPacket = parentData ? {...parentData.packet, observer_id: child.observer_id, observer_name: child.observer_name, snr: child.snr, rssi: child.rssi, path_json: child.path_json, resolved_path: child.resolved_path, direction: child.direction, timestamp: child.timestamp, first_seen: child.timestamp} : child;
             if (parentData) { clearParsedCache(obsPacket); }
-            selectPacket(child.id, parentHash, {packet: obsPacket, breakdown: parentData?.breakdown, observations: parentData?.observations}, child.id);
+            selectPacket(child.id, parentHash, {packet: obsPacket, observations: parentData?.observations}, child.id);
           }
         }
         else if (action === 'select-hash') pktSelectHash(value);
@@ -1279,6 +1954,12 @@
 
     renderTableRows();
     makeColumnsResizable('#pktTable', 'meshcore-pkt-col-widths');
+    // #1056: register fluid-column responsive behavior (drops priority>1 cols
+    // when narrow, shows "+N hidden" pill, reveals on click). Idempotent.
+    if (window.TableResponsive) {
+      var _pktTbl = document.getElementById('pktTable');
+      if (_pktTbl) window.TableResponsive.register(_pktTbl);
+    }
 
     // Initialize table sorting (virtual scroll — sort data array, not DOM)
     if (window.TableSort) {
@@ -1295,6 +1976,7 @@
             _packetSortDirection = direction;
             sortPacketsArray();
             renderTableRows();
+            updatePacketsUrl();
           }
         });
         // Apply initial sort state from TableSort
@@ -1327,20 +2009,23 @@
     const groupTypeName = payloadTypeName(p.payload_type);
     const groupTypeClass = payloadTypeColor(p.payload_type);
     const groupSize = p.raw_hex ? Math.floor(p.raw_hex.length / 2) : 0;
-    const groupHashBytes = ((parseInt(p.raw_hex?.slice(2, 4), 16) || 0) >> 6) + 1;
+    const _grpPlOff = getPathLenOffset(p.route_type);
+    const groupHashBytes = ((parseInt(p.raw_hex?.slice(_grpPlOff * 2, _grpPlOff * 2 + 2), 16) || 0) >> 6) + 1;
     const isSingle = p.count <= 1;
     // Channel color highlighting (#271)
     const _grpDecoded = getParsedDecoded(p) || {};
     const _grpChanStyle = window.ChannelColors ? window.ChannelColors.getRowStyle(_grpDecoded.type || groupTypeName, _grpDecoded.channel) : '';
-    let html = `<tr class="${isSingle ? '' : 'group-header'} ${isExpanded ? 'expanded' : ''}" data-hash="${p.hash}" data-action="${isSingle ? 'select-hash' : 'toggle-select'}" data-value="${p.hash}" data-entry-idx="${entryIdx}" tabindex="0" role="row"${_grpChanStyle ? ' style="' + _grpChanStyle + '"' : ''}>
-          <td style="width:28px;text-align:center;cursor:pointer">${isSingle ? '' : (isExpanded ? '▼' : '▶')}</td>
+    const _grpHashStripe = _hashStripeStyle(p.hash);
+    const _grpStyle = _grpHashStripe + _grpChanStyle;
+    let html = `<tr class="${isSingle ? '' : 'group-header'} ${isExpanded ? 'expanded' : ''}" data-hash="${p.hash}" data-action="${isSingle ? 'select-hash' : 'toggle-select'}" data-value="${p.hash}" data-entry-idx="${entryIdx}" tabindex="0" role="row"${_grpStyle ? ' style="' + _grpStyle + '"' : ''}>
+          <td class="col-expand" style="text-align:center;cursor:pointer">${isSingle ? '' : (isExpanded ? '▼' : '▶')}</td>
           <td class="col-region">${groupRegion ? `<span class="badge-region">${groupRegion}</span>` : '—'}</td>
           <td class="col-time">${renderTimestampCell(p.latest)}</td>
-          <td class="mono col-hash">${truncate(p.hash || '—', 8)}</td>
-          <td class="col-size">${groupSize ? groupSize + 'B' : '—'}</td>
+          <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(p.hash || '')}">${truncate(p.hash || '—', 8)}</td>
+          <td class="col-size" data-filter-field="size" data-filter-value="${groupSize || ''}">${groupSize ? groupSize + 'B' : '—'}</td>
           <td class="col-hashsize mono">${groupHashBytes}</td>
-          <td class="col-type">${p.payload_type != null ? `<span class="badge badge-${groupTypeClass}">${groupTypeName}</span>${transportBadge(p.route_type)}` : '—'}</td>
-          <td class="col-observer">${isSingle ? truncate(obsName(headerObserverId), 16) : truncate(obsName(headerObserverId), 10) + (p.observer_count > 1 ? ' +' + (p.observer_count - 1) : '')}</td>
+          <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(groupTypeName || '')}">${p.payload_type != null ? `<span class="badge badge-${groupTypeClass}">${groupTypeName}</span>${transportBadge(p.route_type)}` : '—'}</td>
+          <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsNameOnly(headerObserverId) || '')}">${isSingle ? truncate(obsNameOnly(headerObserverId), 16) + obsIataBadge(p) : truncate(obsNameOnly(headerObserverId), 10) + groupedObserverIataBadgesHtml(p)}</td>
           <td class="col-path"><span class="path-hops">${groupPathStr}</span></td>
           <td class="col-rpt">${p.observation_count > 1 ? '<span class="badge badge-obs" title="Seen ' + p.observation_count + ' times">👁 ' + p.observation_count + '</span>' : (isSingle ? '' : p.count)}</td>
           <td class="col-details">${getDetailPreview(getParsedDecoded(p))}</td>
@@ -1354,18 +2039,22 @@
         const typeName = payloadTypeName(c.payload_type);
         const typeClass = payloadTypeColor(c.payload_type);
         const size = c.raw_hex ? Math.floor(c.raw_hex.length / 2) : 0;
-        const childHashBytes = ((parseInt(c.raw_hex?.slice(2, 4), 16) || 0) >> 6) + 1;
-        const childRegion = c.observer_id ? (observerMap.get(c.observer_id)?.iata || '') : '';
         const childPath = getParsedPath(c);
+        const _cPlOff = getPathLenOffset(p.route_type);
+        const childHashBytes = c.raw_hex
+          ? (((parseInt(c.raw_hex.slice(_cPlOff * 2, _cPlOff * 2 + 2), 16) || 0) >> 6) + 1)
+          : (childPath.length > 0 ? childPath[0].length / 2 : 0);
+        const childRegion = c.observer_id ? (observerMap.get(c.observer_id)?.iata || '') : '';
         const childPathStr = renderPath(childPath, c.observer_id);
-        html += `<tr class="group-child" data-id="${c.id}" data-hash="${c.hash || ''}" data-action="select-observation" data-value="${c.id}" data-parent-hash="${p.hash}" data-entry-idx="${entryIdx}" tabindex="0" role="row">
-              <td></td><td class="col-region">${childRegion ? `<span class="badge-region">${childRegion}</span>` : '—'}</td>
+        const _childHashStripe = _hashStripeStyle(c.hash || p.hash);
+        html += `<tr class="group-child" data-id="${c.id}" data-hash="${c.hash || ''}" data-action="select-observation" data-value="${c.id}" data-parent-hash="${p.hash}" data-entry-idx="${entryIdx}" tabindex="0" role="row"${_childHashStripe ? ' style="' + _childHashStripe + '"' : ''}>
+              <td class="col-expand"></td><td class="col-region">${childRegion ? `<span class="badge-region">${childRegion}</span>` : '—'}</td>
               <td class="col-time">${renderTimestampCell(c.timestamp)}</td>
-              <td class="mono col-hash">${truncate(c.hash || '', 8)}</td>
-              <td class="col-size">${size}B</td>
+              <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(c.hash || '')}">${truncate(c.hash || '', 8)}</td>
+              <td class="col-size" data-filter-field="size" data-filter-value="${size || ''}">${size}B</td>
               <td class="col-hashsize mono">${childHashBytes}</td>
-              <td class="col-type"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(c.route_type)}</td>
-              <td class="col-observer">${truncate(obsName(c.observer_id), 16)}</td>
+              <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(typeName || '')}"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(c.route_type)}</td>
+              <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsNameOnly(c.observer_id) || '')}">${truncate(obsNameOnly(c.observer_id), 16)}${obsIataBadge(c)}</td>
               <td class="col-path"><span class="path-hops">${childPathStr}</span></td>
               <td class="col-rpt"></td>
               <td class="col-details">${getDetailPreview(getParsedDecoded(c))}</td>
@@ -1385,17 +2074,20 @@
     // Channel color highlighting (#271)
     const _chanStyle = window.ChannelColors ? window.ChannelColors.getRowStyle(decoded.type || typeName, decoded.channel) : '';
     const size = p.raw_hex ? Math.floor(p.raw_hex.length / 2) : 0;
-    const hashBytes = ((parseInt(p.raw_hex?.slice(2, 4), 16) || 0) >> 6) + 1;
+    const _flatPlOff = getPathLenOffset(p.route_type);
+    const hashBytes = ((parseInt(p.raw_hex?.slice(_flatPlOff * 2, _flatPlOff * 2 + 2), 16) || 0) >> 6) + 1;
     const pathStr = renderPath(pathHops, p.observer_id);
     const detail = getDetailPreview(decoded);
-    return `<tr data-id="${p.id}" data-hash="${p.hash || ''}" data-action="select-hash" data-value="${p.hash || p.id}" data-entry-idx="${entryIdx}" tabindex="0" role="row" class="${selectedId === p.id ? 'selected' : ''}"${_chanStyle ? ' style="' + _chanStyle + '"' : ''}>
-        <td></td><td class="col-region">${region ? `<span class="badge-region">${region}</span>` : '—'}</td>
+    const _flatHashStripe = _hashStripeStyle(p.hash);
+    const _flatStyle = _flatHashStripe + _chanStyle;
+    return `<tr data-id="${p.id}" data-hash="${p.hash || ''}" data-action="select-hash" data-value="${p.hash || p.id}" data-entry-idx="${entryIdx}" tabindex="0" role="row" class="${selectedId === p.id ? 'selected' : ''}"${_flatStyle ? ' style="' + _flatStyle + '"' : ''}>
+        <td class="col-expand"></td><td class="col-region">${region ? `<span class="badge-region">${region}</span>` : '—'}</td>
         <td class="col-time">${renderTimestampCell(p.timestamp)}</td>
-        <td class="mono col-hash">${truncate(p.hash || String(p.id), 8)}</td>
-        <td class="col-size">${size}B</td>
+        <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(p.hash || '')}">${truncate(p.hash || String(p.id), 8)}</td>
+        <td class="col-size" data-filter-field="size" data-filter-value="${size || ''}">${size}B</td>
         <td class="col-hashsize mono">${hashBytes}</td>
-        <td class="col-type"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(p.route_type)}</td>
-        <td class="col-observer">${truncate(obsName(p.observer_id), 16)}</td>
+        <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(typeName || '')}"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(p.route_type)}</td>
+        <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsNameOnly(p.observer_id) || '')}">${truncate(obsNameOnly(p.observer_id), 16)}${obsIataBadge(p)}</td>
         <td class="col-path"><span class="path-hops">${pathStr}</span></td>
         <td class="col-rpt"></td>
         <td class="col-details">${detail}</td>
@@ -1471,11 +2163,17 @@
     if (!topSpacer) {
       topSpacer = document.createElement('tr');
       topSpacer.id = 'vscroll-top';
+      // aria-hidden + visibility:hidden so Playwright/AT treat the sentinel as invisible
+      // while preserving its layout role (the inner <td> height drives virtual-scroll padding).
+      topSpacer.setAttribute('aria-hidden', 'true');
+      topSpacer.style.visibility = 'hidden';
       topSpacer.innerHTML = '<td colspan="' + colCount + '" style="padding:0;border:0"></td>';
     }
     if (!bottomSpacer) {
       bottomSpacer = document.createElement('tr');
       bottomSpacer.id = 'vscroll-bottom';
+      bottomSpacer.setAttribute('aria-hidden', 'true');
+      bottomSpacer.style.visibility = 'hidden';
       bottomSpacer.innerHTML = '<td colspan="' + colCount + '" style="padding:0;border:0"></td>';
     }
 
@@ -1529,6 +2227,13 @@
         }
       }
       if (window.__PERF_LOG_RENDER) console.log('[perf] renderVisibleRows: full rebuild %d entries, %.2fms', endIdx - startIdx, performance.now() - _rvr_t0);
+      _finalizePathOverflow(tbody);
+      // #1128 (Bug 1): hop-resolver mutates chip text from hex prefix to a
+      // longer node name AFTER the initial finalize pass — chips that fit at
+      // first measurement overflow once names resolve, but no `+N` pill gets
+      // appended. Cheapest correct fix: re-measure on a delayed pass, after
+      // clearing the per-host `overflowChecked` guard so the recheck runs.
+      _scheduleReFinalizePathOverflow(tbody);
       return;
     }
 
@@ -1562,6 +2267,150 @@
       bottomSpacer.insertAdjacentHTML('beforebegin', html);
     }
     if (window.__PERF_LOG_RENDER) console.log('[perf] renderVisibleRows: incremental head=%d tail=%d, %.2fms', headRowCount, tailRowCount, performance.now() - _rvr_t0);
+    _finalizePathOverflow(tbody);
+    _scheduleReFinalizePathOverflow(tbody);
+  }
+
+  // #1124 (MAJOR-1): when path chips overflow `.path-hops` (capped at 22px /
+  // overflow:hidden in CSS), append a `<span class="path-overflow-pill">+N</span>`
+  // showing how many hops are hidden. Click opens a popover listing all hops.
+  function _finalizePathOverflow(tbody) {
+    if (!tbody) return;
+    var hosts = tbody.querySelectorAll('.path-hops');
+    for (var i = 0; i < hosts.length; i++) {
+      var host = hosts[i];
+      // Skip if already finalized for this content
+      if (host.dataset.overflowChecked === '1') continue;
+      var children = Array.prototype.slice.call(host.children);
+      // Strip any leftover pill before measuring
+      var existingPill = host.querySelector('.path-overflow-pill');
+      if (existingPill) existingPill.remove();
+      var hostRight = host.getBoundingClientRect().right;
+      if (!hostRight) continue;
+      var hidden = 0;
+      // Walk pairs of chip + arrow; count chips (not arrows) whose right edge
+      // is past the host's right edge.
+      for (var j = 0; j < children.length; j++) {
+        var ch = children[j];
+        if (ch.classList.contains('arrow')) continue;
+        var r = ch.getBoundingClientRect();
+        if (r.left >= hostRight || r.right > hostRight + 0.5) hidden++;
+      }
+      if (hidden > 0) {
+        var pill = document.createElement('span');
+        pill.className = 'path-overflow-pill';
+        pill.textContent = '+' + hidden;
+        pill.title = hidden + ' more hop' + (hidden === 1 ? '' : 's') + ' — click to view';
+        pill.setAttribute('role', 'button');
+        pill.setAttribute('tabindex', '0');
+        pill.setAttribute('aria-label', hidden + ' more hops');
+        host.appendChild(pill);
+      }
+      host.dataset.overflowChecked = '1';
+    }
+  }
+
+  // #1128 (Bug 1): re-run overflow finalize after hop-resolver async pass has
+  // had a chance to mutate chip text. Per-tbody so concurrent renders in
+  // different tbodies don't cancel each other (#1131 BLOCKER-2). Uses a
+  // MutationObserver bonded to the tbody to detect when hop-resolver finishes
+  // mutating .path-hops chip text, then runs finalize once mutations settle
+  // for 50ms — replaces the previous 120ms blind timeout, which regressed on
+  // slow networks where the resolver took longer than 120ms (#1131 MAJOR-1).
+  function _scheduleReFinalizePathOverflow(tbody) {
+    if (!tbody) return;
+    // If a quiesce timer is already armed for this tbody, leave it; new
+    // mutations will keep extending it. If an observer is already wired,
+    // we're done — it'll fire again on the next mutation.
+    if (tbody._rePathOverflowObserver) return;
+    var quiesceTimer = null;
+    var stopTimer = null;
+    function finalize() {
+      if (tbody._rePathOverflowObserver) {
+        try { tbody._rePathOverflowObserver.disconnect(); } catch (_e) {}
+        tbody._rePathOverflowObserver = null;
+      }
+      if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
+      var hosts = tbody.querySelectorAll('.path-hops');
+      for (var i = 0; i < hosts.length; i++) hosts[i].dataset.overflowChecked = '';
+      _finalizePathOverflow(tbody);
+    }
+    if (typeof MutationObserver === 'function') {
+      var obs = new MutationObserver(function () {
+        if (quiesceTimer) clearTimeout(quiesceTimer);
+        quiesceTimer = setTimeout(finalize, 50);
+      });
+      obs.observe(tbody, { subtree: true, childList: true, characterData: true });
+      tbody._rePathOverflowObserver = obs;
+      // Hard upper bound — if hop-resolver never mutates (e.g. all chips
+      // already final), still run finalize once after a short delay so the
+      // overflow pill appears.
+      stopTimer = setTimeout(finalize, 1000);
+    } else {
+      // Fallback for environments without MutationObserver.
+      setTimeout(finalize, 120);
+    }
+  }
+
+  // Delegated click for path overflow pills — show popover of full path.
+  function _wirePathOverflowPopover() {
+    if (window.__pathOverflowWired) return;
+    window.__pathOverflowWired = true;
+    var existing = null;
+    function dismiss() {
+      if (existing) { existing.remove(); existing = null; }
+      document.removeEventListener('mousedown', onDoc, true);
+      document.removeEventListener('keydown', onKey, true);
+    }
+    function onDoc(ev) {
+      if (existing && !existing.contains(ev.target) && !ev.target.classList.contains('path-overflow-pill')) dismiss();
+    }
+    function onKey(ev) { if (ev.key === 'Escape') dismiss(); }
+    document.addEventListener('click', function(ev) {
+      var pill = ev.target.closest && ev.target.closest('.path-overflow-pill');
+      if (!pill) return;
+      ev.stopPropagation();
+      var host = pill.closest('.path-hops');
+      if (!host) return;
+      dismiss();
+      var pop = document.createElement('div');
+      pop.className = 'path-popover';
+      // Clone all children except the pill, preserving rendered chips/arrows.
+      var inner = '<div class="path-popover-title">Full path (' + (host.children.length) + ' items)</div><div>';
+      var kids = Array.prototype.slice.call(host.children);
+      for (var i = 0; i < kids.length; i++) {
+        if (kids[i].classList.contains('path-overflow-pill')) continue;
+        inner += kids[i].outerHTML;
+      }
+      inner += '</div>';
+      pop.innerHTML = inner;
+      document.body.appendChild(pop);
+      var r = pill.getBoundingClientRect();
+      // #1128 (Bug 2): position below by default, but flip ABOVE when there
+      // isn't enough room — keeps the popover anchored to the pill instead of
+      // hanging arbitrarily over adjacent rows / off-screen.
+      var pr0 = pop.getBoundingClientRect();
+      var popH = pr0.height;
+      var roomBelow = window.innerHeight - r.bottom;
+      var top;
+      if (roomBelow < popH + 12 && r.top > popH + 12) {
+        top = window.scrollY + r.top - popH - 4;
+      } else {
+        top = window.scrollY + r.bottom + 4;
+      }
+      var left = window.scrollX + r.left;
+      pop.style.top = top + 'px';
+      pop.style.left = left + 'px';
+      var pr = pop.getBoundingClientRect();
+      if (pr.right > window.innerWidth - 8) {
+        pop.style.left = Math.max(8, window.scrollX + window.innerWidth - pr.width - 8) + 'px';
+      }
+      existing = pop;
+      setTimeout(function() {
+        document.addEventListener('mousedown', onDoc, true);
+        document.addEventListener('keydown', onKey, true);
+      }, 0);
+    });
   }
 
   // Attach/detach scroll listener for virtual scrolling
@@ -1640,6 +2489,10 @@
     const tbody = document.getElementById('pktBody');
     if (!tbody) return;
 
+    // Preserve scroll position across re-render (#431)
+    const scrollContainer = document.getElementById('pktLeft');
+    const savedScrollTop = scrollContainer ? scrollContainer.scrollTop : 0;
+
     // Update dynamic parts of the header
     const countEl = document.querySelector('#pktLeft .count');
     const groupBtn = document.getElementById('fGroup');
@@ -1647,7 +2500,14 @@
 
     // Filter to claimed/favorited nodes — pure client-side filter (no server round-trip)
     let displayPackets = packets;
-    if (filters.myNodes) {
+
+    // When loading a specific packet by hash, bypass ALL client-side filters
+    // (myNodes, type, observer, packet-filter-expression). The user is asking
+    // for THAT exact packet — saved type/observer/expression filters must not
+    // hide it. Hash filter is the exact identifier; nothing else applies.
+    const hashOnly = !!filters.hash;
+
+    if (!hashOnly && filters.myNodes) {
       const myNodes = JSON.parse(localStorage.getItem('meshcore-my-nodes') || '[]');
       const myKeys = myNodes.map(n => n.pubkey).filter(Boolean);
       const favs = getFavorites();
@@ -1663,11 +2523,11 @@
     }
 
     // Client-side type/observer filtering
-    if (filters.type) {
+    if (!hashOnly && filters.type) {
       const types = filters.type.split(',').map(Number);
       displayPackets = displayPackets.filter(p => types.includes(p.payload_type));
     }
-    if (filters.observer) {
+    if (!hashOnly && filters.observer) {
       const obsIds = new Set(filters.observer.split(','));
       displayPackets = displayPackets.filter(p => {
         if (obsIds.has(p.observer_id)) return true;
@@ -1678,7 +2538,7 @@
 
     // Packet Filter Language
     const pfCount = document.getElementById('packetFilterCount');
-    if (filters._packetFilter) {
+    if (!hashOnly && filters._packetFilter) {
       const beforeCount = displayPackets.length;
       displayPackets = displayPackets.filter(filters._packetFilter);
       if (pfCount) {
@@ -1702,6 +2562,8 @@
       detachVScrollListener();
       const colCount = _getColCount();
       tbody.innerHTML = '<tr><td colspan="' + colCount + '" class="text-center text-muted" style="padding:24px">' + (filters.myNodes ? 'No packets from your claimed/favorited nodes' : 'No packets found') + '</td></tr>';
+      // Restore scroll position after DOM rebuild (#431)
+      if (scrollContainer) scrollContainer.scrollTop = savedScrollTop;
       return;
     }
 
@@ -1719,6 +2581,9 @@
 
     attachVScrollListener();
     renderVisibleRows();
+
+    // Restore scroll position after re-render (#431)
+    if (scrollContainer) scrollContainer.scrollTop = savedScrollTop;
   }
 
   function getDetailPreview(decoded) {
@@ -1768,8 +2633,42 @@
     }
     renderTableRows();
     const isMobileNow = window.innerWidth <= 640;
+    // #1168 review note: this branch is intentionally narrower than nodes.js /
+    // observers.js. On packets, ≤640 falls through to the legacy mobile bottom
+    // sheet (`isMobileNow` short-circuits before SlideOver), and SlideOver is
+    // used only for the 641–1023 range. nodes.js and observers.js route into
+    // SlideOver across the full ≤1023 range. Both satisfy AC#4 ("not a
+    // separate page"); the per-page split is deliberate — the packets table
+    // has heavier per-row affordances (hex breakdown, observations grid)
+    // that the bottom sheet handles better at very narrow widths than a
+    // side-anchored slide-over. Do NOT "fix" the inconsistency without
+    // discussing with the issue author.
+    const useSlideOver = !isMobileNow && window.SlideOver && window.SlideOver.shouldUse();
     let panel;
-    if (isMobileNow) {
+    if (useSlideOver) {
+      // #1056 AC#4: narrow viewports (641–1023) — open detail in slide-over
+      // overlay rather than the side panel.
+      panel = window.SlideOver.open({
+        title: hash ? ('Packet ' + String(hash).slice(0, 12)) : 'Packet detail',
+        // After close, the rows are re-rendered (see onClose). Use a resolver
+        // to look up the originating row in the post-render DOM by data-hash
+        // / data-id, so keyboard focus restores to the actual table row.
+        restoreFocus: function () {
+          const lookup = hash || id;
+          if (!lookup) return null;
+          const esc = (window.CSS && CSS.escape) ? CSS.escape(String(lookup)) : String(lookup);
+          return document.querySelector('#pktTable tbody tr[data-hash="' + esc + '"]')
+              || document.querySelector('#pktTable tbody tr[data-id="' + esc + '"]');
+        },
+        onClose: function () {
+          selectedId = null;
+          selectedObservationId = null;
+          history.replaceState(null, '', '#/packets');
+          renderTableRows();
+        }
+      });
+      panel.innerHTML = '<div class="text-center text-muted" style="padding:40px">Loading…</div>';
+    } else if (isMobileNow) {
       // Use mobile bottom sheet
       let sheet = document.getElementById('mobileDetailSheet');
       if (!sheet) {
@@ -1806,11 +2705,11 @@
         const newHops = hops.filter(h => !(h in hopNameCache));
         if (newHops.length) await resolveHops(newHops);
       } catch {}
-      panel.innerHTML = isMobileNow ? '' : '<div class="panel-resize-handle" id="pktResizeHandle"></div>' + PANEL_CLOSE_HTML;
+      panel.innerHTML = isMobileNow ? '' : (useSlideOver ? '' : ('<div class="panel-resize-handle" id="pktResizeHandle"></div>' + PANEL_CLOSE_HTML));
       const content = document.createElement('div');
       panel.appendChild(content);
       await renderDetail(content, data, selectedObservationId);
-      if (!isMobileNow) initPanelResize();
+      if (!isMobileNow && !useSlideOver) initPanelResize();
     } catch (e) {
       panel.innerHTML = `<div class="text-muted">Error: ${e.message}</div>`;
     }
@@ -1818,8 +2717,6 @@
 
   async function renderDetail(panel, data, chosenObsId) {
     const pkt = data.packet;
-    const breakdown = data.breakdown || {};
-    const ranges = breakdown.ranges || [];
     const observations = data.observations || [];
 
     // Per-observation rendering (issue #849):
@@ -1839,6 +2736,15 @@
     const effectivePkt = currentObs ? clearParsedCache({...pkt, ...currentObs, _isObservation: true}) : pkt;
     const decoded = getParsedDecoded(effectivePkt) || {};
     const pathHops = getParsedPath(effectivePkt) || [];
+
+    // Compute breakdown ranges from the actually-rendered raw_hex (per-observation).
+    // Single source of truth — derived from the same bytes we display, so a
+    // post-#882 per-obs raw_hex with a different path length than the top-level
+    // packet's raw_hex still gets accurate byte highlights.
+    const obsRawHexForRanges = effectivePkt.raw_hex || pkt.raw_hex || '';
+    const ranges = obsRawHexForRanges
+      ? computeBreakdownRanges(obsRawHexForRanges, pkt.route_type, pkt.payload_type)
+      : [];
 
     // Cross-check: hop count from raw_hex path_len byte vs path_json length
     const obsRawHex = effectivePkt.raw_hex || pkt.raw_hex || '';
@@ -1947,15 +2853,18 @@
       }
     }
 
-    // Location: from ADVERT lat/lon, or from known node via pubkey/sender name
-    let locationHtml = '—';
+    // Location: from ADVERT lat/lon, or from known node via pubkey/sender name.
+    // Issue #1281: only render the row when we actually have transmitter GPS.
+    // Non-ADVERT packets don't carry GPS in the unencrypted payload, so the row
+    // would otherwise render as "—" and waste a slot on ~90% of packet types.
+    let locationHtml = '';
     let locationNodeKey = null;
     if (decoded.lat != null && decoded.lon != null && !(decoded.lat === 0 && decoded.lon === 0)) {
       locationNodeKey = decoded.pubKey || decoded.srcPubKey || '';
       const nodeName = decoded.name || '';
       locationHtml = `${decoded.lat.toFixed(5)}, ${decoded.lon.toFixed(5)}`;
       if (nodeName) locationHtml = `${escapeHtml(nodeName)} — ${locationHtml}`;
-      if (locationNodeKey) locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" style="font-size:0.85em">📍map</a>`;
+      if (locationNodeKey) locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link">📍map</a>`;
     } else {
       // Try to resolve sender node location from nodes list
       const senderKey = decoded.pubKey || decoded.srcPubKey;
@@ -1967,7 +2876,7 @@
             locationNodeKey = nodeData.node.public_key;
             locationHtml = `${nodeData.node.lat.toFixed(5)}, ${nodeData.node.lon.toFixed(5)}`;
             if (nodeData.node.name) locationHtml = `${escapeHtml(nodeData.node.name)} — ${locationHtml}`;
-            locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" style="font-size:0.85em">📍map</a>`;
+            locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link">📍map</a>`;
           } else if (senderName && !senderKey) {
             // Search by name
             const searchData = await api(`/nodes/search?q=${encodeURIComponent(senderName)}`, { ttl: 30000 }).catch(() => null);
@@ -1976,7 +2885,7 @@
               locationNodeKey = match.public_key;
               locationHtml = `${match.lat.toFixed(5)}, ${match.lon.toFixed(5)}`;
               locationHtml = `${escapeHtml(match.name)} — ${locationHtml}`;
-              locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" style="font-size:0.85em">📍map</a>`;
+              locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link">📍map</a>`;
             }
           }
         } catch {}
@@ -1995,21 +2904,60 @@
       ? `<span style="font-size:0.8em;color:var(--text-muted);margin-left:6px">(observation ${observations.indexOf(currentObs) + 1} of ${observations.length})</span>`
       : '';
 
+    // #1279 P2 #3 — Transport codes detail row (firmware/src/Packet.h:46,
+    // parsed at cmd/server/decoder.go:492-498). Present on TRANSPORT_FLOOD/
+    // TRANSPORT_DIRECT routes only.
+    var tcCode1 = '—', tcCode2 = '—', tcShow = false;
+    if (decoded.transportCodes) {
+      tcShow = true;
+      if (decoded.transportCodes.code1) tcCode1 = String(decoded.transportCodes.code1).toUpperCase();
+      if (decoded.transportCodes.code2) tcCode2 = String(decoded.transportCodes.code2).toUpperCase();
+    }
+    var transportCodesRow = tcShow
+      ? `<dt>Transport Codes</dt><dd class="transport-codes">Code1: <code>${escapeHtml(tcCode1)}</code> · Code2: <code>${escapeHtml(tcCode2)}</code></dd>`
+      : '';
+
+    // #1279 P2 #5 — RAW_CUSTOM detail row (firmware/src/Mesh.cpp:577).
+    var rawCustomRow = '';
+    if (pkt.payload_type === 15 && decoded.type === 'RAW_CUSTOM') {
+      var rl = decoded.rawLength != null ? decoded.rawLength + ' byte' + (decoded.rawLength === 1 ? '' : 's') : '—';
+      var ft = decoded.firstByteTag ? String(decoded.firstByteTag).toUpperCase() : '—';
+      rawCustomRow = `<dt>Raw Custom</dt><dd class="raw-custom-detail">Length: <code>${escapeHtml(rl)}</code> · First byte tag: <code>${escapeHtml(ft)}</code></dd>`;
+    }
+
+    // #1458 P0-A — semantic identity header (type badge + decoded summary +
+    // src→dst). Replaces the prior byte-count title that buried packet
+    // identity behind a byte counter (#1458 P0-A).
+    const semanticSummary = getDetailPreview(decoded);
+    const srcLabel = decoded.sender || decoded.name || (decoded.srcHash ? decoded.srcHash.slice(0,8) : null) || (decoded.pubKey ? decoded.pubKey.slice(0,8) + '…' : null);
+    const dstLabel = decoded.recipient || (decoded.destHash ? decoded.destHash.slice(0,8) : null);
+    const srcDstHtml = (srcLabel || dstLabel)
+      ? `<div class="detail-srcdst">${escapeHtml(srcLabel || '?')} <span class="arrow">→</span> ${escapeHtml(dstLabel || (decoded.channel ? '#' + decoded.channel : '?'))}</div>`
+      : '';
+
     panel.innerHTML = `
       ${anomalyBanner}
-      <div class="detail-title">${hasRawHex ? `Packet Byte Breakdown (${size} bytes)` : typeName + ' Packet'}</div>
+      <div class="detail-title">
+        <span class="badge badge-${payloadTypeColor(pkt.payload_type)}">${typeName}</span>
+        ${semanticSummary ? `<span class="detail-summary">${semanticSummary}</span>` : ''}
+        ${displayHopCount > 0 ? `<span class="badge badge-info">${displayHopCount} hop${displayHopCount !== 1 ? 's' : ''}</span>` : ''}
+      </div>
+      ${srcDstHtml}
       <div class="detail-hash">${pkt.hash || 'Packet #' + pkt.id}${obsIndicator}</div>
       ${messageHtml}
       <dl class="detail-meta">
-        <dt>Observer</dt><dd>${obsName(effectivePkt.observer_id)}</dd>
-        <dt>Location</dt><dd>${locationHtml}</dd>
+        <dt>Payload Type</dt><dd><span class="badge badge-${payloadTypeColor(pkt.payload_type)}">${typeName}</span></dd>
+        <dt>Path</dt><dd>${displayHopCount > 0 ? `<span class="badge badge-info">${displayHopCount} hop${displayHopCount !== 1 ? 's' : ''}</span> ` + renderPath(pathHops, effectivePkt.observer_id) : '— (direct)'}</dd>
+        <dt>Timestamp</dt><dd>${renderTimestampCell(effectivePkt.timestamp)}</dd>
+        <dt>Observer</dt><dd>${obsNameOnly(effectivePkt.observer_id)}${obsIataBadge(effectivePkt)}</dd>
+        ${locationHtml ? `<dt>Location</dt><dd>${locationHtml}</dd>` : ''}
         <dt>SNR / RSSI</dt><dd>${snr != null ? snr + ' dB' : '—'} / ${rssi != null ? rssi + ' dBm' : '—'}</dd>
         <dt>Route Type</dt><dd>${routeTypeName(pkt.route_type)}</dd>
-        <dt>Payload Type</dt><dd><span class="badge badge-${payloadTypeColor(pkt.payload_type)}">${typeName}</span></dd>
+        ${pkt.scope_name != null ? `<dt>Scope</dt><dd>${pkt.scope_name !== '' ? escapeHtml(pkt.scope_name) : '<span style="color:var(--text-muted)">unknown scope</span>'}</dd>` : ''}
         ${hashSize ? `<dt>Hash Size</dt><dd>${hashSize} byte${hashSize !== 1 ? 's' : ''}</dd>` : ''}
-        <dt>Timestamp</dt><dd>${renderTimestampCell(effectivePkt.timestamp)}</dd>
         <dt>Propagation</dt><dd>${propagationHtml}</dd>
-        <dt>Path</dt><dd>${displayHopCount > 0 ? `<span class="badge badge-info">${displayHopCount} hop${displayHopCount !== 1 ? 's' : ''}</span> ` + renderPath(pathHops, effectivePkt.observer_id) : '— (direct)'}</dd>
+        ${transportCodesRow}
+        ${rawCustomRow}
         ${effectivePkt.direction ? `<dt>Direction</dt><dd>${escapeHtml(effectivePkt.direction)}</dd>` : ''}
       </dl>
       <div class="detail-actions">
@@ -2019,10 +2967,13 @@
         <button class="replay-live-btn" title="Replay this packet on the live map">▶ Replay</button>
       </div>
 
-      ${hasRawHex ? `<div class="hex-legend">${buildHexLegend(ranges)}</div>
-      <div class="hex-dump">${createColoredHexDump(effectivePkt.raw_hex || pkt.raw_hex, ranges)}</div>` : ''}
+      ${(hasRawHex || Object.keys(decoded).length) ? `<details class="detail-technical"${(typeof window !== 'undefined' && window.innerWidth > 480) ? ' open' : ''}>
+        <summary>Show raw bytes</summary>
+        ${hasRawHex ? `<div class="hex-legend">${buildHexLegend(ranges)}</div>
+        <div class="hex-dump">${createColoredHexDump(effectivePkt.raw_hex || pkt.raw_hex, ranges)}</div>` : ''}
 
-      ${hasRawHex ? buildFieldTable(effectivePkt.raw_hex ? effectivePkt : pkt, decoded, pathHops, ranges) : buildDecodedTable(decoded)}
+        ${hasRawHex ? buildFieldTable(effectivePkt.raw_hex ? effectivePkt : pkt, decoded, pathHops, ranges) : buildDecodedTable(decoded)}
+      </details>` : ''}
 
       ${observations.length > 1 ? `
       <div class="detail-observations" style="margin-top:16px">
@@ -2039,7 +2990,7 @@
             const oPath = getParsedPath(o);
             const isCurrent = currentObs && String(o.id) === String(currentObs.id);
             return `<tr class="detail-obs-row${isCurrent ? ' observation-current' : ''}" data-obs-id="${o.id}" style="cursor:pointer;${isCurrent ? 'background:var(--accent-bg, rgba(0,122,255,0.1))' : ''}" title="Click to view this observation">
-              <td style="padding:4px 6px">${obsName(o.observer_id)}</td>
+              <td style="padding:4px 6px">${obsNameOnly(o.observer_id)}${obsIataBadge(o)}</td>
               <td style="padding:4px 6px">${oPath.length}</td>
               <td style="padding:4px 6px">${o.snr != null ? o.snr + ' dB' : '—'}</td>
               <td style="padding:4px 6px">${o.rssi != null ? o.rssi + ' dBm' : '—'}</td>
@@ -2148,11 +3099,44 @@
           else if (decoded.srcHash) origin.pubkey = decoded.srcHash;
           if (decoded.adName || decoded.name) origin.name = decoded.adName || decoded.name;
           if (senderLat != null && senderLon != null) { origin.lat = senderLat; origin.lon = senderLon; }
-          sessionStorage.setItem('map-route-hops', JSON.stringify({
-            origin: origin,
-            hops: resolvedKeys
-          }));
-          window.location.hash = '#/map?route=1';
+          // #1418 Phase D: also include the recipient (destHash) so the route
+          // displays as: sender → [intermediate hops] → recipient. Without
+          // this the destination node is invisible — operator only sees the
+          // last intermediate repeater.
+          const destination = {};
+          if (decoded.destHash) destination.pubkey = decoded.destHash;
+          // #1418 Phase C: include ALL observations as alternate paths so the
+          // route view can render union-of-edges with stroke-width weighting.
+          // Each observation contributes its own path_json array.
+          const allPaths = (observations || []).map(o => {
+            let path = [];
+            try { path = JSON.parse(o.path_json || '[]'); } catch (_) {}
+            return { path: path, observer: o.observer_name, observer_id: o.observer_id, snr: o.snr, rssi: o.rssi };
+          }).filter(p => p.path && p.path.length > 0);
+          // #1418/#1419: navigate via deep-link URL only. The map page's
+          // loadRouteFromDeepLink() re-fetches the packet from the API and
+          // builds the full payload (incl. packetContext) consistently.
+          // SessionStorage was unreliable — the deep-link path includes
+          // packetContext but the sessionStorage payload didn't, leading
+          // to missing chip + facts when entered from the packets page.
+          const obsId = currentObs ? currentObs.id : (observations[0] && observations[0].id);
+          const pkHash = pkt.hash || pkt.packet_hash;
+          const obsPart = obsId ? '&obs=' + encodeURIComponent(obsId) : '';
+          // Tufte audit fix: close ALL mobile packet panels so operator lands
+          // on the route view, not behind a still-visible detail sheet.
+          // Three different panels exist depending on viewport + flow:
+          //   - #pktRight (desktop split-pane)
+          //   - .slide-over-panel (mid-width SlideOver)
+          //   - #mobileDetailSheet (small-mobile bottom sheet)
+          if (window.innerWidth <= 767) {
+            try { closeDetailPanel(); } catch (_) {}
+            try { if (window.SlideOver && window.SlideOver.close) window.SlideOver.close(); } catch (_) {}
+            try {
+              const sheet = document.getElementById('mobileDetailSheet');
+              if (sheet) sheet.classList.remove('open');
+            } catch (_) {}
+          }
+          window.location.hash = '#/map?packet=' + encodeURIComponent(pkHash) + obsPart;
         } catch {
           window.location.hash = '#/map';
         }
@@ -2210,6 +3194,16 @@
       off += hashSize * pathHops.length;
     }
 
+    // TRACE SNR values (from header path bytes, decoded by backend)
+    if (decoded.type === 'TRACE' && decoded.snrValues && decoded.snrValues.length > 0) {
+      rows += sectionRow('SNR Path (' + decoded.snrValues.length + ' hops completed)', 'section-path');
+      for (let i = 0; i < decoded.snrValues.length; i++) {
+        const snr = decoded.snrValues[i];
+        const snrStr = (snr >= 0 ? '+' : '') + snr.toFixed(2) + ' dB';
+        rows += fieldRow('', 'SNR (hop ' + i + ')', snrStr, '');
+      }
+    }
+
     // Payload
     rows += sectionRow('Payload — ' + payloadTypeName(pkt.payload_type), 'section-payload');
 
@@ -2246,6 +3240,13 @@
       if (decoded.sender_timestamp) rows += fieldRow(off + 2, 'Sender Time', decoded.sender_timestamp, '');
     } else if (decoded.type === 'ACK') {
       rows += fieldRow(off, 'Checksum (4B)', decoded.ackChecksum || '', '');
+    } else if (decoded.type === 'TRACE') {
+      rows += fieldRow(off, 'Trace Tag (4B)', decoded.tag ? '0x' + decoded.tag.toString(16).toUpperCase().padStart(8, '0') : '—', '');
+      rows += fieldRow(off + 4, 'Auth Code (4B)', decoded.authCode ? '0x' + decoded.authCode.toString(16).toUpperCase().padStart(8, '0') : '—', '');
+      rows += fieldRow(off + 8, 'Flags', decoded.traceFlags != null ? '0x' + decoded.traceFlags.toString(16).padStart(2, '0') : '—', decoded.traceFlags != null ? 'hash_size=' + (1 << (decoded.traceFlags & 0x03)) + ' byte(s)' : '');
+      if (decoded.pathData) {
+        rows += fieldRow(off + 9, 'Route Hops', decoded.pathData.toUpperCase(), pathHops.length + ' hop(s)');
+      }
     } else if (decoded.destHash !== undefined) {
       rows += fieldRow(off, 'Dest Hash (1B)', decoded.destHash || '', '');
       rows += fieldRow(off + 1, 'Src Hash (1B)', decoded.srcHash || '', '');
@@ -2481,7 +3482,7 @@
       renderTableRows();
       return;
     }
-    // Single fetch — gets packet + observations + path + breakdown
+    // Single fetch — gets packet + observations + path
     try {
       const data = await api(`/packets/${hash}`);
       const pkt = data.packet;
@@ -2515,12 +3516,22 @@
     } catch {}
   }
 
+  let _lastColorByHash = _isColorByHash();
+  function _onStorageChange() {
+    var current = _isColorByHash();
+    if (_lastColorByHash !== current) {
+      _lastColorByHash = current;
+      renderVisibleRows();
+    }
+  }
+
   let _themeRefreshHandler = null;
 
   registerPage('packets', {
     init: function(app, routeParam) {
       _themeRefreshHandler = () => { if (typeof renderTableRows === 'function') renderTableRows(); };
       window.addEventListener('theme-refresh', _themeRefreshHandler);
+      window.addEventListener('storage', _onStorageChange);
       var result = init(app, routeParam);
       // Install channel color picker on packets table (M2, #271)
       if (window.ChannelColorPicker) window.ChannelColorPicker.installPacketsTable();
@@ -2528,6 +3539,7 @@
     },
     destroy: function() {
       if (_themeRefreshHandler) { window.removeEventListener('theme-refresh', _themeRefreshHandler); _themeRefreshHandler = null; }
+      window.removeEventListener('storage', _onStorageChange);
       return destroy();
     }
   });
@@ -2556,6 +3568,10 @@
       buildGroupRowHtml,
       buildFlatRowHtml,
       _calcVisibleRange,
+      buildPacketsParams,
+      renderTableRows,
+      _setPackets: function(p) { packets = p; },
+      _setFilter: function(k, v) { filters[k] = v; },
     };
   }
 

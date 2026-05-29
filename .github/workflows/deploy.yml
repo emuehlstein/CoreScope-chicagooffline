@@ -3,405 +3,22 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [master]
-    tags: ['v*']
-  pull_request:
-    branches: [master]
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
   packages: write
 
-concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  STAGING_COMPOSE_FILE: docker-compose.staging.yml
-  STAGING_SERVICE: staging-go
-  STAGING_CONTAINER: corescope-staging-go
-
-# Pipeline (sequential, fail-fast):
-#   go-test → e2e-test → build-and-publish → deploy → publish-badges
-#   PRs stop after build-and-publish (no GHCR push). Master continues to deploy + badges.
-
 jobs:
-  # ───────────────────────────────────────────────────────────────
-  # 1. Go Build & Test
-  # ───────────────────────────────────────────────────────────────
-  go-test:
-    name: "✅ Go Build & Test"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Clean Go module cache
-        run: rm -rf ~/go/pkg/mod 2>/dev/null || true
-
-      - name: Set up Go 1.22
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.22'
-          cache-dependency-path: |
-            cmd/server/go.sum
-            cmd/ingestor/go.sum
-
-      - name: Build and test Go server (with coverage)
-        run: |
-          set -e -o pipefail
-          cd cmd/server
-          go build .
-          # -race gates PR #1208's atomic.Pointer migration: the race-detector
-          # is what makes path_inspect_atomic_race_test.go actually assert.
-          go test -race -coverprofile=server-coverage.out ./... 2>&1 | tee server-test.log
-          echo "--- Go Server Coverage ---"
-          go tool cover -func=server-coverage.out | tail -1
-
-      - name: Build and test Go ingestor (with coverage)
-        run: |
-          set -e -o pipefail
-          cd cmd/ingestor
-          go build .
-          go test -coverprofile=ingestor-coverage.out ./... 2>&1 | tee ingestor-test.log
-          echo "--- Go Ingestor Coverage ---"
-          go tool cover -func=ingestor-coverage.out | tail -1
-
-      - name: Build and test channel library + decrypt CLI
-        run: |
-          set -e -o pipefail
-          cd internal/channel
-          go test ./...
-          echo "--- Channel library tests passed ---"
-          cd ../../cmd/decrypt
-          CGO_ENABLED=0 go build -ldflags="-s -w" -o corescope-decrypt .
-          go test ./...
-          echo "--- Decrypt CLI tests passed ---"
-
-      - name: Verify Dockerfile COPY invariants (issue #1316)
-        run: bash scripts/check-dockerfile-internal-pkgs.sh
-
-      - name: Lint CSS variables (issue #1128)
-        run: |
-          set -e
-          node scripts/check-css-vars.js
-          node scripts/test-check-css-vars.js
-
-      - name: Run JS unit tests (packet-filter)
-        run: |
-          set -e
-          node test-packet-filter.js
-          node test-packet-filter-time.js
-          node test-channel-decrypt-insecure-context.js
-          node test-live-region-filter.js
-          node test-issue-1136-observer-iata-map.js
-          node test-channel-qr.js
-          node test-channel-qr-wiring.js
-          node test-channel-modal-ux.js
-          node test-channel-issue-1087.js
-          node test-issue-1409-no-encrypted-flood.js
-          node test-channel-issue-1101.js
-          node test-observer-iata-1188.js
-          node test-pull-to-reconnect-1091.js
-          node test-channel-fluid-layout.js
-          node test-issue-1279-p2-code-filter.js
-          node test-area-filter.js
-          node test-issue-1293-marker-shapes.js
-          node test-issue-1356-map-a11y.js
-          node test-issue-1360-pill-letter-count.js
-          node test-issue-1364-pill-no-clamp.js
-          node test-issue-1375-scope-stats-fetch.js
-          node test-issue-1361-cb-presets.js
-          node test-issue-1407-cb-preset-propagation.js
-          node test-issue-1412-customizer-no-override.js
-          node test-issue-1418-raw-hex-extraction.js
-          node test-issue-1418-edge-weights.js
-          node test-issue-1418-cb-preset-ramp.js
-          node test-issue-1418-spider-fan.js
-          node test-issue-1418-deeplink-hops-channels.js
-          node test-issue-1418-polish-review.js
-          node test-issue-1420-tile-providers.js
-          node test-issue-1438-marker-css-vars.js
-          node test-live.js
-
-      - name: 🧹 Frontend lint (eslint no-undef) — issue #1342
-        run: |
-          set -e
-          # Use eslint@8 (legacy .eslintrc.json). Don't migrate to flat-config / eslint@9.
-          # --no-save: avoid touching package.json / no committed node_modules.
-          npm install --no-save --no-audit --no-fund eslint@8
-          npx eslint public/*.js
-
-      - name: Verify proto syntax
-        run: |
-          set -e
-          sudo apt-get update -qq
-          sudo apt-get install -y protobuf-compiler
-          for proto in proto/*.proto; do
-            echo "  ✓ $(basename "$proto")"
-            protoc --proto_path=proto --descriptor_set_out=/dev/null "$proto"
-          done
-          echo "✅ All .proto files are syntactically valid"
-
-      - name: Generate Go coverage badges
-        if: success()
-        run: |
-          mkdir -p .badges
-
-          SERVER_COV="0"
-          if [ -f cmd/server/server-coverage.out ]; then
-            SERVER_COV=$(cd cmd/server && go tool cover -func=server-coverage.out | tail -1 | grep -oP '[\d.]+(?=%)')
-          fi
-          SERVER_COLOR="red"
-          if [ "$(echo "$SERVER_COV >= 80" | bc -l 2>/dev/null)" = "1" ]; then SERVER_COLOR="green"
-          elif [ "$(echo "$SERVER_COV >= 60" | bc -l 2>/dev/null)" = "1" ]; then SERVER_COLOR="yellow"; fi
-          echo "{\"schemaVersion\":1,\"label\":\"go server coverage\",\"message\":\"${SERVER_COV}%\",\"color\":\"${SERVER_COLOR}\"}" > .badges/go-server-coverage.json
-
-          INGESTOR_COV="0"
-          if [ -f cmd/ingestor/ingestor-coverage.out ]; then
-            INGESTOR_COV=$(cd cmd/ingestor && go tool cover -func=ingestor-coverage.out | tail -1 | grep -oP '[\d.]+(?=%)')
-          fi
-          INGESTOR_COLOR="red"
-          if [ "$(echo "$INGESTOR_COV >= 80" | bc -l 2>/dev/null)" = "1" ]; then INGESTOR_COLOR="green"
-          elif [ "$(echo "$INGESTOR_COV >= 60" | bc -l 2>/dev/null)" = "1" ]; then INGESTOR_COLOR="yellow"; fi
-          echo "{\"schemaVersion\":1,\"label\":\"go ingestor coverage\",\"message\":\"${INGESTOR_COV}%\",\"color\":\"${INGESTOR_COLOR}\"}" > .badges/go-ingestor-coverage.json
-
-          echo "## Go Coverage" >> $GITHUB_STEP_SUMMARY
-          echo "| Module | Coverage |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|----------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Server | ${SERVER_COV}% |" >> $GITHUB_STEP_SUMMARY
-          echo "| Ingestor | ${INGESTOR_COV}% |" >> $GITHUB_STEP_SUMMARY
-
-      - name: Upload Go coverage badges
-        if: success()
-        uses: actions/upload-artifact@v6
-        with:
-          name: go-badges
-          path: .badges/go-*.json
-          retention-days: 1
-          if-no-files-found: ignore
-          include-hidden-files: true
-
-  # ───────────────────────────────────────────────────────────────
-  # 2. Playwright E2E Tests (against Go server with fixture DB)
-  # ───────────────────────────────────────────────────────────────
-  e2e-test:
-    name: "🎭 Playwright E2E Tests"
-    needs: [go-test]
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Set up Node.js 22
-        uses: actions/setup-node@v5
-        with:
-          node-version: '22'
-
-      - name: Clean Go module cache
-        run: rm -rf ~/go/pkg/mod 2>/dev/null || true
-
-      - name: Set up Go 1.22
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.22'
-          cache-dependency-path: cmd/server/go.sum
-
-      - name: Build Go server
-        run: |
-          cd cmd/server
-          go build -o ../../corescope-server .
-          echo "Go server built successfully"
-
-      - name: Build Go migrate tool
-        run: |
-          cd cmd/migrate
-          go build -o ../../corescope-migrate .
-          echo "Go migrate tool built successfully"
-
-      - name: Install npm dependencies
-        run: npm ci --production=false
-
-      - name: Install Playwright browser
-        run: |
-          npx playwright install chromium 2>/dev/null || true
-          npx playwright install-deps chromium 2>/dev/null || true
-
-      - name: Instrument frontend JS for coverage
-        run: sh scripts/instrument-frontend.sh
-
-      - name: Freshen fixture timestamps
-        run: bash tools/freshen-fixture.sh test-fixtures/e2e-fixture.db
-
-      - name: Migrate fixture DB to current schema (#1287)
-        # Server now ASSERTs schema is migrated and refuses to start
-        # otherwise (cmd/server/main.go: dbschema.AssertReady). In prod
-        # the ingestor owns dbschema.Apply, but CI starts only the
-        # server against the committed e2e fixture — so we run the
-        # standalone migrate tool here to bring the fixture up to the
-        # required shape before the server boots.
-        run: ./corescope-migrate -db test-fixtures/e2e-fixture.db
-
-      - name: Start Go server with fixture DB
-        run: |
-          fuser -k 13581/tcp 2>/dev/null || true
-          sleep 1
-          ./corescope-server -port 13581 -db test-fixtures/e2e-fixture.db -public public-instrumented &
-          echo $! > .server.pid
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:13581/api/healthz > /dev/null 2>&1; then
-              echo "Server ready after ${i}s"
-              break
-            fi
-            if [ "$i" -eq 30 ]; then
-              echo "Server failed to start within 30s"
-              exit 1
-            fi
-            sleep 1
-          done
-
-      - name: Run Playwright E2E tests (fail-fast)
-        run: |
-          BASE_URL=http://localhost:13581 node test-e2e-playwright.js 2>&1 | tee e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-filter-ux-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-channel-issue-1087-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-channel-issue-1111-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-map-modal-fluid-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-observer-iata-1188-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-fluid-1055-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-priority-1102-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-priority-1311-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-priority-1391-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1413-nav-overlap-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1400-nav-vertical-clip.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-more-floor-1139-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-bottom-nav-1061-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-gestures-1062-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-gestures-1185-scroll-discriminator-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-gesture-hints-1065-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-touch-gestures-coverage-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-channel-fluid-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-table-fluid-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-charts-fluid-1058-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-slideover-1056-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-slideover-1168-munger-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-logo-pulse-1173-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1122-packets-filter-ux-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1128-packets-layout-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1128-multi-viewport-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1136-live-region-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1150-404-state-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1146-path-link-contrast-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1147-section-order-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1151-orphan-separators-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-logo-rebrand-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-logo-theme-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-logo-default-sage-teal-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1109-hamburger-dropdown-visible-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-live-layout-1178-1179-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1205-live-controls-anchor-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-live-mql-leak-1180-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1204-live-panel-structure-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1234-live-chrome-pass2-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1206-vcr-overlap-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1244-live-vcr-row-hints-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1224-channels-mobile-ux-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1367-channels-chat-app-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1236-map-mobile-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1329-map-controls-accordion-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1273-qr-overlay-height-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1281-location-row-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-issue-1279-legend-p2-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-home-coverage-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-path-inspector-coverage-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1206-resize-observer-leak-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-nav-drawer-1064-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-audio-live-1297-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-audio-lab-1297-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-channel-decrypt-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-channel-qr-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-channel-color-picker-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-customize-theme-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-customize-branding-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-customize-display-e2e.js 2>&1 | tee -a e2e-output.txt
-          BASE_URL=http://localhost:13581 node test-customize-export-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-drag-manager-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1306-collisions-terminology-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1374-route-map-a11y-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-channels-list-render-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-channels-selection-flow-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-channels-add-modal-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-channels-share-color-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-channels-ws-batch-e2e.js 2>&1 | tee -a e2e-output.txt
-
-      - name: Collect frontend coverage (parallel)
-        if: success() && github.event_name == 'push'
-        run: |
-          BASE_URL=http://localhost:13581 node scripts/collect-frontend-coverage.js 2>&1 | tee fe-coverage-output.txt || true
-
-      - name: Generate frontend coverage badges
-        if: success()
-        run: |
-          # Aggregate per-suite PASS/FAIL across every test-*-e2e.js summary.
-          # The previous regex (grep -oP '[0-9]+(?=/)' | tail -1) caught a
-          # stray digits-before-slash like the '2' in '2/3 tests passed' from
-          # some sub-output and stamped the badge as '2 passed'. See #1296.
-          eval "$(bash scripts/aggregate-e2e-pass.sh e2e-output.txt)"
-          E2E_PASS=${PASS:-0}
-          E2E_FAIL=${FAIL:-0}
-
-          mkdir -p .badges
-          if [ -f .nyc_output/frontend-coverage.json ] || [ -f .nyc_output/e2e-coverage.json ]; then
-            npx nyc report --reporter=text-summary --reporter=text 2>&1 | tee fe-report.txt
-            FE_COVERAGE=$(grep 'Statements' fe-report.txt | head -1 | grep -oP '[\d.]+(?=%)' || echo "0")
-            FE_COVERAGE=${FE_COVERAGE:-0}
-            FE_COLOR="red"
-            [ "$(echo "$FE_COVERAGE > 50" | bc -l 2>/dev/null)" = "1" ] && FE_COLOR="yellow"
-            [ "$(echo "$FE_COVERAGE > 80" | bc -l 2>/dev/null)" = "1" ] && FE_COLOR="brightgreen"
-            echo "{\"schemaVersion\":1,\"label\":\"frontend coverage\",\"message\":\"${FE_COVERAGE}%\",\"color\":\"${FE_COLOR}\"}" > .badges/frontend-coverage.json
-            echo "## Frontend: ${FE_COVERAGE}% coverage" >> $GITHUB_STEP_SUMMARY
-          fi
-          if [ "${E2E_FAIL:-0}" -gt 0 ]; then
-            E2E_MSG="${E2E_PASS:-0} passed, ${E2E_FAIL} failed"
-            E2E_COLOR="red"
-          else
-            E2E_MSG="${E2E_PASS:-0} passed"
-            E2E_COLOR="brightgreen"
-          fi
-          echo "{\"schemaVersion\":1,\"label\":\"e2e tests\",\"message\":\"${E2E_MSG}\",\"color\":\"${E2E_COLOR}\"}" > .badges/e2e-tests.json
-
-      - name: Stop test server
-        if: always()
-        run: |
-          if [ -f .server.pid ]; then
-            kill $(cat .server.pid) 2>/dev/null || true
-            rm -f .server.pid
-          fi
-
-      - name: Upload E2E badges
-        if: success()
-        uses: actions/upload-artifact@v6
-        with:
-          name: e2e-badges
-          path: .badges/
-          retention-days: 1
-          if-no-files-found: ignore
-          include-hidden-files: true
-
-  # ───────────────────────────────────────────────────────────────
-  # 3. Build & Publish Docker Image
-  # ───────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────
+  # 1. Build & Push Docker image to GHCR
+  # ─────────────────────────────────────────────────────────────
   build-and-publish:
     name: "🏗️ Build & Publish Docker Image"
-    needs: [e2e-test]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -420,26 +37,14 @@ jobs:
           echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
           echo "git_commit=$GIT_COMMIT" >> "$GITHUB_OUTPUT"
           echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Build: version=$APP_VERSION commit=$GIT_COMMIT time=$BUILD_TIME"
-
-      - name: Build Go Docker image (local staging)
-        run: |
-          GIT_COMMIT="${{ steps.meta.outputs.git_commit }}" \
-          APP_VERSION="${{ steps.meta.outputs.app_version }}" \
-          BUILD_TIME="${{ steps.meta.outputs.build_time }}" \
-          docker compose -f "$STAGING_COMPOSE_FILE" -p corescope-staging build "$STAGING_SERVICE"
-          echo "Built Go staging image ✅"
 
       - name: Set up Docker Buildx
-        if: github.event_name == 'push'
         uses: docker/setup-buildx-action@v3
 
-      - name: Set up QEMU (arm64 runtime stage)
-        if: github.event_name == 'push'
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -447,7 +52,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract Docker metadata
-        if: github.event_name == 'push'
         id: docker-meta
         uses: docker/metadata-action@v5
         with:
@@ -455,12 +59,10 @@ jobs:
           tags: |
             type=semver,pattern=v{{version}}
             type=semver,pattern=v{{major}}.{{minor}}
-            type=semver,pattern=v{{major}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=edge,branch=master
 
       - name: Build and push to GHCR
-        if: github.event_name == 'push'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -475,191 +77,23 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ───────────────────────────────────────────────────────────────
-  # 4. Release Artifacts (tags only)
-  # ───────────────────────────────────────────────────────────────
-  release-artifacts:
-    name: "📦 Release Artifacts"
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [go-test]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-
-      - name: Set up Go 1.22
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.22'
-
-      - name: Build corescope-decrypt (static, linux/amd64)
-        run: |
-          cd cmd/decrypt
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o ../../corescope-decrypt-linux-amd64 .
-
-      - name: Build corescope-decrypt (static, linux/arm64)
-        run: |
-          cd cmd/decrypt
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o ../../corescope-decrypt-linux-arm64 .
-
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            corescope-decrypt-linux-amd64
-            corescope-decrypt-linux-arm64
-
-  # ───────────────────────────────────────────────────────────────
-  # 4b. Deploy Staging (master only)
-  # ───────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────
+  # 2. Deploy to dev EC2
+  # ─────────────────────────────────────────────────────────────
   deploy:
-    name: "🚀 Deploy Staging"
-    if: |
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-      && github.ref == 'refs/heads/master'
+    name: "🚀 Deploy to Dev"
     needs: [build-and-publish]
-    runs-on: [self-hosted, meshcore-runner-2]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-
-      - name: Pull latest image from GHCR
-        run: |
-          # Try to pull the edge image from GHCR and tag for docker-compose compatibility
-          if docker pull ghcr.io/emuehlstein/corescope-chicagooffline:edge; then
-            docker tag ghcr.io/emuehlstein/corescope-chicagooffline:edge corescope-go:latest
-            echo "Pulled and tagged GHCR edge image ✅"
-          else
-            echo "⚠️ GHCR pull failed — falling back to locally built image"
-          fi
-
-      - name: Deploy staging
-        run: |
-          # Force-remove the staging container regardless of how it was created
-          # (compose-managed OR manually created via docker run)
-          docker stop corescope-staging-go 2>/dev/null || true
-          docker rm -f corescope-staging-go 2>/dev/null || true
-          docker compose -f "$STAGING_COMPOSE_FILE" -p corescope-staging down --timeout 30 2>/dev/null || true
-
-          # Wait for container to be fully gone and OS to reclaim memory (3GB limit)
-          for i in $(seq 1 15); do
-            if ! docker ps -a --format '{{.Names}}' | grep -q 'corescope-staging-go'; then
-              break
-            fi
-            sleep 1
-          done
-          sleep 5  # extra pause for OS memory reclaim
-
-          # Ensure staging data dir exists (config.json lives here, no separate file mount)
-          STAGING_DATA="${STAGING_DATA_DIR:-$HOME/meshcore-staging-data}"
-          mkdir -p "$STAGING_DATA"
-
-          # If no config exists, copy the example (CI doesn't have a real prod config)
-          if [ ! -f "$STAGING_DATA/config.json" ]; then
-            echo "Staging config missing — copying config.example.json"
-            cp config.example.json "$STAGING_DATA/config.json" 2>/dev/null || true
-          fi
-
-          docker compose -f "$STAGING_COMPOSE_FILE" -p corescope-staging up -d staging-go
-
-      - name: Healthcheck staging container
-        run: |
-          for i in $(seq 1 120); do
-            HEALTH=$(docker inspect corescope-staging-go --format '{{.State.Health.Status}}' 2>/dev/null || echo "starting")
-            if [ "$HEALTH" = "healthy" ]; then
-              echo "Staging healthy after ${i}s"
-              break
-            fi
-            if [ "$i" -eq 120 ]; then
-              echo "Staging failed health check after 120s"
-              docker logs corescope-staging-go --tail 50
-              exit 1
-            fi
-            sleep 1
-          done
-
-      - name: Smoke test staging API
-        run: |
-          PORT="${STAGING_GO_HTTP_PORT:-80}"
-          if curl -sf "http://localhost:${PORT}/api/stats" | grep -q engine; then
-            echo "Staging verified — engine field present ✅"
-          else
-            echo "Staging /api/stats did not return engine field (port ${PORT})"
-            exit 1
-          fi
-
-      - name: Clean up old Docker images
-        if: always()
-        run: |
-          # Remove dangling images and images older than 24h (keeps current build)
-          echo "--- Docker disk usage before cleanup ---"
-          docker system df
-          docker image prune -af --filter "until=24h" 2>/dev/null || true
-          docker builder prune -f --keep-storage=1GB 2>/dev/null || true
-          echo "--- Docker disk usage after cleanup ---"
-          docker system df
-
-  # ───────────────────────────────────────────────────────────────
-  # 5. Publish Badges & Summary (master only)
-  # ───────────────────────────────────────────────────────────────
-  publish:
-    name: "📝 Publish Badges & Summary"
-    if: github.event_name == 'push'
-    needs: [deploy]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-
-      - name: Download Go coverage badges
-        continue-on-error: true
-        uses: actions/download-artifact@v6
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
         with:
-          name: go-badges
-          path: .badges/
-
-      - name: Download E2E badges
-        continue-on-error: true
-        uses: actions/download-artifact@v6
-        with:
-          name: e2e-badges
-          path: .badges/
-
-      - name: Publish coverage badges to repo
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.BADGE_PUSH_TOKEN }}
-        run: |
-          # GITHUB_TOKEN cannot push to protected branches (required status checks).
-          # Use admin PAT (BADGE_PUSH_TOKEN) via GitHub Contents API instead.
-          for badge in .badges/*.json; do
-            FILENAME=$(basename "$badge")
-            FILEPATH=".badges/$FILENAME"
-            CONTENT=$(base64 -w0 "$badge")
-            CURRENT_SHA=$(gh api "repos/${{ github.repository }}/contents/$FILEPATH" --jq '.sha' 2>/dev/null || echo "")
-            if [ -n "$CURRENT_SHA" ]; then
-              gh api "repos/${{ github.repository }}/contents/$FILEPATH" \
-                -X PUT \
-                -f message="ci: update $FILENAME [skip ci]" \
-                -f content="$CONTENT" \
-                -f sha="$CURRENT_SHA" \
-                -f branch="master" \
-                --silent 2>&1 || echo "Failed to update $FILENAME"
-            else
-              gh api "repos/${{ github.repository }}/contents/$FILEPATH" \
-                -X PUT \
-                -f message="ci: update $FILENAME [skip ci]" \
-                -f content="$CONTENT" \
-                -f branch="master" \
-                --silent 2>&1 || echo "Failed to create $FILENAME"
-            fi
-          done
-          echo "Badge publish complete"
-
-      - name: Post deployment summary
-        run: |
-          echo "## Staging Deployed ✓" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Commit:** \`$(git rev-parse --short HEAD)\` — $(git log -1 --format=%s)" >> $GITHUB_STEP_SUMMARY
+          host: ${{ secrets.DEV_SSH_HOST }}
+          username: ubuntu
+          key: ${{ secrets.DEV_SSH_KEY }}
+          script: |
+            docker pull ghcr.io/emuehlstein/corescope-chicagooffline:edge
+            docker tag ghcr.io/emuehlstein/corescope-chicagooffline:edge corescope-go:latest
+            cd ~/chimesh-mqtt
+            docker compose up -d --no-deps --pull always corescope
+            echo "Deploy done ✅"

@@ -1,6 +1,20 @@
 /* === CoreScope — perf.js === */
 'use strict';
 
+var GH = 'https://github.com/Kpa-clawbot/corescope';
+
+function renderVersionCard(health) {
+  if (!health || (!health.version && !health.commit)) return '';
+  var ver = health.version && health.version !== 'unknown' ? health.version : null;
+  var sha = health.commit && health.commit !== 'unknown' ? health.commit : null;
+  if (!ver && !sha) return '';
+  var vTag = ver ? (ver.charAt(0) === 'v' ? ver : 'v' + ver) : null;
+  var parts = [];
+  if (vTag) parts.push('<a href="' + GH + '/releases/tag/' + vTag + '" target="_blank" rel="noopener">' + vTag + '</a>');
+  if (sha) parts.push('<a href="' + GH + '/commit/' + sha + '" target="_blank" rel="noopener">' + sha.slice(0, 7) + '</a>');
+  return '<div class="perf-card"><div class="perf-num perf-num--small">' + parts.join(' · ') + '</div><div class="perf-label">Version</div></div>';
+}
+
 (function () {
   let interval = null;
 
@@ -13,16 +27,16 @@
     const el = document.getElementById('perfContent');
     if (!el) return;
     try {
-      const [server, client, ioStats, sqliteStats, writeSources] = await Promise.all([
+      // #1258: /api/health was awaited AFTER Promise.all, adding a full RTT
+      // (~50-200ms) on every 5s refresh. Issue it in parallel with the rest.
+      const [server, client, ioStats, sqliteStats, writeSources, health] = await Promise.all([
         fetch('/api/perf').then(r => r.json()),
         Promise.resolve(window.apiPerf ? window.apiPerf() : null),
         fetch('/api/perf/io').then(r => r.json()).catch(() => null),
         fetch('/api/perf/sqlite').then(r => r.json()).catch(() => null),
-        fetch('/api/perf/write-sources').then(r => r.json()).catch(() => null)
+        fetch('/api/perf/write-sources').then(r => r.json()).catch(() => null),
+        fetch('/api/health').then(r => r.json()).catch(() => null)
       ]);
-
-      // Also fetch health telemetry
-      const health = await fetch('/api/health').then(r => r.json()).catch(() => null);
 
       let html = '';
 
@@ -32,7 +46,7 @@
         <div class="perf-card"><div class="perf-num">${server.avgMs}ms</div><div class="perf-label">Avg Response</div></div>
         <div class="perf-card"><div class="perf-num">${health ? health.uptimeHuman : Math.round(server.uptime / 60) + 'm'}</div><div class="perf-label">Uptime</div></div>
         <div class="perf-card"><div class="perf-num">${server.slowQueries.length}</div><div class="perf-label">Slow (&gt;100ms)</div></div>
-        ${health && health.version ? `<div class="perf-card"><div class="perf-num" style="font-size:0.85em">${health.version}${health.commit && health.commit !== "unknown" ? " <span style=\"font-size:0.75em;opacity:0.7\">(${health.commit.slice(0,7)})</span>" : ""}</div><div class="perf-label">Server Version</div></div>` : ""}
+        ${renderVersionCard(health)}
       </div>`;
 
       // System health (memory, event loop / go runtime, WS)
@@ -231,8 +245,15 @@
         html += `</div>`;
       }
 
-      // Server endpoints table
-      const eps = Object.entries(server.endpoints);
+      // Server endpoints table — sort by total time (count * avg) DESC.
+      // #1258: header claimed "sorted by total time" but JSON map order is
+      // undefined and the frontend was not sorting. Slow endpoints could
+      // appear anywhere in the table, defeating the section's whole purpose.
+      const eps = Object.entries(server.endpoints).sort((a, b) => {
+        const ta = (a[1].count || 0) * (a[1].avgMs || 0);
+        const tb = (b[1].count || 0) * (b[1].avgMs || 0);
+        return tb - ta;
+      });
       if (eps.length) {
         html += '<h3>Server Endpoints (sorted by total time)</h3>';
         html += '<div style="overflow-x:auto"><table class="perf-table"><thead><tr><th scope="col">Endpoint</th><th scope="col">Count</th><th scope="col">Avg</th><th scope="col">P50</th><th scope="col">P95</th><th scope="col">Max</th><th scope="col">Total</th></tr></thead><tbody>';
@@ -282,10 +303,28 @@
   registerPage('perf', {
     init(app) {
       render(app);
-      interval = setInterval(refresh, 5000);
+      // #1258: don't burn CPU/network rebuilding the page (and its many cards
+      // + 3 large tables) every 5s while the tab is hidden. Pause polling on
+      // visibilitychange and resume on focus. Reduces background fetch traffic
+      // to zero and prevents a returning user from seeing a 100+ms thrash as
+      // a backlog of refreshes flush.
+      const tick = () => {
+        if (document.hidden) return;
+        refresh();
+      };
+      interval = setInterval(tick, 5000);
+      const onVis = () => {
+        if (!document.hidden) refresh();
+      };
+      document.addEventListener('visibilitychange', onVis);
+      this._onVis = onVis;
     },
     destroy() {
       if (interval) { clearInterval(interval); interval = null; }
+      if (this._onVis) {
+        document.removeEventListener('visibilitychange', this._onVis);
+        this._onVis = null;
+      }
     }
   });
 })();

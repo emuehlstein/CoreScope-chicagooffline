@@ -53,6 +53,7 @@ type Config struct {
 	HashRegions     []string          `json:"hashRegions,omitempty"`
 	Retention       *RetentionConfig  `json:"retention,omitempty"`
 	Metrics         *MetricsConfig    `json:"metrics,omitempty"`
+	Runtime         *RuntimeConfig    `json:"runtime,omitempty"`
 	GeoFilter            *GeoFilterConfig     `json:"geo_filter,omitempty"`
 	ForeignAdverts       *ForeignAdvertConfig `json:"foreignAdverts,omitempty"`
 	ValidateSignatures   *bool             `json:"validateSignatures,omitempty"`
@@ -80,6 +81,12 @@ type Config struct {
 	// NeighborEdgesMaxAgeDays controls neighbor_edges row retention
 	// (#1287 — moved from cmd/server). 0 = default 5.
 	NeighborEdgesMaxAgeDays int `json:"neighborEdgesMaxAgeDays,omitempty"`
+
+	// IngestBufferSize caps the in-memory queue (number of MQTT messages) held
+	// while the single SQLite writer is blocked by startup migrations/prunes
+	// (#1608). Received messages are drained once the write path is ready.
+	// 0 / unset => default. Bounded memory.
+	IngestBufferSize int `json:"ingestBufferSize,omitempty"`
 }
 
 // NeighborEdgesDaysOrDefault returns the configured pruning window or 5.
@@ -88,6 +95,17 @@ func (c *Config) NeighborEdgesDaysOrDefault() int {
 		return 5
 	}
 	return c.NeighborEdgesMaxAgeDays
+}
+
+// IngestBufferSizeOrDefault returns the ingest buffer capacity. Default 50000:
+// at typical mesh rates (~1-2 msg/s) that is many minutes of headroom while a
+// startup migration holds the writer; each queued item is a small closure, so
+// worst-case memory stays in the tens of MB.
+func (c *Config) IngestBufferSizeOrDefault() int {
+	if c.IngestBufferSize > 0 {
+		return c.IngestBufferSize
+	}
+	return 50000
 }
 
 // GeoFilterConfig is an alias for the shared geofilter.Config type.
@@ -132,6 +150,15 @@ func (c *Config) PacketDaysOrZero() int {
 // MetricsConfig controls observer metrics collection.
 type MetricsConfig struct {
 	SampleIntervalSec int `json:"sampleIntervalSec"`
+}
+
+// RuntimeConfig holds Go runtime tuning knobs (#1010).
+type RuntimeConfig struct {
+	// MaxMemoryMB is the soft memory limit (GOMEMLIMIT) in MiB applied via
+	// runtime/debug.SetMemoryLimit at startup. The GOMEMLIMIT environment
+	// variable, when set, takes precedence over this value. 0/unset means
+	// no limit is applied and default Go runtime behavior is preserved.
+	MaxMemoryMB int `json:"maxMemoryMB"`
 }
 
 // DBConfig is the shared SQLite vacuum/maintenance config (#919, #921).

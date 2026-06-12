@@ -51,6 +51,25 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
+	// Apply Go runtime soft memory limit (GOMEMLIMIT). See #1010.
+	// Precedence: GOMEMLIMIT env > runtime.maxMemoryMB > unset (default).
+	{
+		_, envSet := os.LookupEnv("GOMEMLIMIT")
+		runtimeMaxMB := 0
+		if cfg.Runtime != nil {
+			runtimeMaxMB = cfg.Runtime.MaxMemoryMB
+		}
+		limit, source := applyMemoryLimit(runtimeMaxMB, envSet)
+		switch source {
+		case "env":
+			log.Printf("[memlimit] using GOMEMLIMIT from environment (%s)", os.Getenv("GOMEMLIMIT"))
+		case "config":
+			log.Printf("[memlimit] runtime.maxMemoryMB=%d → SetMemoryLimit(%d MiB)", runtimeMaxMB, limit/(1024*1024))
+		default:
+			log.Printf("[memlimit] unset → default (no soft memory limit; recommend setting GOMEMLIMIT or runtime.maxMemoryMB to ≥1.5× working set to avoid OOM-kill)")
+		}
+	}
+
 	sources := cfg.ResolvedSources()
 
 	store, err := OpenStoreWithInterval(cfg.DBPath, cfg.MetricsSampleInterval())
@@ -74,6 +93,152 @@ func main() {
 
 	// Check auto_vacuum mode and optionally migrate (#919)
 	store.CheckAutoVacuum(cfg)
+
+	channelKeys := loadChannelKeys(cfg, *configPath)
+	if len(channelKeys) > 0 {
+		log.Printf("Loaded %d channel keys for GRP_TXT decryption", len(channelKeys))
+	} else {
+		log.Printf("No channel keys loaded — GRP_TXT packets will not be decrypted")
+	}
+
+	regionKeys := loadRegionKeys(cfg)
+	store.BackfillDefaultScopeAsync(regionKeys)
+
+	// Subscribe-early + buffer (#1608): the MQTT subscription is brought up
+	// before startup maintenance so no packets are missed while the single
+	// SQLite writer is blocked (e.g. a large CREATE INDEX migration). Received
+	// messages are buffered here and drained once Ready() is called below.
+	ingestBuffer := NewIngestBuffer(cfg.IngestBufferSizeOrDefault())
+	ingestBuffer.Start()
+
+	// Connect to each MQTT source
+	var clients []mqtt.Client
+	connectedCount := 0
+	for _, source := range sources {
+		tag := source.Name
+		if tag == "" {
+			tag = source.Broker
+		}
+
+		opts := buildMQTTOpts(source)
+		connectTimeout := source.ConnectTimeoutOrDefault()
+		log.Printf("MQTT [%s] connect timeout: %ds", tag, connectTimeout)
+
+		// Pre-allocate the liveness pointer so OnConnect can reset its
+		// stale-message clock on reconnect (PR #1216 r1 item 2). IsConnectedFn
+		// is wired below once the client exists.
+		liveness := &SourceLivenessState{
+			Tag:    tag,
+			Broker: source.Broker,
+		}
+
+		opts.SetOnConnectHandler(func(c mqtt.Client) {
+			log.Printf("MQTT [%s] connected to %s", tag, source.Broker)
+			// PR #1216 r1 item 2: clear the stale LastMessageUnix from
+			// before the outage so the watchdog doesn't immediately scream
+			// "stalled for 2h". Also restarts the cold-start grace window
+			// and clears the alert cooldown so a fresh stall edge can fire.
+			liveness.MarkReconnected(time.Now())
+			topics := source.Topics
+			if len(topics) == 0 {
+				topics = []string{"meshcore/#"}
+			}
+			for _, t := range topics {
+				token := c.Subscribe(t, 0, nil)
+				token.Wait()
+				if token.Error() != nil {
+					log.Printf("MQTT [%s] subscribe error for %s: %v", tag, t, token.Error())
+				} else {
+					log.Printf("MQTT [%s] subscribed to %s", tag, t)
+				}
+			}
+		})
+
+		opts.SetConnectionLostHandler(func(c mqtt.Client, err error) {
+			log.Printf("MQTT [%s] disconnected from %s: %v", tag, source.Broker, err)
+		})
+
+		opts.SetReconnectingHandler(func(c mqtt.Client, options *mqtt.ClientOptions) {
+			log.Printf("MQTT [%s] reconnecting to %s", tag, source.Broker)
+		})
+
+		// Capture source for closure
+		src := source
+		opts.SetDefaultPublishHandler(func(c mqtt.Client, m mqtt.Message) {
+			// PR #1609 M1: stamp the RECEIPT clock here (broker liveness)
+			// independently of the post-write clock that handleMessage
+			// stamps. Without separation the watchdog/healthz could
+			// report "fresh" while the writer was stalled and the
+			// buffer was filling.
+			markReceiptForTag(tag, time.Now())
+			ingestBuffer.Submit(func() {
+				handleMessage(store, tag, src, m, channelKeys, regionKeys, cfg)
+			})
+		})
+
+		client := mqtt.NewClient(opts)
+		// Wire IsConnectedFn now that the client exists, then register.
+		// Registration BEFORE Connect so the attempt counter is available
+		// to OnConnectAttempt on the very first dial.
+		liveness.IsConnectedFn = client.IsConnected
+		// #1335: wire force-reconnect so the watchdog can drop a
+		// half-open TCP socket and re-dial when paho.IsConnected==true
+		// but no messages have flowed past the stall threshold. Throttled
+		// per source by the watchdog itself (forceReconnectThrottle).
+		// Disconnect(250) gives in-flight publishes 250ms to drain;
+		// Connect() returns immediately and paho's reconnect machinery
+		// takes over from there. Captured-by-value `client` is the same
+		// pointer used everywhere else for this source.
+		liveness.ForceReconnectFn = func() {
+			client.Disconnect(250)
+			client.Connect()
+		}
+		// PR #1216 r2 item 3: tag collisions used to log.Fatalf, which
+		// killed the entire ingestor over one config typo and recreated
+		// the #1212 total-ingest-stop class this PR exists to prevent.
+		// registerLivenessOrSkip logs ERROR + skips liveness registration
+		// for the duplicate; the MQTT source still attempts to connect,
+		// it just isn't tracked by the watchdog. First registration
+		// remains authoritative.
+		registerLivenessOrSkip(liveness)
+		token := client.Connect()
+		// With ConnectRetry=true, token.Wait() blocks forever for unreachable brokers.
+		// WaitTimeout lets startup proceed; the client keeps retrying in the background
+		// and OnConnect fires (subscribing) when it eventually connects (#910).
+		if !token.WaitTimeout(time.Duration(connectTimeout) * time.Second) {
+			log.Printf("MQTT [%s] initial connection timed out — retrying in background", tag)
+			clients = append(clients, client)
+			continue
+		}
+		if token.Error() != nil {
+			log.Printf("MQTT [%s] connection failed (non-fatal): %v", tag, token.Error())
+			// BL1 fix: Disconnect to stop Paho's internal retry goroutines.
+			// With ConnectRetry=true, Connect() spawns background goroutines
+			// that leak if the client is simply discarded.
+			client.Disconnect(0)
+			continue
+		}
+		connectedCount++
+		clients = append(clients, client)
+	}
+
+	// BL2 fix: require at least one immediately-connected source. Timed-out
+	// clients are retrying in background (tracked in clients) but don't count
+	// as "connected" — a single unreachable broker must not silently run with
+	// zero active connections.
+	if connectedCount == 0 {
+		// Clean up any timed-out clients still retrying
+		for _, c := range clients {
+			c.Disconnect(0)
+		}
+		log.Fatal("no MQTT sources connected — all timed out or failed. Check broker is running (default: mqtt://localhost:1883). Set MQTT_BROKER env var or configure mqttSources in config.json")
+	}
+
+	if connectedCount < len(clients) {
+		log.Printf("Running — %d MQTT source(s) connected, %d retrying in background", connectedCount, len(clients)-connectedCount)
+	} else {
+		log.Printf("Running — %d MQTT source(s) connected", connectedCount)
+	}
 
 	// Node retention: move stale nodes to inactive_nodes on startup
 	nodeDays := cfg.NodeDaysOrDefault()
@@ -102,6 +267,18 @@ func main() {
 
 	vacuumPages := cfg.IncrementalVacuumPages()
 	store.RunIncrementalVacuum(vacuumPages)
+
+	// Gate open: the synchronous startup writes above cannot return until the
+	// single SQLite writer is free, which means any blocking async migration
+	// (e.g. the CREATE INDEX) has finished. WaitForAsyncMigrations() makes that
+	// explicit. Now drain everything the subscription buffered during startup.
+	store.WaitForAsyncMigrations()
+	ingestBuffer.Ready()
+	if d := ingestBuffer.Dropped(); d > 0 {
+		log.Printf("[ingest-buffer] write path ready; draining backlog (dropped %d during startup — consider raising ingestBufferSize)", d)
+	} else {
+		log.Printf("[ingest-buffer] write path ready; draining backlog (0 dropped)")
+	}
 
 	// Daily ticker for node retention
 	retentionTicker := time.NewTicker(1 * time.Hour)
@@ -192,6 +369,9 @@ func main() {
 	go func() {
 		for range statsTicker.C {
 			store.LogStats()
+			if d := ingestBuffer.Dropped(); d > 0 || ingestBuffer.Pending() > 0 {
+				log.Printf("[ingest-buffer] pending=%d dropped_total=%d", ingestBuffer.Pending(), d)
+			}
 		}
 	}()
 
@@ -237,137 +417,6 @@ func main() {
 	stopNeighborBuilder := store.StartNeighborEdgesBuilder(NeighborEdgesBuilderInterval)
 	defer stopNeighborBuilder()
 	log.Printf("[neighbor-build] enabled (interval=%s)", NeighborEdgesBuilderInterval)
-
-	channelKeys := loadChannelKeys(cfg, *configPath)
-	if len(channelKeys) > 0 {
-		log.Printf("Loaded %d channel keys for GRP_TXT decryption", len(channelKeys))
-	} else {
-		log.Printf("No channel keys loaded — GRP_TXT packets will not be decrypted")
-	}
-
-	regionKeys := loadRegionKeys(cfg)
-	store.BackfillDefaultScopeAsync(regionKeys)
-
-	// Connect to each MQTT source
-	var clients []mqtt.Client
-	connectedCount := 0
-	for _, source := range sources {
-		tag := source.Name
-		if tag == "" {
-			tag = source.Broker
-		}
-
-		opts := buildMQTTOpts(source)
-		connectTimeout := source.ConnectTimeoutOrDefault()
-		log.Printf("MQTT [%s] connect timeout: %ds", tag, connectTimeout)
-
-		// Pre-allocate the liveness pointer so OnConnect can reset its
-		// stale-message clock on reconnect (PR #1216 r1 item 2). IsConnectedFn
-		// is wired below once the client exists.
-		liveness := &SourceLivenessState{
-			Tag:    tag,
-			Broker: source.Broker,
-		}
-
-		opts.SetOnConnectHandler(func(c mqtt.Client) {
-			log.Printf("MQTT [%s] connected to %s", tag, source.Broker)
-			// PR #1216 r1 item 2: clear the stale LastMessageUnix from
-			// before the outage so the watchdog doesn't immediately scream
-			// "stalled for 2h". Also restarts the cold-start grace window
-			// and clears the alert cooldown so a fresh stall edge can fire.
-			liveness.MarkReconnected(time.Now())
-			topics := source.Topics
-			if len(topics) == 0 {
-				topics = []string{"meshcore/#"}
-			}
-			for _, t := range topics {
-				token := c.Subscribe(t, 0, nil)
-				token.Wait()
-				if token.Error() != nil {
-					log.Printf("MQTT [%s] subscribe error for %s: %v", tag, t, token.Error())
-				} else {
-					log.Printf("MQTT [%s] subscribed to %s", tag, t)
-				}
-			}
-		})
-
-		opts.SetConnectionLostHandler(func(c mqtt.Client, err error) {
-			log.Printf("MQTT [%s] disconnected from %s: %v", tag, source.Broker, err)
-		})
-
-		opts.SetReconnectingHandler(func(c mqtt.Client, options *mqtt.ClientOptions) {
-			log.Printf("MQTT [%s] reconnecting to %s", tag, source.Broker)
-		})
-
-		// Capture source for closure
-		src := source
-		opts.SetDefaultPublishHandler(func(c mqtt.Client, m mqtt.Message) {
-			handleMessage(store, tag, src, m, channelKeys, regionKeys, cfg)
-		})
-
-		client := mqtt.NewClient(opts)
-		// Wire IsConnectedFn now that the client exists, then register.
-		// Registration BEFORE Connect so the attempt counter is available
-		// to OnConnectAttempt on the very first dial.
-		liveness.IsConnectedFn = client.IsConnected
-		// #1335: wire force-reconnect so the watchdog can drop a
-		// half-open TCP socket and re-dial when paho.IsConnected==true
-		// but no messages have flowed past the stall threshold. Throttled
-		// per source by the watchdog itself (forceReconnectThrottle).
-		// Disconnect(250) gives in-flight publishes 250ms to drain;
-		// Connect() returns immediately and paho's reconnect machinery
-		// takes over from there. Captured-by-value `client` is the same
-		// pointer used everywhere else for this source.
-		liveness.ForceReconnectFn = func() {
-			client.Disconnect(250)
-			client.Connect()
-		}
-		// PR #1216 r2 item 3: tag collisions used to log.Fatalf, which
-		// killed the entire ingestor over one config typo and recreated
-		// the #1212 total-ingest-stop class this PR exists to prevent.
-		// registerLivenessOrSkip logs ERROR + skips liveness registration
-		// for the duplicate; the MQTT source still attempts to connect,
-		// it just isn't tracked by the watchdog. First registration
-		// remains authoritative.
-		registerLivenessOrSkip(liveness)
-		token := client.Connect()
-		// With ConnectRetry=true, token.Wait() blocks forever for unreachable brokers.
-		// WaitTimeout lets startup proceed; the client keeps retrying in the background
-		// and OnConnect fires (subscribing) when it eventually connects (#910).
-		if !token.WaitTimeout(time.Duration(connectTimeout) * time.Second) {
-			log.Printf("MQTT [%s] initial connection timed out — retrying in background", tag)
-			clients = append(clients, client)
-			continue
-		}
-		if token.Error() != nil {
-			log.Printf("MQTT [%s] connection failed (non-fatal): %v", tag, token.Error())
-			// BL1 fix: Disconnect to stop Paho's internal retry goroutines.
-			// With ConnectRetry=true, Connect() spawns background goroutines
-			// that leak if the client is simply discarded.
-			client.Disconnect(0)
-			continue
-		}
-		connectedCount++
-		clients = append(clients, client)
-	}
-
-	// BL2 fix: require at least one immediately-connected source. Timed-out
-	// clients are retrying in background (tracked in clients) but don't count
-	// as "connected" — a single unreachable broker must not silently run with
-	// zero active connections.
-	if connectedCount == 0 {
-		// Clean up any timed-out clients still retrying
-		for _, c := range clients {
-			c.Disconnect(0)
-		}
-		log.Fatal("no MQTT sources connected — all timed out or failed. Check broker is running (default: mqtt://localhost:1883). Set MQTT_BROKER env var or configure mqttSources in config.json")
-	}
-
-	if connectedCount < len(clients) {
-		log.Printf("Running — %d MQTT source(s) connected, %d retrying in background", connectedCount, len(clients)-connectedCount)
-	} else {
-		log.Printf("Running — %d MQTT source(s) connected", connectedCount)
-	}
 
 	// #1212: per-source stall watchdog. Detects "silently dead" sources
 	// where the client reports connected but no messages have flowed. Logs
@@ -715,8 +764,8 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 					log.Printf("MQTT [%s] node telemetry update error: %v", tag, err)
 				}
 			}
-			// Update default_scope when advert carries a matched transport scope (#899)
-			if pktData.IsTransportScoped {
+			// Update default_scope when advert carries a matched transport scope (#899, #1534)
+			if shouldUpdateDefaultScope(pktData) {
 				if err := store.UpdateNodeDefaultScope(decoded.Payload.PubKey, pktData.ScopeName); err != nil {
 					log.Printf("MQTT [%s] node default_scope update error: %v", tag, err)
 				}
@@ -1075,6 +1124,37 @@ func extractObserverMeta(msg map[string]interface{}) *ObserverMeta {
 		}
 	}
 
+	// Issue #1290: firmware 1.16 publishes a `repeat` flag at the top
+	// level of the /status JSON (MQTTMessageBuilder.cpp:58 — see
+	// agessaman/MeshCore mqtt-bridge-implementation-flex). Accept
+	// either a boolean or a case-insensitive `on|off|true|false|1|0`
+	// string. Missing field → leave CanRelay nil; the writer preserves
+	// the prior column value (default 1, back-compat).
+	if v, ok := msg["repeat"]; ok && v != nil {
+		switch t := v.(type) {
+		case bool:
+			b := t
+			meta.CanRelay = &b
+			hasData = true
+		case string:
+			s := strings.ToLower(strings.TrimSpace(t))
+			switch s {
+			case "on", "true", "1", "yes":
+				b := true
+				meta.CanRelay = &b
+				hasData = true
+			case "off", "false", "0", "no":
+				b := false
+				meta.CanRelay = &b
+				hasData = true
+			}
+		case float64:
+			b := t != 0
+			meta.CanRelay = &b
+			hasData = true
+		}
+	}
+
 	if !hasData {
 		return nil
 	}
@@ -1355,4 +1435,12 @@ func init() {
 		fmt.Println("corescope-ingestor", version)
 		os.Exit(0)
 	}
+}
+
+// shouldUpdateDefaultScope returns true when the packet carries a transport
+// scope whose region key matched (#1534). Without the ScopeName non-empty
+// guard, transport-scoped adverts from non-matching regions would overwrite
+// previously-correct default_scope values with the empty string.
+func shouldUpdateDefaultScope(pktData *PacketData) bool {
+	return pktData.IsTransportScoped && pktData.ScopeName != ""
 }

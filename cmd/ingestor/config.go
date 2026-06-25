@@ -50,8 +50,10 @@ type Config struct {
 	ChannelKeysPath string            `json:"channelKeysPath,omitempty"`
 	ChannelKeys     map[string]string `json:"channelKeys,omitempty"`
 	HashChannels    []string          `json:"hashChannels,omitempty"`
+	HashRegions     []string          `json:"hashRegions,omitempty"`
 	Retention       *RetentionConfig  `json:"retention,omitempty"`
 	Metrics         *MetricsConfig    `json:"metrics,omitempty"`
+	Runtime         *RuntimeConfig    `json:"runtime,omitempty"`
 	GeoFilter            *GeoFilterConfig     `json:"geo_filter,omitempty"`
 	ForeignAdverts       *ForeignAdvertConfig `json:"foreignAdverts,omitempty"`
 	ValidateSignatures   *bool             `json:"validateSignatures,omitempty"`
@@ -75,6 +77,35 @@ type Config struct {
 	// obsBlacklistSetCached is the lazily-built lowercase set for O(1) lookups.
 	obsBlacklistSetCached map[string]bool
 	obsBlacklistOnce      sync.Once
+
+	// NeighborEdgesMaxAgeDays controls neighbor_edges row retention
+	// (#1287 — moved from cmd/server). 0 = default 5.
+	NeighborEdgesMaxAgeDays int `json:"neighborEdgesMaxAgeDays,omitempty"`
+
+	// IngestBufferSize caps the in-memory queue (number of MQTT messages) held
+	// while the single SQLite writer is blocked by startup migrations/prunes
+	// (#1608). Received messages are drained once the write path is ready.
+	// 0 / unset => default. Bounded memory.
+	IngestBufferSize int `json:"ingestBufferSize,omitempty"`
+}
+
+// NeighborEdgesDaysOrDefault returns the configured pruning window or 5.
+func (c *Config) NeighborEdgesDaysOrDefault() int {
+	if c == nil || c.NeighborEdgesMaxAgeDays <= 0 {
+		return 5
+	}
+	return c.NeighborEdgesMaxAgeDays
+}
+
+// IngestBufferSizeOrDefault returns the ingest buffer capacity. Default 50000:
+// at typical mesh rates (~1-2 msg/s) that is many minutes of headroom while a
+// startup migration holds the writer; each queued item is a small closure, so
+// worst-case memory stays in the tens of MB.
+func (c *Config) IngestBufferSizeOrDefault() int {
+	if c.IngestBufferSize > 0 {
+		return c.IngestBufferSize
+	}
+	return 50000
 }
 
 // GeoFilterConfig is an alias for the shared geofilter.Config type.
@@ -99,14 +130,35 @@ func (f *ForeignAdvertConfig) IsDropMode() bool {
 
 // RetentionConfig controls how long stale nodes are kept before being moved to inactive_nodes.
 type RetentionConfig struct {
-	NodeDays      int `json:"nodeDays"`
-	ObserverDays  int `json:"observerDays"`
-	MetricsDays   int `json:"metricsDays"`
+	NodeDays     int `json:"nodeDays"`
+	ObserverDays int `json:"observerDays"`
+	MetricsDays  int `json:"metricsDays"`
+	// PacketDays is the retention window for transmissions (#1283).
+	// Ownership moved from cmd/server to cmd/ingestor; 0 disables.
+	PacketDays int `json:"packetDays"`
+}
+
+// PacketDaysOrZero returns the configured retention.packetDays or 0
+// (disabled) if not set.
+func (c *Config) PacketDaysOrZero() int {
+	if c.Retention != nil && c.Retention.PacketDays > 0 {
+		return c.Retention.PacketDays
+	}
+	return 0
 }
 
 // MetricsConfig controls observer metrics collection.
 type MetricsConfig struct {
 	SampleIntervalSec int `json:"sampleIntervalSec"`
+}
+
+// RuntimeConfig holds Go runtime tuning knobs (#1010).
+type RuntimeConfig struct {
+	// MaxMemoryMB is the soft memory limit (GOMEMLIMIT) in MiB applied via
+	// runtime/debug.SetMemoryLimit at startup. The GOMEMLIMIT environment
+	// variable, when set, takes precedence over this value. 0/unset means
+	// no limit is applied and default Go runtime behavior is preserved.
+	MaxMemoryMB int `json:"maxMemoryMB"`
 }
 
 // DBConfig is the shared SQLite vacuum/maintenance config (#919, #921).
@@ -261,15 +313,24 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // ResolvedSources returns the final list of MQTT sources to connect to.
+//
+// Scheme mapping:
+//
+//	mqtt://  → tcp://   (paho plain TCP)
+//	mqtts:// → ssl://   (paho TLS over TCP)
+//	ws://               (paho WebSocket — passed through, no mapping needed)
+//	wss://              (paho WebSocket TLS — passed through, no mapping needed)
 func (c *Config) ResolvedSources() []MQTTSource {
 	for i := range c.MQTTSources {
-		// paho uses tcp:// and ssl:// not mqtt:// and mqtts://
+		// paho uses tcp:// and ssl:// for plain MQTT; ws:// and wss:// are accepted natively.
 		b := c.MQTTSources[i].Broker
 		if strings.HasPrefix(b, "mqtt://") {
 			c.MQTTSources[i].Broker = "tcp://" + b[7:]
 		} else if strings.HasPrefix(b, "mqtts://") {
 			c.MQTTSources[i].Broker = "ssl://" + b[8:]
 		}
+		// ws:// and wss:// pass through unchanged — paho handles WebSocket
+		// connections natively via gorilla/websocket.
 	}
 	return c.MQTTSources
 }

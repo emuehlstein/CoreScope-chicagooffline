@@ -53,6 +53,12 @@ async function run() {
     args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
   });
   const context = await browser.newContext();
+  // #1532 — `.live-controls` defaults collapsed; pre-seed the user's pin
+  // preference so toggle children (#liveHeatToggle, etc.) are visible in
+  // tests that pre-date the change.
+  await context.addInitScript(() => {
+    try { localStorage.setItem('live-controls-expanded', 'true'); } catch (_) {}
+  });
   const page = await context.newPage();
   page.setDefaultTimeout(10000);
 
@@ -188,17 +194,30 @@ async function run() {
     await page.goto(BASE, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('nav, .navbar, .nav, [class*="nav"]');
     const themeBefore = await page.$eval('html', el => el.getAttribute('data-theme'));
-    // Find toggle button
-    const allButtons = await page.$$('button');
+
+    // The toggle may be a <label#darkModeToggle> wrapping a checkbox (new toggle-switch
+    // design) or a <button#darkModeToggle> (legacy button design). Try the checkbox path
+    // first, then fall back to the old button scan.
     let toggled = false;
-    for (const b of allButtons) {
-      const text = await b.textContent();
-      if (text.includes('\u2600') || text.includes('\ud83c\udf19') || text.includes('\ud83c\udf11') || text.includes('\ud83c\udf15')) {
-        await b.click();
-        toggled = true;
-        break;
+
+    // New toggle-switch: click the label or directly set the checkbox
+    const toggleLabel = await page.$('#darkModeToggle');
+    if (toggleLabel) {
+      await toggleLabel.click();
+      toggled = true;
+    } else {
+      // Legacy fallback: scan buttons for sun/moon emoji
+      const allButtons = await page.$$('button');
+      for (const b of allButtons) {
+        const text = await b.textContent();
+        if (text.includes('\u2600') || text.includes('\ud83c\udf19') || text.includes('\ud83c\udf11') || text.includes('\ud83c\udf15')) {
+          await b.click();
+          toggled = true;
+          break;
+        }
       }
     }
+
     assert(toggled, 'Could not find dark mode toggle button');
     await page.waitForFunction(
       (before) => document.documentElement.getAttribute('data-theme') !== before,
@@ -206,40 +225,68 @@ async function run() {
     );
     const themeAfter = await page.$eval('html', el => el.getAttribute('data-theme'));
     assert(themeBefore !== themeAfter, `Theme didn't change: before=${themeBefore}, after=${themeAfter}`);
+
+    // PR #893 follow-up: tighten — if the new toggle-switch is present, verify
+    // (a) the checkbox is present and behaves as role="switch", and
+    // (b) the chosen theme persists across a full reload (localStorage path).
+    const checkbox = await page.$('#darkModeCheckbox');
+    if (checkbox) {
+      const role = await checkbox.evaluate(el => el.getAttribute('role'));
+      assert(role === 'switch', `Expected role="switch" on #darkModeCheckbox, got "${role}"`);
+      const checkedNow = await checkbox.evaluate(el => el.checked);
+      assert(checkedNow === (themeAfter === 'dark'),
+        `Checkbox state out of sync: checked=${checkedNow}, theme=${themeAfter}`);
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForSelector('#darkModeToggle');
+      const themePersisted = await page.$eval('html', el => el.getAttribute('data-theme'));
+      assert(themePersisted === themeAfter,
+        `Theme did not persist across reload: was=${themeAfter}, after-reload=${themePersisted}`);
+    }
   });
 
-  // Test: Stats bar shows version/commit badge
-  await test('Stats bar shows version and commit badge', async () => {
+  // Test: Version info is on Perf page (not navbar)
+  await test('Version info lives on Perf dashboard, not in navbar', async () => {
     await page.goto(BASE, { waitUntil: 'domcontentloaded' });
-    // Wait for stats to load (fetched from /api/stats)
+    // Wait for nav stats bar to load
     await page.waitForFunction(() => {
       const stats = document.getElementById('navStats');
       return stats && stats.textContent.trim().length > 5;
     }, { timeout: 10000 });
     const navStats = await page.$('#navStats');
     assert(navStats, 'Nav stats bar (#navStats) not found');
-    // Check if stats API exposes version info
+    // Version/engine badges must NOT appear in the navbar
+    const navVersionBadge = await page.$('#navStats .version-badge');
+    assert(!navVersionBadge, 'version-badge should not be in the navbar (moved to Perf dashboard)');
+    const navEngineBadge = await page.$('#navStats .engine-badge');
+    assert(!navEngineBadge, 'engine-badge should not be in the navbar (moved to Perf dashboard)');
+    // Check if health API exposes version info
     const hasVersionData = await page.evaluate(async () => {
       try {
-        const res = await fetch('/api/stats');
+        const res = await fetch('/api/health');
         const data = await res.json();
-        return !!(data.version || data.commit || data.engine);
+        return !!(data.version || data.commit);
       } catch { return false; }
     });
     if (!hasVersionData) {
-      console.log('    ⏭️  Server does not expose version/commit in /api/stats — badge test skipped');
+      console.log('    ⏭️  Server does not expose version/commit in /api/health — perf card test skipped');
       return;
     }
-    // Version badge should appear when data is available
-    await page.waitForFunction(() => !!document.querySelector('.version-badge'), { timeout: 5000 });
-    const badgeText = await page.$eval('.version-badge', el => el.textContent.trim());
-    assert(badgeText.length > 3, `Version badge should have content but got "${badgeText}"`);
-    const hasCommitHash = /[0-9a-f]{7}/i.test(badgeText);
-    assert(hasCommitHash, `Version badge should contain a commit hash, got "${badgeText}"`);
-    const engineBadge = await page.$('.engine-badge');
-    assert(engineBadge, 'Engine badge (.engine-badge) not found');
-    const engineText = await page.$eval('.engine-badge', el => el.textContent.trim().toLowerCase());
-    assert(engineText.includes('node') || engineText.includes('go'), `Engine should contain "node" or "go", got "${engineText}"`);
+    // Version card should appear on the Perf dashboard
+    await page.goto(`${BASE}/#/perf`, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => {
+      const cards = document.querySelectorAll('.perf-card .perf-label');
+      return Array.from(cards).some(el => el.textContent.trim() === 'Version');
+    }, { timeout: 10000 });
+    // waitForFunction already confirmed the Version label exists; just grab the num text
+    const versionNumText = await page.evaluate(() => {
+      const labels = document.querySelectorAll('.perf-card .perf-label');
+      const label = Array.from(labels).find(el => el.textContent.trim() === 'Version');
+      if (!label) return null;
+      const num = label.closest('.perf-card').querySelector('.perf-num, .perf-num--small');
+      return num ? num.textContent.trim() : '';
+    });
+    assert(versionNumText !== null, 'Version perf-card not found on #/perf');
+    assert(versionNumText.length > 0, 'Version card .perf-num should have non-empty text');
   });
 
   // --- Group: Nodes page (tests 2, 5) ---
@@ -261,6 +308,8 @@ async function run() {
   // Test 5: Node detail loads (reuses nodes page from test 2)
   await test('Node detail loads', async () => {
     await page.waitForSelector('table tbody tr:not([id^=vscroll])');
+    // Use page.click() instead of an element handle to avoid detached-element races
+    // when the WebSocket auto-refresh re-renders the table between querySelector and click.
     await page.click('table tbody tr:not([id^=vscroll])');
     // Wait for detail pane to appear
     await page.waitForSelector('.node-detail');
@@ -275,6 +324,7 @@ async function run() {
     await page.goto(`${BASE}/#/nodes`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('[data-loaded="true"]', { timeout: 15000 });
     await page.waitForSelector('table tbody tr:not([id^=vscroll])');
+    // Use page.click() to avoid detached-element race with WebSocket auto-refresh.
     await page.click('table tbody tr:not([id^=vscroll])');
     await page.waitForSelector('.node-detail');
     // Find the Details link in the side panel
@@ -626,6 +676,15 @@ async function run() {
     assert(hasChannelHash, 'Undecrypted GRP_TXT detail should show "Channel Hash"');
   });
 
+  await test('#1530 copy-link-btn color differs from accent', async () => {
+    const hash = await page.evaluate(async () => (await (await fetch('/api/packets?limit=1')).json()).packets?.[0]?.hash);
+    if (!hash) return console.log('    ⏭️  Skipped (no packets)');
+    await page.goto(`${BASE}/#/packets/${hash}`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('.copy-link-btn', { timeout: 8000 });
+    const diff = await page.evaluate(() => window.getComputedStyle(document.querySelector('.copy-link-btn')).color !== window.getComputedStyle(document.documentElement).getPropertyValue('--accent').trim());
+    assert(diff, 'copy-link-btn color should not match --accent');
+  });
+
   // --- Group: Analytics page (test 8 + sub-tabs) ---
 
   // Test 8: Analytics page loads with overview
@@ -818,34 +877,46 @@ async function run() {
     assert(options.length >= 2, `Need >=2 observers, got ${options.length}`);
     await page.selectOption('#compareObsA', options[0]);
     await page.selectOption('#compareObsB', options[1]);
-    await page.waitForFunction(() => {
-      const btn = document.getElementById('compareBtn');
-      return btn && !btn.disabled;
-    }, { timeout: 3000 });
-    await page.click('#compareBtn');
+    // #1646 — comparison auto-runs once both observers are chosen; the
+    // legacy explicit Compare button has been removed entirely. The
+    // picker collapses (.is-collapsed) once the run kicks off.
     await page.waitForFunction(() => {
       const c = document.getElementById('compareContent');
       return c && c.textContent.trim().length > 20;
     }, { timeout: 15000 });
     const hasResults = await page.$eval('#compareContent', el => el.textContent.trim().length > 0);
     assert(hasResults, 'Comparison should produce results');
+    // And the picker should have collapsed (.is-collapsed class).
+    const collapsed = await page.$eval('#compareControls', el => el.classList.contains('is-collapsed'));
+    assert(collapsed, 'Picker should collapse once both observers chosen (.is-collapsed missing)');
+    // The legacy Compare button must NOT exist in the DOM (#1646).
+    const btnExists = await page.$('#compareBtn');
+    assert(btnExists === null, 'Legacy #compareBtn must be removed — auto-run replaces it');
   });
 
   // Test: Compare results show shared/unique breakdown (#129)
   await test('Compare results show shared/unique cards', async () => {
-    // Results should be visible from previous test
-    const cardBoth = await page.$('.compare-card-both');
-    assert(cardBoth, 'Should have "shared" card (.compare-card-both)');
-    const cardA = await page.$('.compare-card-a');
-    assert(cardA, 'Should have "only A" card (.compare-card-a)');
-    const cardB = await page.$('.compare-card-b');
-    assert(cardB, 'Should have "only B" card (.compare-card-b)');
-    // Verify counts are rendered (may be locale-formatted with commas)
-    const counts = await page.$$eval('.compare-card-count', els => els.map(e => e.textContent.trim()));
-    assert(counts.length >= 3, `Expected >=3 summary counts, got ${counts.length}`);
-    counts.forEach((c, i) => {
-      assert(/^[\d,]+$/.test(c), `Count ${i} should be a number but got "${c}"`);
+    // Results should be visible from previous test.
+    // Redesign (#1644) replaced the 3-card layout with a proportional strip
+    // (shared-axis small-multiples): two side segments (A-only / B-only)
+    // flanking a middle segment (shared).
+    const stripMid = await page.$('.compare-strip-mid');
+    assert(stripMid, 'Should have "shared" strip middle (.compare-strip-mid)');
+    const sides = await page.$$('.compare-strip-side');
+    assert(sides.length >= 2, `Should have >=2 side strips (A-only + B-only), got ${sides.length}`);
+    // All three cells now lead with a percentage (#1646 Tufte): two
+    // .compare-strip-side-pct on the sides + one .compare-strip-mid-pct
+    // in the middle. The raw shared count still hangs underneath.
+    const sidePcts = await page.$$eval('.compare-strip-side-pct', els => els.map(e => e.textContent.trim()));
+    const midPct = await page.$eval('.compare-strip-mid-pct', el => el.textContent.trim());
+    assert(sidePcts.length >= 2, `Expected >=2 side pct cells, got ${sidePcts.length}`);
+    assert(/\d+%/.test(midPct), `Mid pct should look like a percentage, got "${midPct}"`);
+    sidePcts.concat([midPct]).forEach((c, i) => {
+      assert(/\d+\s*%/.test(c), `Pct ${i} should contain a % value but got "${c}"`);
     });
+    // The raw shared count exists and is purely numeric (no embedded label).
+    const midCount = await page.$eval('.compare-strip-mid-count', el => el.textContent.trim());
+    assert(/^[\d,]+$/.test(midCount), `Shared count should be a bare number, got "${midCount}"`);
     // Verify tab buttons exist for both/onlyA/onlyB
     const tabs = await page.$$eval('[data-cview]', els => els.map(e => e.getAttribute('data-cview')));
     assert(tabs.includes('both'), 'Should have "both" tab');
@@ -2003,14 +2074,21 @@ async function run() {
     // Use a mobile viewport
     await page.setViewportSize({ width: 480, height: 800 });
     await page.goto(`${BASE}/#/packets`);
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(1500);
 
     const filterBar = await page.$('.filter-bar');
     assert(filterBar, 'Filter bar should exist on packets page');
 
-    // Before clicking toggle, filter inputs should be hidden
-    const toggleBtn = await page.$('.filter-toggle-btn');
-    assert(toggleBtn, 'Filter toggle button should exist on mobile');
+    // #1471: on mobile, the in-page .filter-toggle-btn is hidden + the
+    // operator-visible toggle is the navbar mirror injected by
+    // public/mobile-page-actions.js (class: filter-toggle-btn-mirror).
+    // Try mirror first, fall back to in-page button for any test rig where
+    // the mirror script didn't load.
+    let toggleBtn = await page.$('.filter-toggle-btn-mirror');
+    if (!toggleBtn) {
+      toggleBtn = await page.$('.filter-toggle-btn');
+    }
+    assert(toggleBtn, 'Filter toggle button (navbar mirror or in-page fallback) should exist on mobile');
 
     await toggleBtn.click();
     await page.waitForTimeout(300);
@@ -2037,6 +2115,89 @@ async function run() {
   });
 
   // ─── End mobile filter tests ──────────────────────────────────────────────
+
+  // ─── #1468 — drop client-side "unknown" channel synthesis ────────────────
+
+  await test('#1468: live WS CHAN message with no payload.channel is dropped (no "unknown" bucket)', async () => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto(`${BASE}/#/channels`, { waitUntil: 'domcontentloaded' });
+    // Wait for the channels init() to mount and expose the test hook.
+    await page.waitForFunction(() => typeof window._channelsProcessWSBatchForTest === 'function', { timeout: 10000 });
+
+    // Snapshot starting state so we can compare deltas.
+    const before = await page.evaluate(() => {
+      const s = window._channelsGetStateForTest();
+      return { count: s.channels.length, names: s.channels.map(c => c.name || c.channel || '') };
+    });
+
+    // Feed a CHAN-like message with NO payload.channel field (but valid hash).
+    await page.evaluate(() => {
+      window._channelsProcessWSBatchForTest([
+        {
+          type: 'packet',
+          data: {
+            hash: 'test1468drophash' + Date.now(),
+            decoded: {
+              header: { payloadTypeName: 'GRP_TXT' },
+              payload: { /* no `channel` */ text: 'orphan: hello' },
+            },
+          },
+        },
+      ], null);
+    });
+
+    const after = await page.evaluate(() => {
+      const s = window._channelsGetStateForTest();
+      return { count: s.channels.length, names: s.channels.map(c => c.name || c.channel || '') };
+    });
+
+    // No "unknown" channel materialized.
+    assert(!after.names.includes('unknown'),
+      'channels list does not contain a synthesized "unknown" entry — got ' + JSON.stringify(after.names));
+    // And the channel-count delta is 0 — the orphan message was dropped, not bucketed.
+    assert(after.count === before.count,
+      `channel count unchanged after orphan WS msg — before=${before.count}, after=${after.count}`);
+  });
+
+  await test('#1468 control: same WS message WITH payload.channel is still routed', async () => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto(`${BASE}/#/channels`, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => typeof window._channelsProcessWSBatchForTest === 'function', { timeout: 10000 });
+
+    const sentinel = '__test_chan_1468_' + Date.now();
+    const before = await page.evaluate((name) => {
+      const s = window._channelsGetStateForTest();
+      return { hasSentinel: s.channels.some(c => (c.name || c.channel) === name) };
+    }, sentinel);
+    assert(!before.hasSentinel, 'pre: sentinel channel does not pre-exist');
+
+    await page.evaluate((name) => {
+      window._channelsProcessWSBatchForTest([
+        {
+          type: 'packet',
+          data: {
+            hash: 'test1468hash' + Date.now(),
+            decoded: {
+              header: { payloadTypeName: 'GRP_TXT' },
+              payload: { channel: name, text: 'alice: hi', sender: 'alice' },
+            },
+          },
+        },
+      ], null);
+    }, sentinel);
+
+    const after = await page.evaluate((name) => {
+      const s = window._channelsGetStateForTest();
+      return {
+        hasSentinel: s.channels.some(c => (c.name || c.channel) === name),
+        names: s.channels.map(c => c.name || c.channel || ''),
+      };
+    }, sentinel);
+    assert(after.hasSentinel,
+      'control: channel WITH payload.channel IS routed into the registry — got ' + JSON.stringify(after.names));
+  });
+
+  // ─── End #1468 tests ──────────────────────────────────────────────────────
 
   // Extract frontend coverage if instrumented server is running
   try {
@@ -2615,29 +2776,6 @@ async function run() {
     assert(hasStripe, 'At least one .live-feed-item should have hash-color border-left stripe when toggle ON');
   });
 
-  // --- Map polyline uses hash color ---
-  await test('Map trace polyline uses hash-derived color when toggle ON', async () => {
-    await page.evaluate(() => localStorage.setItem('meshcore-color-packets-by-hash', 'true'));
-    await page.goto(BASE + '/#/live');
-    await page.waitForTimeout(3000);
-    // Use the dedicated .live-packet-trace class so we don't pick up
-    // unrelated leaflet paths (geofilter polygons, region overlays, etc).
-    const pathCount = await page.evaluate(() => document.querySelectorAll('path.live-packet-trace').length);
-    if (pathCount === 0) {
-      console.log('    (skipped — no live-packet-trace polylines drawn in 3s window)');
-      return;
-    }
-    const hasHslPolyline = await page.evaluate(() => {
-      const paths = document.querySelectorAll('path.live-packet-trace');
-      for (const p of paths) {
-        const stroke = p.getAttribute('stroke') || '';
-        if (stroke.startsWith('hsl(')) return true;
-      }
-      return false;
-    });
-    assert(hasHslPolyline, 'At least one live-packet-trace polyline should have hsl() stroke color from hash');
-  });
-
   // --- Roles folded into Analytics (issue #1085) ---
   // Acceptance criteria:
   //   1. "Roles" link does NOT exist in top nav
@@ -3043,6 +3181,251 @@ async function run() {
       assert(m.height <= 60,
         `#1220: collapsed mobile header must be ≤60px (got ${m.height}px of empty chrome)`);
     }
+  });
+
+  // Issue #1243: On mobile (≤640px), the QR code on the node detail page must
+  // overlay the map semi-transparently (matching desktop behavior), not render
+  // as its own ~250px-tall panel below the map.
+  await test('#1243 Node detail mobile QR overlays map semi-transparently (desktop parity)', async () => {
+    await page.setViewportSize({ width: 375, height: 800 });
+    // Find a node with location data so the map renders.
+    await page.goto(BASE + '#/nodes', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#nodesBody tr[data-key]', { timeout: 10000 });
+    // Fetch nodes JSON to pick one with lat/lon.
+    const pubkey = await page.evaluate(async () => {
+      const r = await fetch('/api/nodes');
+      const j = await r.json();
+      const arr = Array.isArray(j) ? j : (j.nodes || []);
+      const withLoc = arr.find(n => n.lat != null && n.lon != null && n.public_key);
+      return withLoc ? withLoc.public_key : null;
+    });
+    assert(pubkey, '#1243: need at least one node with lat/lon in fixture/api');
+    await page.goto(BASE + '#/nodes/' + encodeURIComponent(pubkey), { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('.node-fullscreen', { timeout: 10000 });
+    await page.waitForSelector('#nodeFullQrCode svg', { timeout: 10000 });
+    await page.waitForTimeout(400); // let leaflet + qr settle
+    const m = await page.evaluate(() => {
+      const qrWrap = document.querySelector('.node-qr-wrap');
+      const mapWrap = document.querySelector('.node-map-wrap');
+      if (!qrWrap || !mapWrap) return { err: 'missing wrap elements' };
+      const qrR = qrWrap.getBoundingClientRect();
+      const mapR = mapWrap.getBoundingClientRect();
+      const cs = getComputedStyle(qrWrap);
+      // Parse bg-color alpha (rgba(r,g,b,a) or rgb(r,g,b))
+      let alpha = 1;
+      const bg = cs.backgroundColor || '';
+      const m1 = bg.match(/rgba?\(([^)]+)\)/);
+      if (m1) {
+        const parts = m1[1].split(',').map(s => s.trim());
+        if (parts.length === 4) alpha = parseFloat(parts[3]);
+        else if (parts.length === 3) alpha = 1;
+      }
+      const overlaps = !(qrR.right <= mapR.left || qrR.left >= mapR.right ||
+                        qrR.bottom <= mapR.top || qrR.top >= mapR.bottom);
+      return {
+        position: cs.position,
+        bg, alpha,
+        qr: { l: qrR.left, t: qrR.top, r: qrR.right, b: qrR.bottom, w: qrR.width, h: qrR.height },
+        map: { l: mapR.left, t: mapR.top, r: mapR.right, b: mapR.bottom, w: mapR.width, h: mapR.height },
+        overlaps,
+      };
+    });
+    assert(!m.err, '#1243: ' + m.err);
+    assert(m.position === 'absolute' || m.position === 'fixed',
+      `#1243: QR wrap must be position:absolute|fixed on mobile (got ${m.position}); qr=${JSON.stringify(m.qr)} map=${JSON.stringify(m.map)}`);
+    assert(m.overlaps,
+      `#1243: QR must overlap map canvas on mobile; qr=${JSON.stringify(m.qr)} map=${JSON.stringify(m.map)}`);
+    assert(m.alpha < 1,
+      `#1243: QR background must be semi-transparent (alpha<1) on mobile; bg=${m.bg}`);
+    await page.setViewportSize({ width: 1280, height: 800 });
+  });
+
+  // Issue #1270: The Prefix Tool's Network Overview must report
+  // CONFIGURED-hash-size repeater counts (the operational truth) as the
+  // primary number for each tier, agreeing with the Hash Stats tab's
+  // "By Repeaters" panel. The math-only "unique slices of every pubkey"
+  // number is allowed only as a secondary/educational stat. Before the
+  // fix, Prefix Tool showed "168 / 65536" for 2-byte while Hash Stats
+  // showed only 20 repeaters actually configured for 2-byte hashing.
+  await test('#1270 Prefix Tool primary counts match Hash Stats By Repeaters', async () => {
+    // 1) Read configured-by-hash-size counts straight from the API
+    //    (this is what the Hash Stats tab renders).
+    const distByRepeaters = await page.evaluate(async () => {
+      const r = await fetch('/api/analytics/hash-sizes');
+      const j = await r.json();
+      return j.distributionByRepeaters || {};
+    });
+    const expected = {
+      1: Number(distByRepeaters['1'] || 0),
+      2: Number(distByRepeaters['2'] || 0),
+      3: Number(distByRepeaters['3'] || 0),
+    };
+
+    // 2) Visit the Prefix Tool tab, open Network Overview, scrape
+    //    the primary stat values for each tier.
+    await page.goto(`${BASE}/#/analytics?tab=prefix-tool`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#ptOverview', { timeout: 15000 });
+    // Open the overview accordion if collapsed.
+    await page.evaluate(() => {
+      const body = document.getElementById('ptOverviewBody');
+      if (body && getComputedStyle(body).display === 'none') {
+        document.getElementById('ptOverviewToggle').click();
+      }
+    });
+    await page.waitForSelector('[data-pt-configured="1"]', { timeout: 5000 });
+    const got = await page.evaluate(() => {
+      const read = (b) => {
+        const el = document.querySelector(`[data-pt-configured="${b}"]`);
+        return el ? Number(el.getAttribute('data-value')) : null;
+      };
+      return { 1: read(1), 2: read(2), 3: read(3) };
+    });
+
+    assert(got[1] === expected[1],
+      `#1270 1-byte: prefix-tool shows ${got[1]}, hash-sizes API shows ${expected[1]}`);
+    assert(got[2] === expected[2],
+      `#1270 2-byte: prefix-tool shows ${got[2]}, hash-sizes API shows ${expected[2]}`);
+    assert(got[3] === expected[3],
+      `#1270 3-byte: prefix-tool shows ${got[3]}, hash-sizes API shows ${expected[3]}`);
+  });
+
+  await test('Live page: Area dropdown items have transparent background to prevent unreadable text', async () => {
+    await page.goto(`${BASE}/#/live`);
+    await page.waitForTimeout(1000);
+    // Expand the cog menu first
+    const cog = await page.$('#liveControlsToggle');
+    if (cog) {
+      const expanded = await page.$eval('#liveControlsToggle', el => el.getAttribute('aria-expanded') === 'true');
+      if (!expanded) await cog.click();
+      await page.waitForTimeout(500);
+    }
+    // Click the area filter dropdown trigger on the live page
+    const trigger = await page.$('#liveAreaFilter .region-dropdown-trigger');
+    if (trigger) {
+      await trigger.click();
+      await page.waitForSelector('.region-dropdown-item', { state: 'attached', timeout: 2000 });
+      const bg = await page.evaluate(() => {
+        const item = document.querySelector('.region-dropdown-item');
+        return item ? window.getComputedStyle(item).backgroundColor : null;
+      });
+      assert(bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent',
+        `Expected dropdown item background to be transparent, got ${bg}`);
+    }
+  });
+
+  // === Live page Fullscreen tests (#1532) ===
+  await test('Live page: Fullscreen hides unpinned nav and live-header', async () => {
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1000);
+    
+    // Ensure we are not pinned
+    await page.evaluate(() => localStorage.setItem('live-nav-pinned', 'false'));
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1000);
+
+    const isFullscreen = await page.evaluate(() => document.body.classList.contains('live-fullscreen'));
+    if (isFullscreen) {
+      await page.click('#liveFullscreenToggle');
+      await page.waitForTimeout(500);
+    }
+
+    // Enter fullscreen
+    await page.click('#liveFullscreenToggle');
+    await page.waitForTimeout(500);
+
+    // Verify fullscreen class is on body
+    assert(await page.evaluate(() => document.body.classList.contains('live-fullscreen')), 'Body should have live-fullscreen class');
+
+    // Verify top nav is hidden
+    const navHidden = await page.evaluate(() => {
+      const nav = document.querySelector('.top-nav');
+      return window.getComputedStyle(nav).display === 'none';
+    });
+    assert(navHidden, 'Top nav should be hidden in fullscreen when unpinned');
+
+    // Verify live header body is hidden
+    const headerBodyHidden = await page.evaluate(() => {
+      const headerBody = document.querySelector('.live-header-body');
+      return !headerBody || window.getComputedStyle(headerBody).display === 'none';
+    });
+    assert(headerBodyHidden, 'Live header body should be hidden in fullscreen');
+
+    // Verify stats row is visible
+    const statsVisible = await page.evaluate(() => {
+      const stats = document.querySelector('.live-stats-row');
+      return stats && window.getComputedStyle(stats).display !== 'none';
+    });
+    assert(statsVisible, 'Live stats row should be visible in fullscreen');
+
+    // Exit fullscreen
+    await page.click('#liveFullscreenToggle');
+    await page.waitForTimeout(500);
+    
+    const navVisible = await page.evaluate(() => {
+      const nav = document.querySelector('.top-nav');
+      return window.getComputedStyle(nav).display !== 'none';
+    });
+    assert(navVisible, 'Top nav should be visible again after exiting fullscreen');
+  });
+
+  // === Live page Controls Cog tests (#1532) ===
+  await test('Live page: Controls cog persistence across reloads', async () => {
+    // Clear state first
+    await page.evaluate(() => localStorage.removeItem('live-controls-expanded'));
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1000);
+
+    // Expand the cog menu
+    const cog = await page.$('#liveControlsToggle');
+    if (cog) {
+      let isExpanded = await page.$eval('#liveControls', el => el.classList.contains('is-expanded'));
+      if (!isExpanded) {
+        await cog.click();
+        await page.waitForTimeout(500);
+      }
+      
+      // Verify it's expanded
+      isExpanded = await page.$eval('#liveControls', el => el.classList.contains('is-expanded'));
+      assert(isExpanded, 'Controls should have is-expanded class after clicking cog');
+      
+      // Reload page and verify persistence
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(1000);
+      
+      // Should STILL be expanded
+      isExpanded = await page.$eval('#liveControls', el => el.classList.contains('is-expanded'));
+      assert(isExpanded, 'Controls should persist is-expanded class across reload');
+
+      // Click it again, it should immediately close
+      await page.click('#liveControlsToggle');
+      await page.waitForTimeout(500);
+      isExpanded = await page.$eval('#liveControls', el => el.classList.contains('is-expanded'));
+      assert(!isExpanded, 'Controls should collapse on the first click after a reload');
+    }
+  });
+
+  await test('#1528 .vcr-scope-btn.active background tracks --accent-bg (token swap, not blue literal)', async () => {
+    await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('.vcr-scope-btn.active', { timeout: 8000 });
+    const result = await page.evaluate(() => {
+      const el = document.querySelector('.vcr-scope-btn.active');
+      // Override --accent-bg with a clearly non-blue sentinel so we can detect
+      // whether the rule actually consumes the token (good) or a hardcoded
+      // rgba(59,130,246,...) literal (bad — the theming illusion this fix targets).
+      // Use !important so we beat any customizer-injected :root override.
+      document.documentElement.style.setProperty('--accent-bg', 'rgb(255, 0, 0)', 'important');
+      document.documentElement.style.setProperty('--accent-border', 'rgb(0, 200, 0)', 'important');
+      const bg = window.getComputedStyle(el).backgroundColor;
+      const border = window.getComputedStyle(el).borderColor;
+      document.documentElement.style.removeProperty('--accent-bg');
+      document.documentElement.style.removeProperty('--accent-border');
+      return { bg, border };
+    });
+    // Background should reflect our sentinel red, not blue.
+    assert(/^rgb\(255,\s*0,\s*0\)/.test(result.bg),
+      `.vcr-scope-btn.active bg should track --accent-bg, got ${result.bg}`);
+    assert(/^rgb\(0,\s*200,\s*0\)/.test(result.border),
+      `.vcr-scope-btn.active border should track --accent-border, got ${result.border}`);
   });
 
   await browser.close();

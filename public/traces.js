@@ -9,14 +9,19 @@
     // Check URL for pre-filled hash — support both route param and query param
     const params = new URLSearchParams(location.hash.split('?')[1] || '');
     const urlHash = routeParam || params.get('hash') || '';
+    // Use the global 5-char OWASP escapeHtml from app.js. Hard-fail if it's
+    // missing — never fall back to identity (see #1537: map.js safeEsc bug).
+    if (typeof escapeHtml !== 'function') {
+      throw new Error('traces.js: global escapeHtml is missing — refusing to render unescaped input');
+    }
 
     app.innerHTML = `
       <div class="traces-page">
         <div class="page-header">
-          <h2>🔍 Packet Trace</h2>
+          <h2><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Packet Trace</h2>
         </div>
         <div class="trace-search">
-          <input type="text" id="traceHashInput" placeholder="Enter packet hash…" value="${urlHash}" aria-label="Packet hash to trace">
+          <input type="text" id="traceHashInput" placeholder="Enter packet hash…" value="${escapeHtml(urlHash)}" aria-label="Packet hash to trace">
           <button class="btn-primary" id="traceBtn">Trace</button>
         </div>
         <div id="traceResults"></div>
@@ -51,6 +56,7 @@
     const hash = input.value.trim();
     if (!hash) return;
     currentHash = hash;
+    history.replaceState(null, '', `#/tools/trace/${encodeURIComponent(hash)}`);
 
     const results = document.getElementById('traceResults');
     results.innerHTML = '<div class="text-center text-muted" style="padding:40px">Tracing…</div>';
@@ -69,14 +75,19 @@
         return;
       }
 
-      // Extract ALL unique paths from observations
-      const allPaths = [];
+      // Extract unique paths from observations.
+      // Drop partial paths that are a prefix of a longer observed path — these are
+      // the same packet seen at intermediate relay nodes before it reached the final
+      // hop, not genuinely different routes. Keeping them creates confusing long
+      // "shortcut" edges in the path graph that visually obscure the actual route.
+      const allPathsRaw = [];
       for (const t of traceData) {
         try {
           const hops = JSON.parse(t.path_json || '[]');
-          if (hops.length > 0) allPaths.push({ hops, observer: obsLabel(t) });
+          if (hops.length > 0) allPathsRaw.push({ hops, observer: obsLabel(t) });
         } catch {}
       }
+      const allPaths = dedupePrefixPaths(allPathsRaw);
       // Fallback to packet-level path
       if (allPaths.length === 0) {
         for (const p of packets) {
@@ -94,13 +105,13 @@
         try { decoded = JSON.parse(packetMeta.decoded_json); } catch {}
       }
 
-      renderResults(results, allPaths, decoded);
+      renderResults(results, allPaths, allPathsRaw, decoded);
     } catch (e) {
       results.innerHTML = `<div class="trace-empty" style="color:#ef4444">Error: ${e.message}</div>`;
     }
   }
 
-  function renderResults(container, allPaths, decoded) {
+  function renderResults(container, allPaths, allPathsRaw, decoded) {
     const uniqueObservers = [...new Set(traceData.map(t => t.observer))];
     const typeName = packetMeta ? payloadTypeName(packetMeta.payload_type) : '—';
     const typeClass = packetMeta ? payloadTypeColor(packetMeta.payload_type) : 'unknown';
@@ -136,12 +147,12 @@
         </div>
       </div>
 
-      ${allPaths.length > 0 ? renderPathGraph(allPaths) : ''}
+      ${allPaths.length > 0 ? renderPathGraph(allPaths, allPathsRaw, decoded) : ''}
       ${traceData.length > 0 ? renderTimeline(t0, spreadMs) : ''}
     `;
   }
 
-  function renderPathGraph(allPaths) {
+  function renderPathGraph(allPaths, allPathsRaw, decoded) {
     // Collect unique nodes and edges across all observed paths
     const nodeSet = new Set();
     const edgeMap = new Map(); // "from→to" => Set of observer labels
@@ -156,6 +167,20 @@
         const key = chain[i] + '→' + chain[i + 1];
         if (!edgeMap.has(key)) edgeMap.set(key, new Set());
         edgeMap.get(key).add(observer);
+      }
+    }
+
+    // Attribute prefix observers to the edges they witnessed.
+    // Prefix paths are dropped from allPaths to avoid spurious layout edges, but
+    // their observers still corroborated the shared prefix segment — credit them
+    // to the edges that exist in the full-path graph.
+    const allPathsSet = new Set(allPaths);
+    for (const entry of allPathsRaw) {
+      if (allPathsSet.has(entry)) continue;
+      const chain = ['Origin', ...entry.hops]; // no 'Dest': prefix stopped here
+      for (let i = 0; i < chain.length - 1; i++) {
+        const key = chain[i] + '→' + chain[i + 1];
+        if (edgeMap.has(key)) edgeMap.get(key).add(entry.observer);
       }
     }
 
@@ -185,7 +210,7 @@
     const colCount = maxCol + 1;
     const svgW = Math.max(600, colCount * 200);
     const maxRows = Math.max(...[...colGroups.values()].map(g => g.length));
-    const svgH = Math.max(120, maxRows * 60 + 40);
+    const svgH = Math.max(160, maxRows * 80 + 60);
     const colSpacing = svgW / (colCount + 1);
 
     // Compute node positions
@@ -236,14 +261,41 @@
     }
 
     let nodesSvg = '';
+    // Per-hop SNR overlay: TRACE packets only, numeric labels at hop midpoints
+    // (Tufte: no double-encoding via color/thickness — number is the signal).
+    const snrValues = (decoded && decoded.type === 'TRACE' && Array.isArray(decoded.snrValues))
+      ? decoded.snrValues : null;
+    if (snrValues && snrValues.length > 0) {
+      // Build the hop chain from the first observed full path (Origin → hops → Dest).
+      const firstPath = allPaths[0];
+      if (firstPath && Array.isArray(firstPath.hops)) {
+        const chain = ['Origin', ...firstPath.hops, 'Dest'];
+        const hopCount = Math.min(snrValues.length, chain.length - 1);
+        for (let i = 0; i < hopCount; i++) {
+          const p1 = nodePos.get(chain[i]);
+          const p2 = nodePos.get(chain[i + 1]);
+          if (!p1 || !p2) continue;
+          const v = snrValues[i];
+          if (v == null || !Number.isFinite(Number(v))) continue;
+          const mx = (p1.x + p2.x) / 2;
+          const my = (p1.y + p2.y) / 2 - 6;
+          const label = Number(v).toFixed(1);
+          nodesSvg += `<text class="hop-snr" x="${mx}" y="${my}" text-anchor="middle" font-size="10" font-weight="600" fill="var(--text, #111827)">${label}</text>`;
+        }
+      }
+    }
     for (const [node, pos] of nodePos) {
       const isEndpoint = node === 'Origin' || node === 'Dest';
-      const r = isEndpoint ? 18 : 14;
-      const fill = isEndpoint ? 'var(--accent, #3b82f6)' : 'var(--surface-2, #374151)';
-      const stroke = isEndpoint ? 'var(--accent, #3b82f6)' : 'var(--border, #4b5563)';
-      const label = isEndpoint ? node : node;
+      const r = isEndpoint ? 18 : 16;
+      const fill = isEndpoint ? 'var(--accent, #3b82f6)' : 'var(--accent-bg, rgba(59,130,246,0.12))';
+      const stroke = isEndpoint ? 'var(--accent, #3b82f6)' : 'var(--accent, #3b82f6)';
       nodesSvg += `<circle cx="${pos.x}" cy="${pos.y}" r="${r}" fill="${fill}" stroke="${stroke}" stroke-width="2"/>`;
-      nodesSvg += `<text x="${pos.x}" y="${pos.y + 4}" text-anchor="middle" fill="white" font-size="${isEndpoint ? 10 : 9}" font-weight="${isEndpoint ? 700 : 500}">${escapeHtml(label)}</text>`;
+      if (isEndpoint) {
+        nodesSvg += `<text x="${pos.x}" y="${pos.y + 4}" text-anchor="middle" fill="white" font-size="10" font-weight="700">${escapeHtml(node)}</text>`;
+      } else {
+        // Label below the circle so it doesn't fight for space inside the small node
+        nodesSvg += `<text x="${pos.x}" y="${pos.y + r + 14}" text-anchor="middle" fill="var(--text, #111827)" font-size="10" font-weight="500">${escapeHtml(node)}</text>`;
+      }
     }
 
     // Legend: unique paths
@@ -293,6 +345,20 @@
         </div>
         ${rows.join('')}
       </div>`;
+  }
+
+  function dedupePrefixPaths(rawPaths) {
+    return rawPaths.filter(({ hops }) => {
+      const sig = JSON.stringify(hops);
+      return !rawPaths.some(other => {
+        if (other.hops.length <= hops.length) return false;
+        return JSON.stringify(other.hops.slice(0, hops.length)) === sig;
+      });
+    });
+  }
+
+  if (typeof window !== 'undefined') {
+    window.TracesHelpers = { dedupePrefixPaths, renderPathGraph };
   }
 
   registerPage('traces', { init, destroy });

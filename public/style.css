@@ -1,5 +1,40 @@
 /* === CoreScope — style.css === */
 
+/* Phosphor icon sprite helper (#1648 M1).
+ * Icons live in public/icons/phosphor-sprite.svg as <symbol id="ph-NAME">.
+ * Reference with: <svg class="ph-icon"><use href="/icons/phosphor-sprite.svg#ph-NAME"/></svg>
+ * Inherits color via currentColor; sized to 1em so it scales with surrounding text. */
+.ph-icon {
+  width: 1em;
+  height: 1em;
+  /* #1648 M1 follow-up: icons are 1em-sized so they scale with the
+   * surrounding text — but several nav surfaces use a smaller font-size
+   * (top-nav text is ~12.8px), which dropped the rendered icon below the
+   * intended 16px floor. Pin .ph-icon's own font-size to 16px so the
+   * icon scales independently of the parent's text size. */
+  font-size: 16px;
+  vertical-align: -0.125em;
+  fill: currentColor;
+  flex-shrink: 0;
+}
+
+/* Status-token color classes (#1648 M3).
+ * Replace 🟢🟡🔴⚪/✅⚠️❌ emoji dots with Phosphor sprites that inherit EMOJI-OK-COMMENT
+ * their color via currentColor. Each class threads the existing
+ * --status-* color token so dark/light theming continues to work.
+ *
+ * Pattern:
+ *   <span class="status-ok"><svg class="ph-icon"><use href="…#ph-circle-fill"/></svg></span>
+ */
+.status-ok    { color: var(--status-green); }
+.status-warn  { color: var(--status-yellow); }
+.status-err   { color: var(--status-red); }
+.status-muted { color: var(--text-muted, #94a3b8); }
+.status-ok .ph-icon,
+.status-warn .ph-icon,
+.status-err .ph-icon,
+.status-muted .ph-icon { fill: currentColor; }
+
 /* Aldrich webfont — used by the navbar logo SVG (issue #1137 follow-up).
  * Self-hosted woff2 (latin subset from Google Fonts, ~16KB). Only weight
  * available is 400; the SVG's font-weight="700" synthesizes bold. */
@@ -62,6 +97,12 @@
  * ============================================================ */
 
 :root {
+  /* Node-quality link strength colours (bottleneck tiers). Dark-theme
+     overrides live in the [data-theme="dark"] block below (brighter hues). */
+  --link-strong: #1a7f37;
+  --link-medium: #bf8700;
+  --link-weak: #cf222e;
+  --link-oneway: #8c959f;  /* one-way (no two-way link) — distinct from weak red */
   /* --- Fluid spacing scale ---------------------------------
    * Targets at 1440px viewport: 4 / 8 / 16 / 24 / 32 / 48 px.
    * Min/max clamps keep small viewports usable and prevent
@@ -104,6 +145,8 @@
   --nav-text-muted: #cbd5e1;
   --nav-active-bg: rgba(74, 158, 255, 0.15);
   --accent: #4a9eff;
+  --accent-bg: rgba(59, 130, 246, 0.12);
+  --accent-border: rgba(59, 130, 246, 0.25);
   --geo-filter-color: #3b82f6;
   --status-green: #22c55e;
   --status-yellow: #eab308;
@@ -113,6 +156,10 @@
   --status-amber: #f59e0b;
   --status-amber-light: #fef3c7;
   --status-amber-text: #92400e;
+  /* #1648 M6 (M4 CDP carry-forward): named token for the neutral/info
+     accent used as the unrolled-route hop fallback color (was #3b82f6
+     baked in route-render.js). Themes via dark-mode block below. */
+  --status-info: #3b82f6;
   --path-inspector-speculative: #d97706;
   --role-observer: #8b5cf6;
   --accent-hover: #6db3ff;
@@ -178,6 +225,9 @@
   --bg-secondary: var(--surface-2);
   --text-secondary: var(--text-muted);
   --bg: var(--surface);
+  /* PR #893: --shadow used by .theme-toggle thumb shadow; define in :root for
+   * light theme. Dark theme override is set in both dark-mode blocks below. */
+  --shadow: rgba(0,0,0,0.3);
   --trace-ghost-color: #94a3b8;
 
   /* #1128: documented z-index scale. Use these custom props for any new
@@ -196,11 +246,12 @@
   --z-tooltip: 9200;
 }
 
-/* ⚠️ DARK THEME VARIABLES — KEEP BOTH BLOCKS IN SYNC
+/* ⚠️ DARK THEME VARIABLES — KEEP BOTH BLOCKS IN SYNC EMOJI-OK-COMMENT
    The media query handles OS-level dark mode (auto); [data-theme="dark"] handles manual toggle.
    When changing dark theme variables, update BOTH blocks below. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    color-scheme: dark;
     --status-green: #22c55e;
     --status-yellow: #eab308;
     --status-red: #ef4444;
@@ -210,13 +261,14 @@
     --status-amber-light: #422006;
     --status-amber-text: #fcd34d;
     --path-inspector-speculative: #f59e0b;
+    --status-info: #60a5fa;
     --surface-0: #0f0f23;
     --surface-1: #1a1a2e;
     --surface-2: #232340;
     --surface-3: #2d2d50;
     --surface: var(--surface-1);
     --content-bg: var(--surface-0);
-    --card-bg: var(--surface-1);
+    --card-bg: var(--surface-2);
     --text: #e2e8f0;
     --text-muted: #a8b8cc;
     --border: #334155;
@@ -226,12 +278,19 @@
     --input-bg: #1e1e34;
     --selected-bg: #1e3a5f;
     --hover-bg: rgba(255,255,255, 0.06);
+    --shadow: rgba(0,0,0,0.5);
     --trace-ghost-color: #94a3b8;
     --section-bg: #1e1e34;
   }
 }
-/* ⚠️ DARK THEME VARIABLES — KEEP IN SYNC with @media block above */
+/* ⚠️ DARK THEME VARIABLES — KEEP IN SYNC with @media block above (EMOJI-OK-COMMENT) */
 [data-theme="dark"] {
+  color-scheme: dark;
+  /* Brighter link-strength hues for contrast on dark map tiles + surfaces. */
+  --link-strong: #3fb950;
+  --link-medium: #d29922;
+  --link-weak: #f85149;
+  --link-oneway: #768390;
   --status-green: #22c55e;
   --status-yellow: #eab308;
   --status-red: #ef4444;
@@ -240,13 +299,14 @@
   --status-amber: #f59e0b;
   --status-amber-light: #422006;
   --status-amber-text: #fcd34d;
+  --status-info: #60a5fa;
   --surface-0: #0f0f23;
   --surface-1: #1a1a2e;
   --surface-2: #232340;
   --surface-3: #2d2d50;
   --surface: var(--surface-1);
   --content-bg: var(--surface-0);
-  --card-bg: var(--surface-1);
+  --card-bg: var(--surface-2);
   --text: #e2e8f0;
   --text-muted: #a8b8cc;
   --border: #334155;
@@ -256,6 +316,7 @@
   --input-bg: #1e1e34;
   --selected-bg: #1e3a5f;
   --hover-bg: rgba(255,255,255, 0.06);
+  --shadow: rgba(0,0,0,0.5);
   --trace-ghost-color: #94a3b8;
   --section-bg: #1e1e34;
 }
@@ -284,8 +345,16 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
    all interactive controls. Targets are achieved with min-height/min-width
    plus inline-flex centering so existing visual styling (font-size, padding,
    icon size) is preserved on desktop while the *hit area* grows for touch.
-   Issue #1060. */
-.nav-link { min-height: 48px; display: inline-flex; align-items: center; }
+   Issue #1060.
+
+   Issue #1400: the global `min-height: 48px` on `.nav-link` was the root
+   cause of ~20 recurring nav-vanishing bugs (#1391, #1396, and ~18 earlier
+   symptoms). 48px links + padding inflated `.nav-links` to 56px tall inside
+   a 52px `.top-nav` with `overflow:hidden`; Firefox flex-centered the
+   over-tall item to a negative y, clipping the entire link strip ABOVE the
+   viewport. Touch-target sizing is preserved for mobile via the
+   `@media (max-width: 767px)` override added near the hamburger block. */
+.nav-link { display: inline-flex; align-items: center; }
 
 /* Generic button surfaces — filter bar, modal buttons, inline .btn usages.
    inline-flex keeps text/icons centered without changing visible padding much. */
@@ -373,7 +442,6 @@ button.ch-item {
 .ch-scroll-btn,
 .chooser-btn,
 .clock-filter-btn,
-.compare-btn,
 .copy-link-btn,
 .alab-btn {
   min-height: 48px;
@@ -395,7 +463,6 @@ button.ch-item {
 .ch-scroll-btn:active,
 .chooser-btn:active,
 .clock-filter-btn:active,
-.compare-btn:active,
 .copy-link-btn:active,
 .alab-btn:active {
   background: var(--row-hover);
@@ -422,6 +489,16 @@ input[type="week"] {
   min-height: 48px;
   box-sizing: border-box;
   touch-action: manipulation;
+}
+
+/* Theme the UA-native checkbox + radio so they pick up the page accent
+ * instead of rendering as bare white squares against the dark theme.
+ * Pairs with `color-scheme: dark` on the dark-theme rule so the box
+ * surround also re-skins. (Tufte #1646 — bare native widgets are
+ * chartjunk-by-omission: they advertise the chrome, not the data.) */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
 }
 
 /* Visible :active states — touch devices have no hover, so :active is the
@@ -491,19 +568,31 @@ input[type="week"] {
   padding: 0 var(--gutter); height: 52px;
   position: sticky; top: 0; z-index: 1100;
   box-shadow: 0 2px 8px rgba(0,0,0,.3);
-  flex-wrap: nowrap; overflow-x: hidden; overflow-y: visible; min-width: 0;
+  flex-wrap: nowrap; overflow: hidden; min-width: 0;
+  /* #1413: enforce a minimum horizontal gap between flex children of
+     .top-nav (.nav-left and .nav-right). Without this the only thing
+     pushing nav-right away from nav-left was justify-content: space-
+     between, which collapses to zero whenever nav-left's intrinsic
+     content fills the row — including the historic vw~1101..1599 band
+     where .nav-stats reappears (display:flex) and shoves nav-right
+     leftward to overlap the .nav-more-btn. */
+  column-gap: 16px;
 }
-.nav-left { display: flex; align-items: center; gap: var(--space-lg); min-width: 0; flex-shrink: 1; overflow-x: hidden; overflow-y: visible; }
+/* #1403: removed overflow:hidden — was clipping flex children offscreen (vertical) AND clipping the More dropdown contents. The original purpose was to prevent horizontal overflow during Priority+ measurement (#1066) — that purpose is served by .top-nav itself which still has overflow:hidden. */
+.nav-left { display: flex; align-items: center; gap: var(--space-lg); min-width: 0; flex-shrink: 1; }
 .nav-brand { display: flex; align-items: center; gap: var(--space-sm); text-decoration: none; color: var(--nav-text); font-weight: 700; font-size: var(--fs-md); }
 .brand-icon { font-size: 20px; }
-.brand-logo {
+/* #1450 — split .brand-logo by element type:
+   - Inline default wordmark (<svg>) keeps the 125x36 pin tuned to its
+     viewBox (#1141 widened it to fit CORE/SCOPE; intrinsic content
+     ratio ~3.08:1, so width:125px @ height:36px is the natural box).
+   - Operator custom logo via branding.logoUrl is an <img>, whose
+     natural aspect ratio MUST be preserved — pinning width:125px on
+     a 1:1 or portrait image squishes it into a pill. Use width:auto
+     with a max-width cap so wide logos don't blow the nav layout. */
+svg.brand-logo {
   display: block;
   height: 36px;
-  /* Width matches the inline SVG's effective content aspect (~3.08:1)
-     after cropping to the wordmark+nodes region in the navbar viewBox.
-       /* Pinned to match the SVG intrinsic width (#1141 followup: viewBox
-     widened to 150 10 970 280 to fit CORE/SCOPE wordmark; intrinsic
-     width 125 keeps the text legible at the same ~36px height). */
   width: 125px;
   max-height: 36px;
   /* The logo is inlined into the DOM (PR #1137) so it inherits page
@@ -511,6 +600,14 @@ input[type="week"] {
      in :root above. The .top-nav scope below overrides --logo-text to
      --nav-text so the wordmark stays readable on the dark navbar even
      when the page theme is Light. */
+}
+img.brand-logo {
+  display: block;
+  height: 36px;
+  width: auto;          /* preserve natural aspect of operator image */
+  max-width: 200px;     /* cap wide logos so they can't push nav-right off */
+  max-height: 36px;
+  object-fit: contain;  /* defensive — never crop or stretch the image */
 }
 .top-nav {
   /* Navbar lives on --nav-bg (typically dark), so the brand wordmark
@@ -580,7 +677,7 @@ input[type="week"] {
   }
 }
 
-.nav-links { display: flex; align-items: center; gap: var(--space-xs); }
+.nav-links { display: flex; align-items: center; gap: var(--space-xs); flex: 1 1 auto; min-width: 0; }
 .nav-link {
   color: var(--nav-text-muted); text-decoration: none;
   padding: 14px clamp(8px, 0.6vw + 4px, 14px); font-size: var(--fs-sm);
@@ -619,7 +716,7 @@ input[type="week"] {
 }
 .nav-btn:hover { background: var(--nav-bg2); color: var(--nav-text); }
 
-/* === Theme Toggle Switch (chicagooffline) === */
+/* === Theme Toggle Switch === */
 .theme-toggle {
   display: inline-flex; align-items: center; cursor: pointer;
   padding: 0; margin: 0; border: none; background: none;
@@ -637,10 +734,17 @@ input[type="week"] {
 .theme-toggle input:checked ~ .theme-toggle-track {
   background: var(--accent);
 }
+/* PR #893 follow-up: keyboard focus indicator. The native checkbox is visually
+ * hidden, so we draw the ring on the track sibling when the checkbox is
+ * :focus-visible. Matches the global focus-ring style above. */
+.theme-toggle input:focus-visible ~ .theme-toggle-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .theme-toggle-thumb {
   position: absolute; left: 3px; width: 18px; height: 18px;
-  background: #fff; border-radius: 50%;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  background: var(--nav-text); border-radius: 50%;
+  box-shadow: 0 1px 3px var(--shadow);
   transition: transform 0.2s ease;
   z-index: 1;
 }
@@ -657,6 +761,23 @@ input[type="week"] {
 .theme-toggle-moon { left: 4px; opacity: 0; }
 .theme-toggle input:checked ~ .theme-toggle-track .theme-toggle-sun { opacity: 0; }
 .theme-toggle input:checked ~ .theme-toggle-track .theme-toggle-moon { opacity: 1; }
+/* PR #893 follow-up: respect prefers-reduced-motion — disable the slide/fade
+ * animation so the thumb snaps to position. */
+@media (prefers-reduced-motion: reduce) {
+  .theme-toggle-track,
+  .theme-toggle-thumb,
+  .theme-toggle-icon { transition: none; }
+}
+/* PR #893 follow-up: Windows High Contrast / forced-colors mode — the track
+ * background and thumb shadow get flattened to system colors, so explicitly
+ * keep a system-colored border on track and thumb to stay visible. */
+@media (forced-colors: active) {
+  .theme-toggle-track { border: 1px solid CanvasText; background: Canvas; }
+  .theme-toggle-thumb { background: CanvasText; box-shadow: none; }
+  .theme-toggle input:focus-visible ~ .theme-toggle-track {
+    outline: 2px solid Highlight;
+  }
+}
 
 /* Hide version badge (chicagooffline) */
 .nav-stats .version-badge { display: none; }
@@ -667,24 +788,6 @@ input[type="week"] {
 }
 .nav-stats .stat-val { color: var(--nav-text); font-weight: 600; transition: color 0.3s ease; }
 .nav-stats .stat-val.updated { color: var(--accent); }
-.nav-stats .engine-badge {
-  font-size: 10px; font-weight: 600; font-family: var(--mono);
-  color: var(--nav-text-muted); background: rgba(255,255,255,0.1);
-  padding: 1px 5px; border-radius: var(--badge-radius);
-  letter-spacing: 0.5px; text-transform: lowercase;
-}
-.nav-stats .version-badge {
-  font-size: 10px; font-weight: 600; font-family: var(--mono);
-  color: var(--nav-text-muted); background: rgba(255,255,255,0.1);
-  padding: 1px 5px; border-radius: var(--badge-radius);
-  letter-spacing: 0.5px;
-}
-.nav-stats .version-badge a {
-  color: var(--nav-text-muted); text-decoration: none;
-}
-.nav-stats .version-badge a:hover {
-  color: var(--nav-text); text-decoration: underline;
-}
 
 /* === Layout === */
 /* Default: body-scroll mode — content pushes beyond viewport, iOS status-bar
@@ -742,7 +845,7 @@ input[type="week"] {
 /* === Filter toolbar (#1122)
  * Toolbar layout is composed of fenced .filter-group clusters:
  *   1. Quick filters       — text inputs (hash, node, observer, region, type, channel)
- *   2. Toggles             — Group by Hash, ★ My Nodes
+ *   2. Toggles             — Group by Hash, ★ My Nodes EMOJI-OK-COMMENT
  *   3. Time window         — last-N selector
  *   4. Sort & view options — observer sort, columns toggle, hex paths
  * Adjacent .filter-group + .filter-group siblings get a left divider + padding
@@ -754,20 +857,20 @@ input[type="week"] {
 .filter-bar input, .filter-bar select {
   padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px;
   font-size: 13px; background: var(--input-bg); color: var(--text); font-family: var(--font);
-  height: 34px; box-sizing: border-box; line-height: 1;
+  height: 34px; min-height: 34px; box-sizing: border-box; line-height: 1;
 }
 .filter-bar input { width: 120px; }
 .filter-bar select { min-width: 90px; }
 .filter-bar .btn {
   padding: 6px 14px; border: 1px solid var(--border); border-radius: 6px;
   background: var(--input-bg); cursor: pointer; font-size: 13px; transition: all .15s;
-  font-family: var(--font); color: var(--text); height: 34px; box-sizing: border-box; line-height: 1;
+  font-family: var(--font); color: var(--text); height: 34px; min-height: 34px; box-sizing: border-box; line-height: 1;
 }
 .filter-group { display: flex; gap: 6px; align-items: center; }
 /* #1124 (MAJOR-3): each grouped cluster wraps as a single unit at narrow
  * widths instead of letting individual controls reflow across categories. */
 .filter-bar .filter-group { flex-wrap: nowrap; }
-.filter-group .btn { padding: 4px 10px; font-size: 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); cursor: pointer; transition: background 0.15s, color 0.15s; }
+.filter-group .btn { padding: 4px 10px; font-size: 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); cursor: pointer; transition: background 0.15s, color 0.15s; height: 34px; min-height: 34px; box-sizing: border-box; line-height: 1; }
 .filter-group .btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .filter-group .btn:hover:not(.active) { background: var(--surface-2); }
 .filter-group + .filter-group { border-left: 1px solid var(--border); padding-left: 12px; margin-left: 6px; }
@@ -782,6 +885,7 @@ input[type="week"] {
 .sort-help:hover .sort-help-tip { display: block; }
 .filter-bar .btn:hover { background: var(--row-hover); }
 .filter-bar .btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.filter-bar .col-toggle-btn { height: 34px; min-height: 34px; }
 
 .btn-icon {
   background: none; border: 1px solid var(--border); border-radius: 6px;
@@ -815,7 +919,195 @@ input[type="week"] {
   overflow: hidden; text-overflow: ellipsis;
   max-width: 0; /* forces td to respect table width instead of expanding to content */
 }
-.data-table td.col-details { white-space: normal; word-break: break-word; }
+.data-table td.col-details { white-space: normal; word-break: break-word; max-width: 480px; }
+/* #1415: pin the expand-chevron column narrow at every viewport.
+ * Chevron glyph is ~16px wide; legacy column auto-sized to 50-180px and shoved every
+ * downstream data column right. 32px is enough for the ▶/▼ + 8px padding. */
+.data-table th.col-expand,
+.data-table td.col-expand {
+  width: 32px; min-width: 32px; max-width: 32px;
+  padding: 3px 4px; text-align: center;
+}
+
+/* #1415 / #1458 / #1461 — mobile packets UX overhaul.
+ * NOTE: hiding the first dt/dd pair below assumes Payload Type is the
+ * first <dt> in .detail-meta (per packets.js renderDetail). Keep that
+ * invariant — test-issue-1415-packets-layout.js asserts it. */
+@media (max-width: 600px) {
+  /* #1: kill empty chevron rail */
+  #pktTable th.col-expand,
+  #pktTable td.col-expand { display: none !important; }
+
+  /* #1b: slim THEAD ~24px sticky */
+  #pktTable thead th {
+    padding: 3px 6px !important;
+    font-size: 9px !important;
+    line-height: 1.2 !important;
+    letter-spacing: 0.04em !important;
+    text-transform: uppercase;
+    height: 24px !important;
+  }
+  #pktTable thead { position: sticky; top: 0; z-index: 5; background: var(--surface-1, #1a1a1a); }
+
+  /* #2: hide page-header row + filter-expr.
+   * pause + Filters pill are mirrored into .nav-left by mobile-page-actions.js.
+   * NOTE: do NOT display:none the entire .filter-bar — the original
+   * .filter-toggle-btn lives inside it and must remain clickable for the
+   * #534 E2E test (and for any user whose navbar mirror failed to inject). */
+  #pktLeft .page-header { display: none !important; }
+  #pktLeft .pkt-filter-expr { display: none !important; }
+  /* #1461 followup: the navbar mirror is always present on mobile.
+   * Hide the in-page Filters button \u2014 the test #534 now clicks the
+   * navbar mirror (.filter-toggle-btn-mirror) instead. */
+  .filter-bar > .filter-toggle-btn {
+    display: none !important;
+  }
+  /* Bar itself has no chrome unless expanded */
+  .filter-bar {
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    min-height: 0 !important;
+  }
+  .filter-bar.filters-expanded {
+    padding: 6px 8px !important;
+    margin-bottom: 4px !important;
+    background: var(--surface-2, rgba(0,0,0,0.05)) !important;
+    border: 1px solid var(--border, #333) !important;
+    border-radius: 6px !important;
+  }
+
+  /* Navbar-mirror buttons injected by mobile-page-actions.js. Visual tokens
+   * (border, colors) live here so the customizer can theme them and so we
+   * don't ship them as inline cssText strings. */
+  .mpa-btn-icon {
+    padding: 4px 6px;
+    font-size: 14px;
+    background: transparent;
+    border: 1px solid var(--border, #444);
+    border-radius: 6px;
+    color: var(--nav-text, #fff);
+    cursor: pointer;
+  }
+  .mpa-btn-pill {
+    padding: 4px 10px;
+    font-size: 12px;
+    background: transparent;
+    border: 1px solid var(--border, #444);
+    border-radius: 999px;
+    color: var(--nav-text, #fff);
+    cursor: pointer;
+    font-weight: 500;
+  }
+  .mpa-toast {
+    position: fixed;
+    left: 50%;
+    bottom: 90px;
+    transform: translateX(-50%);
+    background: var(--surface-2, #222);
+    color: var(--text, #fff);
+    padding: 10px 16px;
+    border: 1px solid var(--border, #444);
+    border-radius: 8px;
+    font-size: 13px;
+    max-width: 80vw;
+    z-index: 9999;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    transition: opacity .3s;
+  }
+
+  .filter-bar.filters-expanded {
+    padding: 6px 8px !important;
+    margin-bottom: 4px !important;
+    background: var(--surface-2, rgba(0,0,0,0.05)) !important;
+    border: 1px solid var(--border, #333) !important;
+    border-radius: 6px !important;
+    height: auto;
+  }
+
+  /* #3: detail panel cleanup */
+  /* Strip redundant src→dst line (identity in sticky header) */
+  .mobile-detail-sheet .detail-srcdst { display: none !important; }
+  /* Hide boxed "decoded message" card on mobile — content already in
+   * the sticky header's semantic summary */
+  .mobile-detail-sheet .detail-message { display: none !important; }
+  /* Hide PAYLOAD TYPE row (first dt+dd pair — already in header badge) */
+  .mobile-detail-sheet dl.detail-meta > dt:first-child,
+  .mobile-detail-sheet dl.detail-meta > dt:first-child + dd { display: none !important; }
+  /* 2-col grid for label/value rows */
+  .mobile-detail-sheet dl.detail-meta {
+    display: grid;
+    grid-template-columns: minmax(90px, 30%) 1fr;
+    gap: 4px 10px;
+    margin: 8px 0 !important;
+  }
+  .mobile-detail-sheet dl.detail-meta dt {
+    margin: 0 !important;
+    padding: 0 !important;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    align-self: center;
+  }
+  .mobile-detail-sheet dl.detail-meta dd {
+    margin: 0 !important;
+    padding: 0 !important;
+    font-size: 13px;
+  }
+
+  /* #4: sheet structure — kill handle, sticky header inside sheet, clear
+   * bottom-nav (58px tall) so last row doesn't get cut off, taller max */
+  /* Restructure: outer sheet has fixed height + overflow:hidden; the
+   * .mobile-sheet-content is the ONLY scroll region. ✕ close stays sticky EMOJI-OK-COMMENT
+   * pinned at top of the sheet. Title also stays sticky within the
+   * scroll region. */
+  .mobile-detail-sheet {
+    max-height: calc(100vh - 110px) !important;  /* leave room for bottom nav */
+    padding: 0 !important;
+    overflow: hidden !important;
+    display: none;
+    flex-direction: column;
+  }
+  .mobile-detail-sheet.open { display: flex !important; }
+  .mobile-sheet-handle { display: none !important; }  /* conflicts with browser pull-to-refresh */
+  .mobile-sheet-close {
+    position: absolute !important;
+    top: 6px !important;
+    right: 10px !important;
+    background: var(--surface-2, rgba(0,0,0,0.6)) !important;
+    border-radius: 999px !important;
+    width: 32px !important;
+    height: 32px !important;
+    display: flex !important;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px !important;
+    z-index: 20 !important;
+    border: 1px solid var(--border, #444) !important;
+  }
+  .mobile-sheet-content {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 12px 12px 60px !important;
+    /* visible scrollbar so operator sees there's more */
+    scrollbar-width: thin;
+  }
+  .mobile-sheet-content::-webkit-scrollbar { width: 6px; }
+  .mobile-sheet-content::-webkit-scrollbar-thumb { background: var(--border, #555); border-radius: 3px; }
+  /* Sticky in-sheet header for packet identity */
+  .mobile-detail-sheet .detail-title {
+    position: sticky;
+    top: 0;
+    background: var(--detail-bg);
+    z-index: 5;
+    padding: 6px 36px 8px 0;
+    margin: 0 0 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+}
 .data-table td:has(.spark-bar), .data-table td.col-spark { max-width: none; overflow: visible; min-width: 80px; }
 .data-table .col-time { min-width: clamp(72px, 8vw, 108px); white-space: nowrap; }
 
@@ -919,6 +1211,33 @@ body.scroll-locked { overflow: hidden; }
   font-size: 10px; font-weight: 700; font-family: var(--mono);
   background: var(--nav-bg); color: var(--nav-text); letter-spacing: .5px;
 }
+/* Issue #1290: listener vs repeater badge on observers list + detail.
+ * Driven by ObserverResp.can_relay (false = firmware reported repeat:off).
+ * Server-side disambiguator excludes listener observers from path-hop
+ * candidates; this badge surfaces the same hint to operators. Colors use
+ * existing theme vars so the badge tracks the active palette. */
+.badge-listener,
+.badge-repeater {
+  display: inline-block; padding: 1px 5px; border-radius: 4px;
+  font-size: 10px; font-weight: 700; font-family: var(--mono);
+  letter-spacing: .5px; margin-left: 4px; vertical-align: middle;
+}
+.badge-listener {
+  background: var(--transport-badge-bg, #f59e0b20);
+  color: var(--transport-badge-fg, #d97706);
+}
+.badge-repeater {
+  background: var(--nav-bg); color: var(--nav-text);
+}
+/* Observer IATA pill rendered inline next to observer name on packets (#1188).
+ * Visually similar to .badge-region but distinct so the row badge and the
+ * inline-with-observer badge can be styled independently in future themes. */
+.badge-iata {
+  display: inline-block; padding: 1px 5px; border-radius: 4px;
+  font-size: 10px; font-weight: 700; font-family: var(--mono);
+  background: var(--nav-bg); color: var(--nav-text); letter-spacing: .5px;
+  margin-left: 4px; vertical-align: middle;
+}
 /* TODO: expose --transport-badge-bg/fg in customizer THEME_CSS_MAP (tracked in future milestone) */
 .badge-transport {
   display: inline-block; padding: 1px 5px; border-radius: 4px;
@@ -931,7 +1250,16 @@ body.scroll-locked { overflow: hidden; }
   font-size: 10px; font-weight: 600;
   background: #ede9fe; color: #6d28d9;
 }
-
+.multibyte-badge {
+  color: var(--text);
+  background: var(--accent-bg);
+  font-size: 10px;
+}
+.pubkey-prefix-badge {
+  background:var(--nav-bg);
+  color:var(--nav-text);
+  font-family:var(--mono)
+}
 /* === Monospace === */
 .mono { font-family: var(--mono); font-size: 12px; }
 
@@ -939,7 +1267,14 @@ body.scroll-locked { overflow: hidden; }
 .detail-title {
   font-size: 15px; font-weight: 700; margin-bottom: 12px;
   padding-bottom: 8px; border-bottom: 2px solid var(--border);
+  /* #1458 P0-A: semantic-first header — type badge + summary + hops share a row. */
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
 }
+.detail-title .detail-summary { color: var(--text-muted); font-weight: 400; }
+.detail-srcdst {
+  font-size: 14px; margin: -4px 0 12px; color: var(--text);
+}
+.detail-srcdst .arrow { color: var(--text-muted); margin: 0 4px; }
 .detail-hash {
   font-family: var(--mono); font-size: 12px; color: var(--text-muted);
   margin-bottom: 12px; word-break: break-all;
@@ -950,6 +1285,10 @@ body.scroll-locked { overflow: hidden; }
 }
 .detail-meta dt { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .3px; }
 .detail-meta dd { font-weight: 500; margin-bottom: 4px; }
+/* #1281: 📍map link inside detail-meta — UA-default blue is unreadable on EMOJI-OK-COMMENT
+ * dark backgrounds. Force theme-aware color via --accent. */
+.loc-map-link { color: var(--accent); font-size: 0.85em; text-decoration: none; }
+.loc-map-link:hover { text-decoration: underline; }
 .observation-current { background: var(--accent-bg, rgba(0,122,255,0.1)); font-weight: 600; }
 .detail-obs-row:hover { background: var(--hover-bg, rgba(255,255,255,0.05)); }
 .detail-obs-table th { font-size: 0.8em; text-transform: uppercase; color: var(--text-muted); }
@@ -996,7 +1335,7 @@ body.scroll-locked { overflow: hidden; }
 }
 .field-table .section-row td {
   background: var(--section-bg, #eef2ff); font-weight: 700; font-size: 11px;
-  text-transform: uppercase; letter-spacing: .5px; color: var(--accent);
+  text-transform: uppercase; letter-spacing: .5px; color: var(--text);
 }
 .field-table .section-header td  { background: rgba(243,139,168,0.18); }
 .field-table .section-transport td { background: rgba(137,180,250,0.18); }
@@ -1070,18 +1409,45 @@ body.scroll-locked { overflow: hidden; }
 .byop-modal .byop-header {
   position: sticky; top: 0; z-index: 2;
   background: var(--card-bg);
-  margin: -24px -24px 12px;
-  padding: 12px 24px;
+  /* #1487: was `margin: -24px -24px 12px; padding: 12px 24px;` — assumed
+     .modal desktop padding of 24px. On mobile .modal switches to 16px
+     padding, so the negative margin overshot, content-flow pushed the
+     next sibling UP under the (sticky-pinned) header, and the
+     description paragraph was visually occluded by ~12px. Drop the
+     full-bleed negative-margin gymnastics — header now uses normal
+     padding (modal padding handles the inset) and bounded sizing. */
+  margin: 0 0 12px;
+  padding: 4px 0;
   border-bottom: 1px solid var(--border);
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  /* Hard cap so emoji ascent / btn-icon 48px floor can't blow the header
+     past the safe range (was 73px pre-fix). */
+  max-height: 48px;
+  box-sizing: border-box;
+}
+.byop-modal .byop-header h3 {
+  /* #1487: explicit font + line-height so emoji-bearing title doesn't
+     blow up the header on platforms where the default emoji font has
+     huge ascent metrics (observed contributor to 73px header). */
+  margin: 0; font-size: 1rem; line-height: 1.3;
 }
 /* MINOR-7: dropped position: sticky on .byop-x — it sits inside the
    already-sticky .byop-header, so the sticky on the child was a no-op.
-   We only need visual styling here. */
+   We only need visual styling here.
+   #1487: override .btn-icon 48px floor — inside the header we need a
+   compact button so the header stays bounded. The :before tap-target
+   pad below preserves accessibility (effective hit area ~ 44x44). */
 .byop-modal .byop-x {
   background: var(--card-bg); border: 1px solid var(--border);
-  border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 16px;
+  border-radius: 6px; padding: 2px 8px; cursor: pointer; font-size: 14px;
   line-height: 1; color: var(--text);
+  min-height: 0; min-width: 0; height: 32px;
+  position: relative;
+}
+/* #1487: invisible tap-pad to keep ≥44px effective hit area while the
+   visual button stays compact inside the bounded header. */
+.byop-modal .byop-x::before {
+  content: ''; position: absolute; inset: -8px; border-radius: 8px;
 }
 .byop-modal .byop-x:hover { background: var(--row-hover, rgba(0,0,0,0.05)); }
 
@@ -1097,6 +1463,19 @@ body.scroll-locked { overflow: hidden; }
   line-height: 1; color: var(--text);
 }
 .modal > .modal-close:not(.ch-modal-close):hover { background: var(--row-hover, rgba(0,0,0,0.05)); }
+
+/* #1648 M6 (M5 CDP carry-forward): mobile touch-target. The 4px/10px
+   padding above produces an ~24px hit area, below WCAG's 44×44 minimum.
+   Bump on ≤640px so dismiss is reliably tappable on phones. Applies to
+   both the generic .modal-close and the channel-modal close. */
+@media (max-width: 640px) {
+  .modal > .modal-close:not(.ch-modal-close),
+  .ch-modal-close {
+    min-width: 44px; min-height: 44px;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 8px 12px;
+  }
+}
 
 
 /* === Map Controls Panel === */
@@ -1233,7 +1612,7 @@ button.ch-item.selected { background: var(--selected-bg); }
   text-align: center;
   line-height: 1.4;
 }
-/* Shared icon button base for sidebar row controls (remove ✕, share ⤴).
+/* Shared icon button base for sidebar row controls (remove ✕, share ⤴). EMOJI-OK-COMMENT
    WCAG 2.5.5 / Apple HIG: 44x44 CSS px minimum touch target. */
 .ch-icon-btn {
   display: inline-flex; align-items: center; justify-content: center;
@@ -1391,6 +1770,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 .nodes-filters select {
   padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px;
   font-size: 13px; background: var(--input-bg); color: var(--text); font-family: var(--font);
+  height: 34px; min-height: 34px; box-sizing: border-box; line-height: 1;
 }
 
 /* Node Detail */
@@ -1413,7 +1793,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 /* #1146: "Paths Through This Node" entries render as <div> blocks, not
    tables, so the rule above doesn't reach them. Without this, the path-hop
    <a> elements inherit the UA-default rgb(0,0,238) blue, which on the dark
-   card surface (--card-bg: #1a1a2e) computes to ~1.8-3.0:1 — well below
+   card surface (--card-bg: #232340 in dark mode) computes to ~2.5-3.5:1 — well below
    the 4.5:1 WCAG AA body-text minimum. Use --accent so the link tracks the
    active theme (and customizer overrides) like the data-table links do. */
 .node-detail-section #pathsContent a,
@@ -1536,6 +1916,12 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 .observers-page { padding: 20px; max-width: 1200px; margin: 0 auto; }
 .obs-summary { display: flex; gap: 20px; margin-bottom: 16px; flex-wrap: wrap; }
 .obs-stat { display: flex; align-items: center; gap: 6px; font-size: 14px; color: var(--text-muted); }
+/* #1562 — "Last updated: X ago" pill on the observers-page header.
+   Clickable (forces a fresh fetch / bypasses client cache). Goes to
+   --warning when the cached payload is >60s old so operators see staleness. */
+.obs-updated { cursor: pointer; font-size: 13px; color: var(--text-muted); border: 1px dashed transparent; padding: 2px 6px; border-radius: 4px; }
+.obs-updated:hover, .obs-updated:focus { border-color: var(--border); outline: none; }
+.obs-updated-stale { color: var(--status-yellow); border-color: var(--status-yellow); }
 .health-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 .health-dot.health-green { background: var(--status-green); box-shadow: 0 0 6px #22c55e80; }
 .health-dot.health-yellow { background: var(--status-yellow); box-shadow: 0 0 6px #eab30880; }
@@ -1641,6 +2027,12 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 /* "More" button (hidden on desktop) */
 .nav-more-wrap { display: none; position: relative; overflow: visible; }
 .nav-more-btn { display: inline-flex; }
+/* #1406: position:fixed (not absolute) so the dropdown escapes .nav-more-wrap's
+   layout box. When absolute, the dropdown's content extents inflated
+   .nav-more-wrap.scrollHeight → bubbled into .nav-left flex line-height calc
+   → centered a 279px content line in 52px container → entire nav strip clipped
+   above viewport. position:fixed removes the dropdown from flow entirely; JS in
+   app.js positions top/right dynamically relative to the More button. */
 .nav-more-menu {
   display: none; position: fixed;
   background: var(--nav-bg); border: 1px solid var(--border); border-radius: 8px;
@@ -1662,7 +2054,9 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 @media (max-width: 900px) {
   .panel-right { width: 320px; min-width: 320px; }
   .nav-stats { display: none; }
-  .brand-logo { height: 32px; width: 112px; }
+  /* #1450 — same svg/img split at tablet width */
+  svg.brand-logo { height: 32px; width: 112px; }
+  img.brand-logo { height: 32px; width: auto; max-width: 180px; }
   .nav-link { padding: 14px 8px; font-size: 13px; }
   .map-controls { width: 180px; font-size: 12px; }
 }
@@ -1672,7 +2066,10 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
    clips when squeezed into the 99px tablet pin (#1137 → SCOPE→SCOF).
    Swap to the dedicated .brand-mark-only inline SVG (arcs+dots only). */
 @media (max-width: 400px) {
-  .brand-logo { display: none; }
+  /* #1450 — must match the svg/img specificity used at top-level
+     (svg.brand-logo / img.brand-logo, 0,1,1) or the new rules win
+     and the wordmark fails to hide on narrow mobile widths. */
+  svg.brand-logo, img.brand-logo { display: none; }
   .brand-mark-only { display: block; }
 }
 
@@ -1757,6 +2154,9 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   .nav-links a:not([data-priority="high"]) { display: flex; }
   .nav-links.open { display: flex; }
   .nav-link { padding: 12px 20px; border-bottom: none; }
+  /* Issue #1400: restore 48px touch-target on mobile only. Global rule
+     removed because it overflowed the 52px desktop top-nav. */
+  .nav-link { min-height: 48px; }
   .nav-link.active { background: var(--nav-active-bg); border-radius: 0; margin: 0; padding: 12px 20px; }
   .nav-left { gap: 12px; }
   body.nav-open { overflow: hidden; }
@@ -1816,8 +2216,13 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   #chList .ch-item-name { flex: 1 1 auto; min-width: 0; }
   #chList .ch-item-top { gap: 6px; }
   #chList .ch-icon-btn { min-width: 32px; min-height: 32px; padding: 2px 4px; }
+  /* #1648 M5: share-btn now renders an inline <svg.ph-icon> from channels.js,
+   * so the legacy `font-size: 0` + `::before { content: '<emoji>' }` shim is
+   * obsolete. The icon-button class above already sets the touch target;
+   * the SVG inherits color via currentColor. */
+  #chList .ch-share-btn .ph-icon { font-size: 13px; }
   #chList .ch-share-btn { font-size: 0; }
-  #chList .ch-share-btn::before { content: '📤'; font-size: 13px; }
+  #chList .ch-share-btn .ph-icon, #chList .ch-share-btn svg { font-size: 13px; }
   #chList .ch-remove-btn { font-size: 12px; padding: 2px 6px; }
   /* Hide the analytics-style time on mobile rows to free width for the name. */
   #chList .ch-item-time { font-size: 10px; }
@@ -1861,8 +2266,34 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   .search-box { width: 95vw; }
   .search-overlay { padding-top: 60px; }
 
-  /* Map controls */
-  .map-controls { width: calc(100vw - 24px); right: 12px; top: 8px; max-height: 200px; font-size: 12px; padding: 10px 12px; }
+  /* Map controls — #1329: drop fixed 200px cap, use accordion sections
+     instead so visible content fits without internal scrolling. Panel can
+     grow to fill available height; max-height bound by viewport so it
+     never escapes the screen. */
+  .map-controls { width: calc(100vw - 24px); right: 12px; top: 8px; max-height: calc(100vh - 80px); font-size: 12px; padding: 10px 12px; }
+  /* On mobile, hide collapsed section bodies (everything inside the
+     fieldset except the legend). The legend remains tappable to expand. */
+  .map-controls fieldset.mc-section.mc-collapsed > *:not(legend) { display: none; }
+  .map-controls fieldset.mc-section > legend.mc-label {
+    cursor: pointer;
+    user-select: none;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 0;
+  }
+  /* ▸ / ▾ indicator via ::after so we don't touch markup */
+  .map-controls fieldset.mc-section > legend.mc-label::after {
+    content: '▾';
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-left: 8px;
+    transition: transform 0.15s;
+  }
+  .map-controls fieldset.mc-section.mc-collapsed > legend.mc-label::after {
+    content: '▸';
+  }
   #leaflet-map { z-index: 0; }
   #map-wrap { z-index: 0; }
 
@@ -1891,13 +2322,16 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
 
-/* Favorite stars */
+/* Favorite stars — Phosphor sprite, 44×44 hit target (WCAG 2.5.5) */
 .fav-star {
-  background: none; border: none; cursor: pointer; font-size: 1.1rem;
-  color: var(--text-muted); padding: 2px 4px; line-height: 1;
+  background: none; border: none; cursor: pointer;
+  color: var(--text-muted); padding: 0; line-height: 1;
   transition: color .15s, transform .15s;
+  min-width: 44px; min-height: 44px;
+  display: inline-flex; align-items: center; justify-content: center;
 }
-.fav-star:hover { transform: scale(1.2); }
+.fav-star .ph-icon { width: 22px; height: 22px; }
+.fav-star:hover { transform: scale(1.1); }
 .fav-star.on { color: var(--status-yellow); }
 
 /* BYOP Decode Modal */
@@ -1958,6 +2392,35 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 }
 .leaflet-popup-tip { background: var(--card-bg) !important; }
 .leaflet-popup-content { color: var(--text) !important; font-size: 13px !important; }
+
+/* For Leaflet layer control */
+.leaflet-control-layers,
+.leaflet-control-layers-expanded {
+  background-color: var(--card-bg) !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+}
+.leaflet-control-layers-separator {
+  border-top-color: var(--border) !important;
+}
+[data-theme="dark"] .leaflet-control-layers-toggle {
+  filter: invert(1);
+}
+
+/* ---- Leaflet overrides for theme ---- */
+.leaflet-control-zoom a {
+  background: color-mix(in srgb, var(--surface-1) 92%, transparent) !important;
+  backdrop-filter: blur(12px);
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+  width: 44px !important;
+  height: 44px !important;
+  line-height: 44px !important;
+  font-size: 20px !important;
+}
+.leaflet-control-zoom a:hover {
+  background: rgba(59, 130, 246, 0.2) !important;
+}
 
 /* Column resize handles */
 .col-resize-handle {
@@ -2055,6 +2518,12 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
     font-size: 14px;
   }
   .ch-avatar.ch-tappable { min-width: 44px; min-height: 44px; width: 44px; height: 44px; }
+  /* #1253: trim .badge-iata h-padding + margin-left on narrow viewports so
+   * the observer cell + IATA pill fits within a 375px viewport. Without this
+   * the badge right edge overflows by ~1.25px at 375px (same class of fix
+   * as #1250/#1251 VCR LCD-clip). Badge stays fully visible — only padding
+   * and side margin shrink; font-size, colors (via vars) unchanged. */
+  .badge-iata { padding: 1px 3px; margin-left: 2px; }
 }
 
 /* Full-screen node detail */
@@ -2119,6 +2588,26 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .hash-cell-taken  { background: var(--status-green); color: #fff; }
 .hash-cell-possible { background: var(--status-yellow); color: #fff; }
 .hash-cell-collision { color: #fff; }
+/* #1473 — First-byte 0x00 / 0xFF pubkeys are avoided by the MeshCore
+   firmware keygen convention (NOT a protocol-level rejection):
+   https://github.com/meshcore-dev/MeshCore/blob/8ede7641/examples/simple_repeater/main.cpp#L83
+   Visually grey + strike, kill pointer events so the matrix click handler
+   skips them. Applied by public/prefix-reserved.js → markReservedCells(). */
+.hash-cell.prefix-reserved,
+.prefix-reserved {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--card-bg),
+    var(--card-bg) 4px,
+    var(--border) 4px,
+    var(--border) 8px
+  ) !important;
+  color: var(--text-muted) !important;
+  text-decoration: line-through;
+  opacity: 0.6;
+  cursor: not-allowed !important;
+  pointer-events: none;
+}
 .hash-matrix-tooltip {
   position: fixed; z-index: var(--z-tooltip); background: var(--surface-1); border: 1px solid var(--border);
   border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); padding: 8px 12px;
@@ -2198,12 +2687,12 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 }
 .observer-selector { display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
 .node-qr { text-align: center; margin-top: 8px; }
-.node-qr svg { max-width: 100px; border-radius: 4px; }
+.node-qr svg { max-width: 100px; height: auto; border-radius: 4px; }
 [data-theme="dark"] .node-qr svg rect[fill="#ffffff"] { fill: var(--card-bg); }
 [data-theme="dark"] .node-qr svg rect[fill="#000000"] { fill: var(--text); }
 .node-map-qr-wrap { position: relative; }
 .node-map-qr-overlay { position: absolute; bottom: 8px; right: 8px; z-index: 400; background: rgba(255,255,255,0.5); border-radius: 4px; padding: 4px; line-height: 0; margin: 0; text-align: center; }
-.node-map-qr-overlay svg { max-width: 56px !important; display: block; margin: 0; }
+.node-map-qr-overlay svg { max-width: 56px !important; height: auto; display: block; margin: 0; }
 [data-theme="dark"] .node-map-qr-overlay { background: rgba(255,255,255,0.4); }
 
 /* Replay on Live Map button in packet detail */
@@ -2281,16 +2770,16 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 
 .copy-link-btn {
   padding: 5px 12px;
-  background: rgba(59, 130, 246, 0.12);
-  border: 1px solid rgba(59, 130, 246, 0.25);
-  color: var(--accent, #3b82f6);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--text);
   border-radius: 6px;
   font-size: 0.78rem;
   font-weight: 600;
   cursor: pointer;
   transition: background 0.15s;
 }
-.copy-link-btn:hover { background: rgba(59, 130, 246, 0.25); }
+.copy-link-btn:hover { background: var(--accent-border, rgba(59, 130, 246, 0.25)); }
 
 /* Route tooltip on map */
 .route-tooltip {
@@ -2361,7 +2850,35 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 @media (max-width: 480px) {
   .subpath-detail { min-width: 100%; width: 100%; max-width: 100%; }
   .subpath-layout { flex-direction: column; }
+
+  /* #1415 mobile chrome compaction — keep packets pre-table chrome to ≤2 rows.
+   * Hide BYOP (operator request) to reclaim ~70px from the page-header row,
+   * shrink the page-header h2, and zero its bottom margin. The filter bar
+   * already collapses behind a "Filters ▾" toggle (see existing block above). */
+  .page-header [data-action="pkt-byop"] { display: none; }
+  .page-header { margin-bottom: 6px; }
+  .page-header h2 { font-size: 15px; }
+  .data-table td, .data-table th { padding: 6px 4px; }
+
+  /* #1458 P0-C — collapse the always-on filter expression input on small mobile.
+   * Reveals when the sibling .filter-bar has .filters-expanded (set by the
+   * existing "Filters ▾" toggle, so one tap reveals BOTH chrome rows). */
+  .pkt-filter-expr { display: none; }
+  #pktLeft:has(.filter-bar.filters-expanded) .pkt-filter-expr { display: block; }
+
+  /* #1458 P0-A — semantic-first detail title: keep it dense, single-row when
+   * possible, badges + summary share a line. */
+  .detail-title { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 15px; }
+  .detail-srcdst { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
 }
+
+/* #1458 P0-B — raw-bytes disclosure styling (applies everywhere). */
+.detail-technical { margin-top: 12px; }
+.detail-technical > summary {
+  cursor: pointer; padding: 6px 0; font-weight: 600; color: var(--text-muted);
+  user-select: none;
+}
+.detail-technical[open] > summary { color: var(--text); }
 
 /* Legend swatches */
 .legend-swatch { display: inline-block; width: 12px; height: 12px; border: 1px solid var(--border); vertical-align: middle; }
@@ -2490,7 +3007,8 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 .node-top-row { display: flex; gap: 16px; margin-bottom: 12px; }
 .node-top-row .node-map-wrap { flex: 3; min-height: 200px; border-radius: 8px; overflow: hidden; }
 .node-top-row .node-map-wrap .node-detail-map { height: 100%; }
-.node-top-row .node-qr-wrap { flex: 1; min-width: 120px; max-width: 160px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.node-top-row .node-qr-wrap { flex: 1; align-self: flex-start; min-width: 120px; max-width: 160px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
+.node-top-row .node-qr-wrap .node-qr { margin-top: 0; }
 .node-qr-wrap--full { max-width: 240px; margin: 0 auto; }
 .node-stats-table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
 .node-stats-table td { padding: 6px 12px; border-bottom: 1px solid var(--border); }
@@ -2507,7 +3025,36 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
     height: 200px;
     min-height: 160px;
   }
+  /* #1243 — On mobile, mirror the desktop split-pane behavior used by the
+     compact node detail (.node-map-qr-wrap): overlay the QR on the map
+     instead of stacking a 250px-tall QR panel below it. Desktop (≥768px)
+     keeps the side-by-side flex layout untouched. */
+  .node-top-row { position: relative; }
+  .node-top-row .node-map-wrap { flex: 1 1 100%; }
+  .node-top-row .node-qr-wrap {
+    position: absolute;
+    bottom: 8px;
+    right: 8px;
+    z-index: 400;
+    flex: 0 0 auto;
+    min-width: 0;
+    max-width: 96px;
+    padding: 4px;
+    background: var(--card-bg-translucent, rgba(255, 255, 255, 0.85));
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    line-height: 0;
+    margin: 0;
+  }
+  .node-top-row .node-qr-wrap .node-qr svg { max-width: 72px; height: auto; }
+  /* Hide the redundant pubkey caption inside the overlay QR — it's already
+     shown in the card above and would push the overlay too large. */
+  .node-top-row .node-qr-wrap .mono { display: none; }
+  [data-theme="dark"] .node-top-row .node-qr-wrap {
+    background: var(--card-bg-translucent-dark, rgba(255, 255, 255, 0.4));
+  }
 }
+
 .detail-back-btn {
   background: none;
   border: 1px solid var(--border, #333);
@@ -2621,23 +3168,33 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
   .perf-table th, .perf-table td { padding: 4px 6px; }
 }
 
-/* ─── Region filter bar ─── */
+/* ─── Region / Area filter bars ─── */
 .region-filter-bar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 0; }
+.area-dropdown-menu { min-width: 160px; }
+.area-dropdown-item.area-item-active { color: var(--accent); font-weight: 600; }
 .region-filter-container { margin: 0; padding: 0; display: inline-flex; align-items: center; }
 .region-pill {
   display: inline-flex; align-items: center; padding: 4px 12px; border-radius: 16px;
   font-size: 12px; font-weight: 500; cursor: pointer; border: 1.5px solid var(--border);
-  background: transparent; color: var(--text-muted); transition: all 0.15s;
+  background: transparent; color: var(--text-muted); transition: all 0.15s; white-space: nowrap;
+  flex-shrink: 0;
 }
 .region-pill:hover { border-color: var(--accent); color: var(--accent); }
-.region-pill-active {
+button.region-pill-active {
   background: var(--accent); color: #fff; border-color: var(--accent);
 }
-.region-pill-active:hover { opacity: 0.85; }
+button.region-pill-active:hover { opacity: 0.85; color: #fff; }
 .region-filter-label {
   font-size: 12px; font-weight: 600; color: var(--text-muted); align-self: center;
-  margin-right: 2px; user-select: none;
+  margin-right: 2px; user-select: none; white-space: nowrap; flex-shrink: 0;
 }
+.analytics-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
+.analytics-time-window-select {
+  height: 34px; min-height: 34px; padding: 0 10px; border-radius: 6px; box-sizing: border-box;
+  font-size: 13px; font-weight: 500; cursor: pointer; border: 1px solid var(--border);
+  background: var(--input-bg); color: var(--text); transition: border-color 0.15s;
+}
+.analytics-time-window-select:hover { border-color: var(--accent); }
 .region-dropdown-wrap { position: relative; display: inline-flex; align-items: center; }
 .region-dropdown-trigger {
   display: inline-flex; align-items: center; padding: 6px 10px; border-radius: 6px;
@@ -2655,7 +3212,8 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 .region-dropdown-item {
   display: flex; align-items: center; gap: 6px; padding: 6px 12px;
   font-size: 13px; cursor: pointer; color: var(--text); white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis; max-width: 320px;
+  overflow: hidden; text-overflow: ellipsis; width: 100%; max-width: 320px;
+  background: transparent; border: 0px;
 }
 .region-dropdown-item input[type="checkbox"] {
   width: 14px; height: 14px; margin: 0; flex-shrink: 0;
@@ -2844,109 +3402,446 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 .packet-filter-input.filter-error { border-color: var(--status-red); }
 .packet-filter-input.filter-active { border-color: var(--status-green); }
 
-/* === Observer Comparison (#/compare) === */
-.compare-controls { margin-bottom: 20px; }
-.compare-selector {
-  display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap;
+/* ============================================================
+ * Generic themed button vocabulary (#1644).
+ * ------------------------------------------------------------
+ * PR #1642 introduced markup like <button class="btn-secondary"> in
+ * observers.js / observer-detail.js but never shipped a top-level
+ * `.btn-secondary` rule — only `.ch-modal-btn-secondary`. The buttons
+ * fell back to the browser default (white/gray) and looked broken
+ * against the themed UI.
+ *
+ * The fix is a small, three-tier vocabulary built out of existing
+ * surface/border/text tokens — NO new top-level color tokens, no
+ * gradient/shadow chartjunk. Companion to `.btn-primary` (#3329 above):
+ *
+ *   .btn-primary    — high-emphasis, accent-filled
+ *   .btn-secondary  — low-emphasis, themed neutral on surface
+ *   .btn-ghost      — minimal, transparent until hover
+ *
+ * Sized 32-px tall by default; the global 48-px touch-target rule
+ * lifts the hit area on touch devices without breaking desktop
+ * proportions. Sibling `.btn-icon` (already defined above) keeps
+ * its existing semantics.
+ * ============================================================ */
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, color 120ms;
 }
-.compare-select-group { display: flex; flex-direction: column; gap: 4px; }
+.btn-secondary:hover:not([disabled]):not(:disabled) {
+  background: var(--row-hover);
+  border-color: var(--accent);
+  color: var(--text);
+}
+.btn-secondary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.btn-secondary[disabled],
+.btn-secondary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.btn-ghost:hover:not([disabled]):not(:disabled) {
+  background: var(--hover-bg);
+  color: var(--text);
+  border-color: var(--border);
+}
+.btn-ghost[disabled],
+.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* === Observer Comparison (#/compare) — Tufte redesign (#1644) ===
+ * Design rationale: the old layout was three card-boxes side-by-side
+ * (heavy borders, decorative rgba tints, three nearly-identical
+ * 28px counts) forcing the eye to do mental subtraction. The
+ * redesign borrows the route-view v2 vocabulary (surface tokens,
+ * small-multiples, ctx pills, sparing accent) so the comparison
+ * page belongs in the same product. A single proportional
+ * diff-strip (Tufte's "show the data") makes the asymmetry
+ * legible at a glance; the textual cards are demoted to subtext.
+ */
+.compare-page { padding: var(--space-md); max-width: 1200px; margin: 0 auto;
+  /* #1646 mobile: reserve space below the floating bottom-nav at ≤768px.
+   * --bottom-nav-reserve is 0px on desktop, 56px + safe-area on mobile,
+   * so this rule is a no-op for desktop and adds the exact clearance
+   * needed on phones — the Shared-Types pill row + tabs were getting
+   * eaten by the nav. (Tufte: don't reserve space we don't need.) */
+  padding-bottom: calc(var(--space-md) + var(--bottom-nav-reserve, 0px));
+}
+.compare-page .page-header {
+  display: flex; align-items: center; justify-content: flex-start;
+  gap: var(--space-sm); margin-bottom: var(--space-sm);
+}
+.compare-page .page-header h2 { font-size: var(--fs-lg); margin: 0; }
+
+.compare-breadcrumbs {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  margin: 0 0 var(--space-md);
+}
+.compare-breadcrumbs a { color: var(--accent); text-decoration: none; }
+.compare-breadcrumbs a:hover { text-decoration: underline; }
+
+.compare-controls {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-sm) var(--space-md);
+  margin-bottom: var(--space-md);
+}
+/* Once both observers are picked, the headline strip below is the
+ * answer. Demote the picker: tighter padding, smaller labels.
+ * Operators can still swap A/B without leaving the page. The "A"/"B"
+ * referent stays visible (issue #1646 Tufte: erase labels, not
+ * referents). */
+.compare-controls.is-collapsed {
+  padding: 4px var(--space-md);
+}
+.compare-controls.is-collapsed .compare-select-group label { display: none; }
+.compare-controls.is-collapsed .compare-select { font-size: var(--fs-sm); padding: 4px 8px; }
+.compare-controls.is-collapsed .compare-select-id { display: inline-block; }
+.compare-selector {
+  display: flex; align-items: flex-end; gap: var(--space-sm); flex-wrap: wrap;
+}
+.compare-select-group { display: flex; flex-direction: column; gap: 2px; min-width: 180px; }
 .compare-select-group label {
-  font-size: 12px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: 0.3px; color: var(--text-muted);
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.6px; color: var(--text-muted);
+}
+/* The "A" / "B" badge is hidden when the labels are visible (expanded
+ * state) and revealed when collapsed, so the dropdown row never loses
+ * its A/B referent. */
+.compare-select-id {
+  display: none;
+  font-size: 10px; font-weight: 700; color: var(--text-muted);
+  letter-spacing: 0.6px; padding: 2px 0;
 }
 .compare-select {
-  padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
-  background: var(--input-bg); color: var(--text); font-size: 14px;
-  min-width: 220px; cursor: pointer;
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--input-bg); color: var(--text); font-size: var(--fs-sm);
+  cursor: pointer;
 }
 .compare-select:focus { border-color: var(--accent); outline: none; }
 .compare-vs {
-  font-size: 18px; font-weight: 700; color: var(--text-muted);
-  padding-bottom: 6px;
+  font-size: 10px; font-weight: 700; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 1.2px;
+  padding: 0 4px;
+  align-self: center;
+  opacity: 0.7;
 }
-.compare-btn {
-  padding: 8px 20px; border: none; border-radius: 6px;
-  background: var(--accent); color: #fff; font-size: 14px; font-weight: 600;
-  cursor: pointer; transition: background 0.15s;
-}
-.compare-btn:hover:not(:disabled) { background: var(--accent-hover); }
-.compare-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+/* The Compare CTA was removed in #1646 — comparison auto-runs when
+ * both observers are chosen. The legacy .compare-btn touch-target
+ * declaration was deleted with it; surrounding form controls already
+ * carry their own 48px-min-height rule. */
 
-.compare-results { margin-top: 16px; }
+.compare-results { margin-top: var(--space-md); }
 
-.compare-summary {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 12px; margin-bottom: 16px;
+/* ── Headline strip — the only large number on the page ───────────
+ * Three counts above a single proportional bar (small multiples on
+ * a shared axis: one strip, not three boxes). Eye sees the whole
+ * comparison in one fixation. */
+.compare-strip {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-sm) var(--space-md) var(--space-md);
+  margin-bottom: var(--space-md);
 }
-.compare-card {
-  padding: 16px; border-radius: 8px; text-align: center; cursor: pointer;
-  border: 2px solid transparent; transition: border-color 0.15s, transform 0.1s;
+.compare-strip-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: var(--space-md);
+  align-items: baseline;
+  margin-bottom: 8px;
 }
-.compare-card:hover { transform: translateY(-2px); }
-.compare-card-count { font-size: 28px; font-weight: 700; }
-.compare-card-label { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
-.compare-card-pct { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
-
-.compare-card-both {
-  background: rgba(34, 197, 94, 0.1); border-color: rgba(34, 197, 94, 0.3);
+.compare-strip-side { display: flex; flex-direction: column; gap: 2px; cursor: pointer; }
+.compare-strip-side-b { text-align: right; }
+.compare-strip-name {
+  font-size: var(--fs-sm); font-weight: 700; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.compare-card-both .compare-card-count { color: var(--status-green); }
-
-.compare-card-a {
-  background: rgba(74, 158, 255, 0.1); border-color: rgba(74, 158, 255, 0.3);
+/* The side cells lead with the percentage, matching the middle cell
+ * (one unit across the row, no design variation — issue #1646). */
+.compare-strip-side-pct {
+  font-family: var(--mono);
+  font-size: var(--fs-xl); font-weight: 700;
+  color: var(--text); font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
-.compare-card-a .compare-card-count { color: var(--accent); }
-
-.compare-card-b {
-  background: rgba(255, 107, 107, 0.1); border-color: rgba(255, 107, 107, 0.3);
+.compare-strip-side-pct-unit {
+  font-size: 0.6em; margin-left: 1px;
 }
-.compare-card-b .compare-card-count { color: var(--status-red); }
-
-/* Comparison bar */
-.compare-bar-container { margin-bottom: 16px; }
-.compare-bar {
-  display: flex; height: 24px; border-radius: 6px; overflow: hidden;
-  background: var(--border);
+.compare-strip-sub { font-size: 11px; color: var(--text-muted); }
+.compare-strip-mid {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  border-left: 1px dashed var(--border);
+  border-right: 1px dashed var(--border);
+  padding: 0 var(--space-md);
+  cursor: pointer;
 }
-.compare-bar-seg { transition: width 0.3s ease; }
-.compare-bar-a { background: var(--accent); }
-.compare-bar-both { background: var(--status-green); }
-.compare-bar-b { background: var(--status-red); }
-
-.compare-bar-legend {
-  display: flex; gap: 16px; margin-top: 8px; font-size: 12px;
+.compare-strip-mid-count {
+  font-family: var(--mono);
+  font-size: var(--fs-sm); font-weight: 600;
+  color: var(--text); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* The 79% gets the largest type — it IS the answer to "how much
+ * overlap?". The raw count and the label demote underneath. (Tufte:
+ * the most important number gets the most ink. Issue #1646.) */
+.compare-strip-mid-pct {
+  font-family: var(--mono);
+  font-size: var(--fs-xl); font-weight: 700;
+  color: var(--accent); font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.compare-strip-mid-pct-unit {
+  font-size: 0.6em; margin-left: 1px;
+}
+.compare-strip-mid-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px;
   color: var(--text-muted);
 }
-.compare-legend-item { display: flex; align-items: center; gap: 4px; }
-.compare-dot {
-  width: 10px; height: 10px; border-radius: 50%; display: inline-block;
-}
-.compare-dot-a { background: var(--accent); }
-.compare-dot-both { background: var(--status-green); }
-.compare-dot-b { background: var(--status-red); }
 
+/* The diff bar — one row, three colored segments, shared axis. */
+.compare-bar-container { margin-top: 4px; }
+.compare-bar {
+  display: flex; height: 10px; border-radius: 5px; overflow: hidden;
+  background: var(--surface-2);
+}
+.compare-bar-seg {
+  transition: width 240ms ease;
+  /* #1646: Tufte/honesty — a 1–2% segment must still be visible or
+   * the chart is lying about presence. This is a *presence floor only*,
+   * not a perception-equivalent floor: 2px is the smallest pip the
+   * eye can reliably register on a 10px-tall bar without falsely
+   * equating a 1% and a 5% slice (which a 6px floor would do).
+   * Above ~2% the proportional encoding remains accurate. */
+  min-width: 2px;
+}
+.compare-bar-a    { background: var(--accent); }
+.compare-bar-both { background: var(--status-green); }
+.compare-bar-b    { background: var(--status-amber); }
+/* Tick marks on the diff bar showing where the proportions land */
+.compare-bar-legend {
+  display: flex; gap: var(--space-md); margin-top: 6px;
+  font-size: 11px; color: var(--text-muted);
+  flex-wrap: wrap;
+}
+.compare-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.compare-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.compare-dot-a    { background: var(--accent); }
+.compare-dot-both { background: var(--status-green); }
+.compare-dot-b    { background: var(--status-amber); }
+
+/* ── Asymmetric reach sentences ───────────────────────────────────
+ * Two compact lines telling the directional story without three
+ * cards or two big numbers. Mono-numeric for at-a-glance compare. */
+.compare-asym {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-md);
+  margin-bottom: var(--space-md);
+}
+.compare-asym-line {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-left: none;
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm) var(--space-md);
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+.compare-asym-line b { color: var(--text); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.compare-asym-line .compare-asym-pct {
+  font-family: var(--mono); font-size: var(--fs-lg); font-weight: 700;
+  color: var(--text); font-variant-numeric: tabular-nums;
+  display: block; margin-bottom: 2px;
+}
+
+/* ── Type breakdown — packet-context ctx pills (route-view vocab) ─ */
 .compare-type-summary {
-  margin-bottom: 16px; font-size: 13px; color: var(--text);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-left: none;
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm) var(--space-md);
+  margin-bottom: var(--space-md);
+  font-size: var(--fs-sm); color: var(--text);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+}
+.compare-type-summary-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px;
+  color: var(--text-muted); font-weight: 700;
+  margin-right: 4px;
 }
 .compare-type-badge {
-  display: inline-block; padding: 2px 8px; margin: 2px;
-  border-radius: var(--badge-radius); background: var(--surface-0);
-  font-size: 12px; color: var(--text-muted);
+  display: inline-flex; align-items: baseline; gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--badge-radius);
+  background: var(--surface-2);
+  font-size: 11px;
+  color: var(--text);
+  font-family: var(--mono); font-variant-numeric: tabular-nums;
+}
+.compare-type-badge b { color: var(--accent); font-weight: 700; }
+
+/* ── Tabs (Summary / Both / Only A / Only B) ──────────────────── */
+.compare-tabs {
+  display: flex; gap: 0; margin-bottom: var(--space-sm);
+  border-bottom: 1px solid var(--border); flex-wrap: wrap;
+}
+.compare-tabs .tab-btn {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  padding: 6px 14px;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 120ms, border-color 120ms;
+  margin-bottom: -1px;
+}
+.compare-tabs .tab-btn:hover { color: var(--text); }
+.compare-tabs .tab-btn.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
 }
 
-.compare-tabs { display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
-
-.compare-summary-text { padding: 12px 0; font-size: 14px; line-height: 1.6; }
+.compare-summary-text { padding: 4px 0 var(--space-sm); font-size: var(--fs-sm); line-height: 1.6; color: var(--text-muted); }
 .compare-summary-text p { margin: 0 0 8px; }
-.compare-warning { color: var(--status-yellow); font-weight: 600; }
-.compare-good { color: var(--status-green); font-weight: 600; }
+.compare-summary-text p b,
+.compare-summary-text p strong { color: var(--text); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.compare-warning {
+  color: var(--status-amber-text); background: var(--status-amber-light);
+  border: 1px solid var(--status-amber); padding: 6px 10px; border-radius: var(--radius-sm);
+  font-weight: 600;
+}
+.compare-good {
+  color: var(--status-green);
+  border: 1px solid var(--status-green); padding: 6px 10px; border-radius: var(--radius-sm);
+  font-weight: 600;
+}
 
-.compare-table { font-size: 13px; }
+.compare-table { font-size: var(--fs-sm); }
 
 @media (max-width: 640px) {
   .compare-selector { flex-direction: column; align-items: stretch; }
+  .compare-select-group { min-width: 0; }
   .compare-select { min-width: auto; width: 100%; }
-  .compare-summary { grid-template-columns: 1fr; }
+  .compare-vs { display: none; }
+  .compare-strip-row { grid-template-columns: 1fr; gap: var(--space-sm); }
+  .compare-strip-side-b { text-align: left; }
+  .compare-strip-mid { border-left: none; border-right: none;
+    border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border);
+    padding: var(--space-sm) 0; flex-direction: row; gap: 6px; align-items: baseline; }
+  .compare-asym { grid-template-columns: 1fr; }
+  /* #1646 mobile reflow: the asym sentence wraps mid-phrase at narrow
+   * widths ("3,262 of GY889 Repeater's 3,347 packets" splitting after
+   * "Repeater's"). text-wrap:pretty rebalances trailing words to
+   * avoid orphan-style breaks; overflow-wrap:anywhere lets very long
+   * node names yield instead of pushing the column. The percentage
+   * already lives on its own line (display:block), so the body is
+   * free to breathe. */
+  .compare-asym-line {
+    text-wrap: pretty;
+    overflow-wrap: anywhere;
+    word-break: normal;
+  }
+  /* #1646 mobile tabs: "Only N6IJ Repeater (675)" overruns the row at
+   * 375px; without min-width:0 a flex item can't shrink past its
+   * intrinsic content width. Allow each tab to shrink and ellipsis
+   * its label so all four fit. The count parenthetical stays
+   * visible because it's at the tail of the string. */
+  .compare-tabs .tab-btn {
+    min-width: 0;
+    flex: 0 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 50%;
+    padding: 6px 10px;
+  }
+}
+
+/* ── Observers page — compare-selection column + button hints ─── */
+.col-compare-select {
+  width: 36px; text-align: center;
+  /* Tufte: this column is administrative chrome, NOT data.
+     Shrink it; use the muted text so it doesn't compete. */
+  color: var(--text-muted);
+}
+/* The checkbox itself: theme-aware accent + minimum tap target
+ * provided by the surrounding cell, not the input. */
+.col-compare-select input[type="checkbox"] {
+  width: 16px; height: 16px; min-height: 16px;
+  accent-color: var(--accent); cursor: pointer;
+  /* When at least one row is selected, we add .has-compare-selection
+   * to the table so the column highlight makes it obvious WHICH rows
+   * are in the selection. */
+}
+.obs-table.has-compare-selection .col-compare-select { color: var(--text); }
+.obs-table tbody tr:has(input[data-compare-select]:checked) {
+  background: var(--selected-bg);
+}
+/* Compact "Compare selected (0)" button: when nothing selected, fade
+ * to background so it doesn't compete with the primary "Compare
+ * observers" CTA. The disabled rule above already gives 0.5 opacity. */
+.observers-page .page-header {
+  display: flex; align-items: center; gap: var(--space-sm); flex-wrap: wrap;
+  margin-bottom: var(--space-sm);
+}
+.observers-page .page-header h2 { font-size: var(--fs-lg); margin: 0 var(--space-sm) 0 0; }
+.observers-page .page-header .obs-refresh-spacer { margin-left: auto; }
+
+/* Observer-detail header: the Compare-with picker + Compare button
+ * should sit together visually. Reuses the same .btn-secondary. */
+.observer-detail-page .compare-with-group {
+  display: inline-flex; align-items: stretch; gap: 0;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-1); overflow: hidden;
+}
+.observer-detail-page .compare-with-group select.time-range-select {
+  border: none; background: transparent; color: var(--text);
+  font-size: var(--fs-sm); padding: 6px 10px;
+  border-right: 1px solid var(--border);
+  min-height: 0;
+}
+.observer-detail-page .compare-with-group select.time-range-select:focus { outline: none; }
+.observer-detail-page .compare-with-group button[data-action="compare-with-go"] {
+  border: none; border-radius: 0; background: var(--surface-2);
+}
+.observer-detail-page .compare-with-group button[data-action="compare-with-go"]:hover:not(:disabled) {
+  background: var(--row-hover); color: var(--text);
 }
 
 /* Neighbor graph canvas focus indicator for keyboard navigation */
@@ -3281,91 +4176,245 @@ th.sort-active { color: var(--accent, #60a5fa); }
 .tools-card h3 { margin: 0 0 4px 0; font-size: 16px; }
 .tools-card p { margin: 0; font-size: 13px; color: var(--text-muted); }
 
-/* Nav icon styling (chicagooffline) */
-.nav-link.nav-icon {
-  padding: 0 12px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 44px;
-}
-.nav-svg {
-  display: block;
-  color: var(--nav-text);
-  transition: color 0.15s, opacity 0.15s;
-}
-.nav-link.nav-icon:hover .nav-svg,
-.nav-link.nav-icon.active .nav-svg {
-  color: var(--accent);
-  opacity: 1;
-}
-.nav-link.nav-icon .nav-svg {
-  opacity: 0.85;
+/* ── Map marker clustering (issue #1036, a11y refit issue #1356) ──
+ *
+ * #1356 WCAG 2.2 AA refit — Tufte structural framing + audit minimal patch.
+ * Design source: github.com/Kpa-clawbot/CoreScope/issues/1356 (Tufte + audit comments).
+ *
+ * Carriers (NON-color) of meaning, per WCAG 1.4.1:
+ *   - V1 cluster bubbles: size (40/48/56px) + numeral + border-style ramp EMOJI-OK-COMMENT
+ *     (1.5px solid / 2.5px solid / 2px double). Fill is a single neutral.
+ *   - V2 role pills: capital-letter prefix (R/C/M/S/O). Wong (2011) palette
+ *     hue is secondary. Dark text (#1a1a1a) on ALL five pills (audit override
+ *     so only ONE text-color rule is needed and every pill passes 4.5:1).
+ *   - V3 multi-byte hash labels: unicode glyph prefix (✓/?/✗) + neutral fill EMOJI-OK-COMMENT
+ *     + 3px colored left-border using the audit's high-luminance accent set
+ *     (NOT Tol "vibrant" — those failed 3:1 vs the neutral fill).
+ *
+ * Constants are --mc-* namespaced. The reserved --info / --warning / --accent
+ * system vars are NOT touched (per issue scope + AGENTS.md).
+ */
+:root {
+  /* V1 — cluster bubble */
+  --mc-cluster-fill:   rgba(33, 41, 54, 0.88);
+  --mc-cluster-text:   #ffffff;
+  --mc-cluster-border: #666666; /* audit: white border = 1.05:1 vs Carto-light; #666 = 4.83:1 */
+
+  /* V2 — role pills (Wong 2011 colorblind-safe palette) */
+  --mc-role-repeater:  #D55E00; /* vermillion        */
+  --mc-role-companion: #56B4E9; /* sky blue          */
+  --mc-role-room:      #009E73; /* bluish-green      */
+  --mc-role-sensor:    #F0E442; /* yellow            */
+  --mc-role-observer:  #CC79A7; /* reddish-purple    */
+
+  /* #1488 — marker stroke (outline around the role shape on map + live).
+   * Reporter (EldoonNemar) found the new white stroke overwhelming with
+   * hundreds of nodes. Defaults preserve visibility on both dark + light
+   * tiles; operators dial these via the customizer (Colors → Marker
+   * Stroke) or via config.json (markerStroke.*). All SVG marker builders
+   * read these vars so changes propagate live without a reload. */
+  --mc-marker-stroke-color:   #fff;
+  --mc-marker-stroke-width:   2;
+  --mc-marker-stroke-opacity: 1;
+
+  /* #1407 — per-role text colors paired with each --mc-role-X bg so
+   * .mc-pill (and any badge using the var) hits WCAG 1.4.3 AA against
+   * the active preset. Wong defaults all clear 4.5:1 with dark text;
+   * preset overrides live in body[data-cb-preset="..."] blocks below. */
+  --mc-role-repeater-text:  #1a1a1a;
+  --mc-role-companion-text: #1a1a1a;
+  --mc-role-room-text:      #1a1a1a;
+  --mc-role-sensor-text:    #1a1a1a;
+  --mc-role-observer-text:  #1a1a1a;
+
+  /* V3 — multi-byte hash labels (neutral fill + high-luminance accent stripes) */
+  --mc-mb-fill:        rgba(33, 41, 54, 0.92);
+  --mc-mb-text:        #ffffff;
+  --mc-mb-confirmed:   #56F0A0; /* audit override of Tol vibrant for fill contrast */
+  --mc-mb-suspected:   #FFD966;
+  --mc-mb-unknown:     #FF8888;
 }
 
-/* Stats icon styling (chicagooffline) */
-.stat-icon {
-  display: inline-block;
-  vertical-align: middle;
-  color: var(--nav-text);
-  opacity: 0.7;
-  margin: 0 2px;
+/* ─────────────────────────────────────────────────────────────────────────
+ * #1361 — Colorblind preset overrides.
+ *
+ * Each block overrides --mc-role-* and --mc-mb-* CSS vars when the body
+ * carries the matching data-cb-preset attribute. cb-presets.js also writes
+ * these vars inline on documentElement (defense-in-depth so the preset
+ * takes effect even on pages that ship custom theme overrides), and keeps
+ * window.ROLE_COLORS in sync for JS consumers (legend, cluster builder).
+ *
+ * Palette sources cited in PR body. Authoritative CSS rules here mirror
+ * the JS PRESETS table in public/cb-presets.js — both are the source of
+ * truth so a regression that drops one is still caught by the other
+ * (mirrors the #1356 "pill color: defense-in-depth via CSS + inline" pattern).
+ * ─────────────────────────────────────────────────────────────────────── */
+/* #1446 — the body data-cb-preset rule for the default (Wong) palette is
+ * intentionally OMITTED. Wong is the :root baseline; selecting "default"
+ * from the customizer is identical to "no preset". Writing the Wong
+ * palette here would mask the server config's nodeColors (see #1446
+ * cascade). Wong values remain available via :root above.
+ */
+body[data-cb-preset="deut"] {
+  /* IBM 5-class deut variant — anchors shifted out of red/green collision. */
+  --mc-role-repeater:  #FE6100;
+  --mc-role-companion: #648FFF;
+  --mc-role-room:      #785EF0;
+  --mc-role-sensor:    #FFB000;
+  --mc-role-observer:  #DC267F;
+  /* #1407 — room/observer fail with dark text (3.86/3.83); flip to white. */
+  --mc-role-repeater-text:  #1a1a1a;
+  --mc-role-companion-text: #1a1a1a;
+  --mc-role-room-text:      #ffffff;
+  --mc-role-sensor-text:    #1a1a1a;
+  --mc-role-observer-text:  #ffffff;
+  --mc-mb-confirmed:   #648FFF;
+  --mc-mb-suspected:   #FFB000;
+  --mc-mb-unknown:     #DC267F;
+}
+body[data-cb-preset="prot"] {
+  /* Protan: swap repeater anchor for higher-luminance amber. */
+  --mc-role-repeater:  #FFB000;
+  --mc-role-companion: #648FFF;
+  --mc-role-room:      #785EF0;
+  --mc-role-sensor:    #FE6100;
+  --mc-role-observer:  #DC267F;
+  /* #1407 — same room/observer flip as deut. */
+  --mc-role-repeater-text:  #1a1a1a;
+  --mc-role-companion-text: #1a1a1a;
+  --mc-role-room-text:      #ffffff;
+  --mc-role-sensor-text:    #1a1a1a;
+  --mc-role-observer-text:  #ffffff;
+  --mc-mb-confirmed:   #648FFF;
+  --mc-mb-suspected:   #FFB000;
+  --mc-mb-unknown:     #DC267F;
+}
+body[data-cb-preset="trit"] {
+  /* Paul Tol muted (B/Y-safe). */
+  --mc-role-repeater:  #CC6677;
+  --mc-role-companion: #117733;
+  --mc-role-room:      #882255;
+  --mc-role-sensor:    #DDCC77;
+  --mc-role-observer:  #AA4499;
+  /* #1407 — companion / room / observer fail AA with dark text; flip to white. */
+  --mc-role-repeater-text:  #1a1a1a;  /* 5.73:1 */
+  --mc-role-companion-text: #ffffff;  /* 5.66:1 */
+  --mc-role-room-text:      #ffffff;  /* 8.71:1 */
+  --mc-role-sensor-text:    #1a1a1a;  /* 12.98:1 */
+  --mc-role-observer-text:  #ffffff;  /* 5.25:1 */
+  --mc-mb-confirmed:   #117733;
+  --mc-mb-suspected:   #DDCC77;
+  --mc-mb-unknown:     #CC6677;
+}
+body[data-cb-preset="achromat"] {
+  /* Pure luminance ramp at 20/35/50/70/90% — relies on #1356/#1357 carriers. */
+  --mc-role-repeater:  #333333;
+  --mc-role-companion: #595959;
+  --mc-role-room:      #808080;
+  --mc-role-sensor:    #b3b3b3;
+  --mc-role-observer:  #e6e6e6;
+  /* #1407 — original bug: dark text on all 5 grays failed AA on 3 of 5.
+   * Pair each gray with the text color that wins ≥4.5:1; L=50% mid-gray
+   * needs pure black (#1a1a1a yields 4.41, #fff yields 3.95 — neither
+   * passes; black yields 5.32). */
+  --mc-role-repeater-text:  #ffffff;  /* 12.63:1 */
+  --mc-role-companion-text: #ffffff;  /* 7.00:1 */
+  --mc-role-room-text:      #000000;  /* 5.32:1 */
+  --mc-role-sensor-text:    #1a1a1a;  /* 8.30:1 */
+  --mc-role-observer-text:  #1a1a1a;  /* 13.94:1 */
+  --mc-mb-confirmed:   #b3b3b3;
+  --mc-mb-suspected:   #808080;
+  --mc-mb-unknown:     #595959;
 }
 
-/* Hide favorites button for consistent navbar (chicagooffline) */
-.nav-fav-wrap {
-  display: none !important;
-}
-
-/* Force non-priority nav items to More dropdown on wide screens only (chicagooffline) */
-@media (min-width: 1024px) {
-  .nav-links a:not([data-priority="high"]) {
-    display: none !important;
-  }
-}
-
-/* Ensure More button text stays inline (chicagooffline) */
-.nav-more-btn {
-  white-space: nowrap;
-}
-
-/* Show More button on large screens (chicagooffline override) */
-/* Increase specificity to beat .is-hidden from upstream Priority+ JS */
-@media (min-width: 1024px) {
-  .nav-more-wrap,
-  .nav-more-wrap.is-hidden {
-    display: flex !important;
-    align-items: center;
-  }
-}
-
-
-/* ── Map marker clustering (issue #1036) ── */
 .mc-cluster-wrap { background: transparent !important; border: 0 !important; }
 .mc-cluster {
   width: 48px; height: 48px; border-radius: 50%;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   font-family: var(--font, system-ui, sans-serif);
-  color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.5);
-  border: 2px solid rgba(255,255,255,0.85);
-  box-shadow: 0 2px 6px rgba(0,0,0,0.35);
+  background: var(--mc-cluster-fill);
+  color: var(--mc-cluster-text); text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+  border: 2px solid var(--mc-cluster-border);
+  /* Dark halo + soft shadow — audit fix so the border edge is visible vs Carto-light */
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.5), 0 1px 2px rgba(0,0,0,0.35);
   cursor: pointer;
   transition: transform 120ms ease;
 }
 .mc-cluster:hover { transform: scale(1.06); }
-.mc-cluster.mc-sm { background: var(--info, #2563eb); width: 40px; height: 40px; }
-.mc-cluster.mc-md { background: var(--warning, #d97706); width: 48px; height: 48px; }
-.mc-cluster.mc-lg { background: var(--accent, #dc2626); width: 56px; height: 56px; }
-.mc-cluster .mc-count { font-size: 14px; font-weight: 700; line-height: 1; }
-.mc-cluster.mc-lg .mc-count { font-size: 16px; }
+/* Border-style ramp is the redundant non-color carrier of the count bucket. */
+.mc-cluster.mc-sm { width: 40px; height: 40px; border-width: 1.5px; border-style: solid; }
+.mc-cluster.mc-md { width: 48px; height: 48px; border-width: 2.5px; border-style: solid; }
+.mc-cluster.mc-lg { width: 56px; height: 56px; border-width: 2px;   border-style: double; }
+.mc-cluster .mc-count { font-size: 0.875rem; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+.mc-cluster.mc-lg .mc-count { font-size: 1rem; }
 .mc-cluster .mc-pills {
   display: flex; gap: 2px; margin-top: 3px;
 }
 .mc-cluster .mc-pill {
-  display: inline-block; min-width: 12px; padding: 0 3px;
-  border-radius: 6px; font-size: 9px; font-weight: 600; line-height: 12px;
-  color: #fff; text-align: center; text-shadow: none;
-  border: 1px solid rgba(255,255,255,0.4);
+  display: inline-block; min-width: 12px; padding: 1px 3px;
+  border-radius: 3px;
+  /* #1364: removed the prior `max-width` cap — it clamped the BOX
+     (including the 1px 3px padding) to ~2.5ch of text, ellipsizing `R60`
+     to `R…`. JS in map.js already caps counts at "999+" (max 5 chars:
+     `R999+`), which is the load-bearing safety. `overflow:hidden` +
+     `text-overflow:ellipsis` stay as belt-only graceful-degrade if the
+     JS cap is ever bypassed. */
+  overflow: hidden; text-overflow: ellipsis;
+  /* #1407 — pill text color now reads --mc-pill-text (set per-pill via the
+     role-* selectors below), with a #1a1a1a fallback for any caller that
+     forgets to set the role class. This replaces the hardcoded `#1a1a1a`
+     that broke WCAG 1.4.3 AA on the achromat preset for 3 of 5 grays.
+     The Wong (#1357) audit conclusion still holds for the default preset
+     because --mc-role-X-text defaults to #1a1a1a in :root.
+     Sized in rem (0.625rem = 10px @ default 16px root) so user
+     font-size preferences scale the pill (SC 1.4.4 Resize Text 200%). */
+  font: 700 0.625rem/1.1 ui-monospace, "SF Mono", Consolas, monospace;
+  letter-spacing: 0;
+  color: var(--mc-pill-text, #1a1a1a); text-align: center; text-shadow: none;
+  border: 1px solid rgba(0,0,0,0.25);
+  /* #1360: overflow:hidden + text-overflow:ellipsis above bound the pill
+     when counts approach the 4-char cap ("999+"). Acceptable tradeoff vs.
+     SC 1.4.12 letter-spacing clipping: text content is the role letter +
+     <=4 digits, far short of needing aggressive letter-spacing overrides. */
+}
+/* #1407 — per-role pill text color, sourced from --mc-role-*-text vars set
+ * by cb-presets.js applyPreset() (and the body[data-cb-preset=...] CSS
+ * blocks above). The role-<r> class is emitted by makeClusterIcon in
+ * public/map.js, so each pill picks the correct foreground for its bg. */
+.mc-cluster .mc-pill.role-repeater  { color: var(--mc-role-repeater-text,  #1a1a1a); }
+.mc-cluster .mc-pill.role-companion { color: var(--mc-role-companion-text, #1a1a1a); }
+.mc-cluster .mc-pill.role-room      { color: var(--mc-role-room-text,      #1a1a1a); }
+.mc-cluster .mc-pill.role-sensor    { color: var(--mc-role-sensor-text,    #1a1a1a); }
+.mc-cluster .mc-pill.role-observer  { color: var(--mc-role-observer-text,  #1a1a1a); }
+
+/* V3 — multi-byte hash labels: neutral fill + colored 3px left border */
+.mc-mb-label {
+  background: var(--mc-mb-fill);
+  color: var(--mc-mb-text);
+  /* Sized in rem (0.75rem = 12px @ default root) so user font-size
+     preferences scale the label per SC 1.4.4 Resize Text 200%. */
+  font: 600 0.75rem/1.2 ui-monospace, "SF Mono", Consolas, monospace;
+  letter-spacing: 0.02em;
+  padding: 2px 5px 2px 4px;
+  border-left: 3px solid transparent;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.5), 0 1px 2px rgba(0,0,0,0.35);
+  white-space: nowrap;
+  text-align: center;
+  line-height: 1.2;
+}
+.mc-mb-label.status-confirmed { border-left-color: var(--mc-mb-confirmed); }
+.mc-mb-label.status-suspected { border-left-color: var(--mc-mb-suspected); }
+.mc-mb-label.status-unknown   { border-left-color: var(--mc-mb-unknown);   }
+
+/* Forced-colors / Windows High Contrast — degrade gracefully (audit item 7). */
+@media (forced-colors: active) {
+  .mc-cluster, .mc-pill, .mc-mb-label {
+    forced-color-adjust: auto;
+    background: Canvas;
+    color: CanvasText;
+    border-color: CanvasText;
+  }
 }
 
 /* === #1034 PR1: Channel Add modal + sectioned sidebar === */
@@ -3726,16 +4775,22 @@ body { touch-action: pan-y; }
   .row-swiping,
   .row-action-overlay { transition: none !important; }
 }
-/* === end #1062 ====================================================== */ (feat(#1062): green — implement gesture system)
+/* === end #1062 ====================================================== */
 
 /* === Issue #1065 — Gesture discoverability hints =================== */
+/* width:fit-content makes the pill shrink to its content; without it
+ * the wrap defaults to block (100% of body width). Combined with
+ * .gesture-hint-bottom { left:50%; transform:translateX(-50%) } that
+ * pushed the wrap off-screen-left on narrow viewports (#1065 follow-up).
+ * Comments live ABOVE the rule body, not interleaved, because a stray
+ * em-dash or sequence inside the body has historically caused some CSS
+ * parsers to drop the entire rule from the CSSOM. */
 .gesture-hint {
   position: fixed;
   z-index: 9999;
+  width: -moz-fit-content;
+  width: fit-content;
   max-width: 360px;
-  /* !important guards against any layered cascade enabling pointer-events
-   * (e.g., a future overlay class with higher specificity). The hint
-   * wrapper MUST never capture clicks — only its inner button does. */
   pointer-events: none !important;
   opacity: 1;
   animation-name: gesture-hint-slide-in;
@@ -3807,3 +4862,353 @@ body { touch-action: pan-y; }
   }
 }
 /* === end #1065 ====================================================== */
+
+/* === #1367 Channels chat-app redesign (mobile) ====================== */
+/* Mobile (<768px): flat chat-app row list. Full-width 80px rows with
+   a hash-colored avatar, bold name, ellipsized last-message preview,
+   and right-aligned relative timestamp. No inline action chips. */
+.ch-row {
+  display: flex; align-items: center; gap: 12px;
+  width: 100%; min-height: 80px; height: 80px; padding: 8px 12px;
+  background: transparent; border: 0; border-bottom: 1px solid var(--border);
+  text-align: left; cursor: pointer; color: var(--text);
+  -webkit-tap-highlight-color: rgba(0,0,0,.08);
+  touch-action: manipulation;
+}
+.ch-row:hover { background: var(--row-hover); }
+.ch-row.selected { background: var(--selected-bg); }
+.ch-row-avatar {
+  width: 64px; height: 64px; flex: 0 0 64px;
+  border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  color: #fff; font-weight: 700; font-size: 14px; letter-spacing: 0.5px;
+}
+.ch-row-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.ch-row-line1 {
+  display: flex; align-items: baseline; gap: 8px;
+  min-width: 0;
+}
+.ch-row-name {
+  flex: 1 1 auto; min-width: 0;
+  font-weight: 700; font-size: 15px; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ch-row-time {
+  flex: 0 0 auto;
+  font-size: 12px; color: var(--text-muted); white-space: nowrap;
+  margin-left: auto;
+}
+.ch-row-preview {
+  font-size: 13px; color: var(--text-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* Detail view chrome (mobile): back chevron + title. */
+.ch-back {
+  display: none; background: none; border: 0; cursor: pointer;
+  color: var(--text); font-size: 24px; line-height: 1;
+  min-width: 40px; min-height: 40px; padding: 0 8px;
+  border-radius: 6px;
+  align-items: center; justify-content: center;
+  -webkit-tap-highlight-color: rgba(0,0,0,.08);
+  touch-action: manipulation;
+}
+.ch-back:hover, .ch-back:focus { background: var(--row-hover); outline: none; }
+
+/* Per-message structure additions (mobile + desktop): a colored
+   reply-target prefix at the start of the bubble body. */
+.ch-reply-target { font-weight: 700; }
+
+/* Mobile-only layout swap: sidebar IS the full screen until a channel
+   is opened, then the main pane slides over it. */
+@media (max-width: 767px) {
+  .ch-layout { position: relative; }
+  /* Override the older #1224/#1057 stacking — go full-screen list view. */
+  .ch-sidebar {
+    width: 100%; max-height: none; height: 100%;
+    border-right: none; border-bottom: none;
+  }
+  .ch-main {
+    position: absolute; inset: 0;
+    /* Default: hidden behind the sidebar (visibility lets the rect
+       still report inset:0 so existing fluid-layout tests see an
+       "overlay" — same x/w as the sidebar — instead of an
+       off-screen pane). */
+    visibility: hidden;
+    transform: translateX(0);
+    transition: visibility 0s linear 220ms, transform 220ms ease;
+    background: var(--content-bg);
+    z-index: 2;
+  }
+  .ch-layout.ch-detail-open .ch-main {
+    visibility: visible;
+    transition: visibility 0s, transform 220ms ease;
+  }
+  .ch-back { display: inline-flex; }
+  /* When the layout is in list mode, hide the back button (no channel). */
+  .ch-layout:not(.ch-detail-open) .ch-back { display: none; }
+  /* The channel list now scrolls inside the sidebar at full height. */
+  .ch-channel-list { padding-bottom: 24px; }
+}
+/* === end #1367 ====================================================== */
+/* ─── #1374 packet-route map view ───────────────────────────────────
+   Role-aware shape markers + sequence-number badges + directional
+   arrows + collapsible legend. WCAG SC 1.3.1 / 1.4.3 / 1.4.11 AA.
+   - Marker badge background uses --mc-route-badge-bg / -fg with measured
+     contrast ≥ 7:1 against #1a1a1a text on Carto Positron AND Dark
+     Matter (we burn-in #f8fafc fill + #0f172a text — both tiles).
+   - Edges use a per-hop HSL gradient as REDUNDANT carrier; the sequence
+     number badge is the primary order signal so colorblind users and
+     forced-colors users still read the route.
+   - `prefers-reduced-motion: reduce` disables marker focus pulse.
+   - `forced-colors: active` strips role colors → uses CanvasText/Canvas.
+   ----------------------------------------------------------------- */
+:root {
+  --mc-route-badge-bg: #f8fafc;
+  --mc-route-badge-fg: #0f172a;
+  --mc-route-badge-border: #1a1a1a;
+  --mc-route-label-bg: #f8fafc;
+  --mc-route-label-fg: #0f172a;
+  --mc-route-label-border: #475569;
+  --mc-route-legend-bg: rgba(248, 250, 252, 0.96);
+  --mc-route-legend-fg: #0f172a;
+  --mc-route-legend-border: #475569;
+}
+[data-theme="dark"] {
+  --mc-route-legend-bg: rgba(15, 23, 42, 0.94);
+  --mc-route-legend-fg: #f1f5f9;
+  --mc-route-legend-border: #94a3b8;
+}
+
+.mc-route-marker-icon { background: transparent !important; border: none !important; }
+.mc-route-marker {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+}
+.mc-route-marker:focus {
+  outline: 3px solid #06b6d4;
+  outline-offset: 2px;
+  border-radius: 50%;
+}
+.mc-route-marker.ch-unresolved {
+  opacity: 0.65;
+  filter: grayscale(0.8);
+}
+.mc-route-seq-badge {
+  position: absolute;
+  bottom: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 3px;
+  background: var(--mc-route-badge-bg);
+  color: var(--mc-route-badge-fg);
+  border: 1.5px solid var(--mc-route-badge-border);
+  border-radius: 8px;
+  font: 700 10px/14px system-ui, sans-serif;
+  text-align: center;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+.mc-route-label-icon { background: transparent !important; border: none !important; }
+.mc-route-label {
+  display: inline-block;
+  padding: 1px 6px;
+  background: var(--mc-route-label-bg);
+  color: var(--mc-route-label-fg);
+  border: 1px solid var(--mc-route-label-border);
+  border-radius: 3px;
+  font: 600 11px/14px system-ui, sans-serif;
+  white-space: nowrap;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+.mc-route-edge {
+  fill: none;
+}
+.mc-route-legend {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 700;
+  max-width: 240px;
+  background: var(--mc-route-legend-bg);
+  color: var(--mc-route-legend-fg);
+  border: 1px solid var(--mc-route-legend-border);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  font: 12px/1.4 system-ui, sans-serif;
+}
+.mc-route-legend-toggle {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  border-bottom: 1px solid var(--mc-route-legend-border);
+  font: 700 12px/1.2 system-ui, sans-serif;
+  text-align: left;
+  cursor: pointer;
+}
+.mc-route-legend-toggle:focus { outline: 2px solid #06b6d4; outline-offset: 1px; }
+.mc-route-legend-toggle[aria-expanded="false"] + .mc-route-legend-body { display: none; }
+.mc-route-legend-body { padding: 8px 10px; }
+.mc-route-legend-list { list-style: none; padding: 0; margin: 4px 0; }
+.mc-route-legend-entry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+.mc-route-legend-swatch svg { display: block; }
+.mc-route-legend-glyph {
+  display: inline-block;
+  width: 14px;
+  text-align: center;
+  font-weight: 700;
+  color: var(--mc-route-legend-fg);
+}
+.mc-route-legend-gradient {
+  display: inline-block;
+  width: 32px;
+  height: 8px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, hsl(152,70%,50%), hsl(18,70%,58%));
+  border: 1px solid var(--mc-route-legend-border);
+}
+.mc-route-legend-section {
+  margin-top: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--mc-route-legend-fg);
+  opacity: 0.75;
+}
+.mc-route-resolved-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  margin-bottom: 4px;
+  background: #fef3c7;
+  color: #78350f;
+  border: 1px solid #92400e;
+  border-radius: 3px;
+  font: 700 11px/14px system-ui, sans-serif;
+}
+.mc-route-context-label {
+  position: absolute;
+  top: 12px;
+  left: 60px;
+  z-index: 700;
+  padding: 4px 8px;
+  background: var(--mc-route-legend-bg);
+  color: var(--mc-route-legend-fg);
+  border: 1px solid var(--mc-route-legend-border);
+  border-radius: 4px;
+  font: 600 11px/1.3 system-ui, sans-serif;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+}
+.mc-route-popup .mc-route-popup-title {
+  font: 700 13px/1.3 system-ui, sans-serif;
+  margin-bottom: 4px;
+  color: var(--text, #0f172a);
+}
+.mc-route-popup .mc-route-popup-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font: 11px/1.4 system-ui, sans-serif;
+  color: var(--text-muted, #475569);
+}
+.mc-route-popup .mc-route-popup-row b,
+.mc-route-popup .mc-route-popup-row code {
+  color: var(--text, #0f172a);
+}
+.mc-route-popup-link {
+  color: var(--accent, #0ea5e9);
+  font-size: 11px;
+  text-decoration: underline;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mc-route-marker,
+  .mc-route-edge { transition: none !important; animation: none !important; }
+}
+@media (forced-colors: active) {
+  .mc-route-marker svg circle,
+  .mc-route-marker svg rect,
+  .mc-route-marker svg polygon { stroke: CanvasText !important; }
+  .mc-route-seq-badge,
+  .mc-route-label,
+  .mc-route-legend,
+  .mc-route-context-label {
+    background: Canvas !important;
+    color: CanvasText !important;
+    border-color: CanvasText !important;
+  }
+  .mc-route-edge { stroke: CanvasText !important; }
+}
+
+/* ===========================================================================
+   Issue #1369 — embed mode (?embed=1 on /#/map and /#/channels)
+   Hide all chrome for full-bleed cross-domain iframe embeds. body.embed is
+   toggled in app.js navigate() based on shouldEmbedRoute().
+   =========================================================================== */
+body.embed .top-nav,
+body.embed [data-bottom-nav],
+body.embed .nav-drawer,
+body.embed .nav-drawer-backdrop { display: none !important; }
+body.embed { padding: 0 !important; margin: 0 !important; }
+/* App container occupies full viewport in embed mode — top-nav (52px) and
+   bottom-nav reserve are gone, so reclaim the full dvh. */
+body.embed #app.app-fixed {
+  height: 100vh !important;
+  height: 100dvh !important;
+}
+
+/* #1504 — Path symbols legend disclosure (subtle inline key, shared by Packets + Nodes). */
+.path-symbols-legend-wrapper {
+  margin: 4px 0 6px;
+  text-align: right;
+}
+.path-symbols-legend {
+  position: relative; /* anchor for absolutely-positioned .path-legend-list */
+  display: inline-block;
+  margin-left: 6px;
+  font-weight: normal;
+  font-size: 11px;
+  vertical-align: middle;
+}
+.path-symbols-legend > summary {
+  display: inline-block;
+  cursor: pointer;
+  color: var(--text-muted, #888);
+  list-style: none;
+  border-bottom: 1px dotted currentColor;
+  user-select: none;
+}
+.path-symbols-legend > summary::-webkit-details-marker { display: none; }
+.path-symbols-legend > summary::marker { content: ''; }
+.path-symbols-legend > summary::before { content: 'ⓘ '; opacity: 0.7; }
+.path-symbols-legend[open] > summary { color: var(--text, inherit); }
+.path-symbols-legend .path-legend-list {
+  position: absolute;
+  z-index: 50;
+  margin: 4px 0 0;
+  padding: 8px 12px;
+  list-style: none;
+  background: var(--bg-card, var(--bg, #fff));
+  border: 1px solid var(--border, #ddd);
+  border-radius: 4px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+  font-size: 11px;
+  line-height: 1.5;
+  max-width: 360px;
+  color: var(--text, inherit);
+}
+.path-symbols-legend .path-legend-list li { padding: 2px 0; }
+.path-symbols-legend .path-legend-glyph {
+  display: inline-block;
+  min-width: 1.6em;
+  font-weight: 600;
+}

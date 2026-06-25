@@ -54,6 +54,20 @@ const (
 	// drift rarely exceeds 1 hour, while epoch-0 RTCs produce ~1.7B sec.
 	bimodalSkewThresholdSec = 3600.0
 
+	// rtcResetOutlierThresholdSec is the absolute skew above which a
+	// sample is treated as obvious sensor garbage — an RTC-reset advert
+	// where the firmware emitted its factory timestamp (typically off by
+	// months/years). These samples are excluded from the recent-window
+	// "good/bad" split (bug #1285 — single RTC-reset advert among 30
+	// healthy adverts must not flip a node to bimodal_clock) and from the
+	// per-hash evidence median (a 700-day median is not actionable for
+	// operators). They remain in the raw sample stream and the RTC-reset
+	// badge logic which surfaces them separately. 24h is a generous floor:
+	// real drift is fractions of a sec/advert, real clock-skew tops out
+	// in the hours range; anything above a day is structurally not a
+	// drift signal.
+	rtcResetOutlierThresholdSec = 24 * 3600.0
+
 	// maxPlausibleSkewJumpSec is the largest skew change between
 	// consecutive samples that we treat as physical drift. Anything larger
 	// (e.g. a GPS sync that jumps the clock by minutes/days) is rejected
@@ -119,6 +133,7 @@ type NodeClockSkew struct {
 	Samples         []SkewSample `json:"samples,omitempty"` // time-series for sparklines
 	GoodFraction        float64  `json:"goodFraction"`        // fraction of recent samples with |skew| <= 1h
 	RecentBadSampleCount int     `json:"recentBadSampleCount"` // count of recent samples with |skew| > 1h
+	RecentBadSamples     []BadSample `json:"recentBadSamples,omitempty"` // #1094: per-bad-sample evidence (hash + bad advertTS)
 	RecentSampleCount    int     `json:"recentSampleCount"`    // total recent samples in window
 	RecentHashEvidence  []HashEvidence      `json:"recentHashEvidence,omitempty"`
 	CalibrationSummary  *CalibrationSummary `json:"calibrationSummary,omitempty"`
@@ -130,6 +145,15 @@ type NodeClockSkew struct {
 type SkewSample struct {
 	Timestamp int64   `json:"ts"`   // Unix epoch of observation
 	SkewSec   float64 `json:"skew"` // corrected skew in seconds
+}
+
+// BadSample is a single recent advert flagged as having a nonsense timestamp
+// (|corrected skew| in the bimodal-bad band — > 1h, <= 24h). #1094: surfaced
+// so the UI can link each offender to its packet detail page.
+type BadSample struct {
+	Hash     string  `json:"hash"`     // transmission hash for packet-detail deep-link
+	AdvertTS int64   `json:"advertTS"` // the offending advert Unix timestamp
+	SkewSec  float64 `json:"skewSec"`  // corrected skew vs observer at observation time
 }
 
 // HashEvidenceObserver is one observer's contribution to a per-hash evidence entry.
@@ -498,7 +522,7 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 			lastSkew = cs.LastSkewSec
 			lastAdvTS = cs.LastAdvertTS
 		}
-		tsSkews = append(tsSkews, tsSkewPair{ts: cs.LastObservedTS, skew: cs.MedianSkewSec})
+		tsSkews = append(tsSkews, tsSkewPair{ts: cs.LastObservedTS, skew: cs.MedianSkewSec, hash: tx.Hash, advertTS: cs.LastAdvertTS})
 	}
 
 	if len(allSkews) == 0 {
@@ -522,6 +546,7 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 
 	recentSkew := lastSkew
 	var recentVals []float64
+	var recentPairs []tsSkewPair
 	if n := len(tsSkews); n > 0 {
 		latestTS := tsSkews[n-1].ts
 		// Index-based window: last K samples.
@@ -545,6 +570,7 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 			start = startByTime
 		}
 		recentVals = make([]float64, 0, n-start)
+		recentPairs = tsSkews[start:n]
 		for i := start; i < n; i++ {
 			recentVals = append(recentVals, tsSkews[i].skew)
 		}
@@ -560,13 +586,37 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 	//   no_clock       — goodFraction < 0.10 (essentially no real clock)
 	//   bimodal_clock  — 0.10 <= goodFraction < 0.80 AND badCount > 0
 	//   ok/warn/etc.   — goodFraction >= 0.80 (normal, outliers filtered)
+	//
+	// RTC-reset outliers (|skew| > 24h — single advert where the firmware
+	// emitted its factory timestamp) are EXCLUDED from this split (bug
+	// #1285): they're not "bimodal-bad real-but-large skew" but obvious
+	// sensor garbage, surfaced separately via the RTC-reset badge. Counting
+	// them as bimodal-bad produces a false-alarm warning ("3 of last 5
+	// adverts had nonsense timestamps") on otherwise-healthy nodes.
 	var goodSamples []float64
-	for _, v := range recentVals {
-		if math.Abs(v) <= bimodalSkewThresholdSec {
+	var rtcResetCount int
+	var recentBadSamples []BadSample // #1094: per-bad-sample evidence (hash + advertTS)
+	for i, v := range recentVals {
+		absV := math.Abs(v)
+		switch {
+		case absV > rtcResetOutlierThresholdSec:
+			rtcResetCount++ // ignored for good/bad classification
+		case absV <= bimodalSkewThresholdSec:
 			goodSamples = append(goodSamples, v)
+		default:
+			// Bimodal-bad: 1h < |skew| <= 24h. Capture hash + advertTS so
+			// the UI can link each offender to its packet detail page
+			// instead of showing a count without evidence (#1094).
+			if i < len(recentPairs) && recentPairs[i].hash != "" {
+				recentBadSamples = append(recentBadSamples, BadSample{
+					Hash:     recentPairs[i].hash,
+					AdvertTS: recentPairs[i].advertTS,
+					SkewSec:  round(v, 1),
+				})
+			}
 		}
 	}
-	recentSampleCount := len(recentVals)
+	recentSampleCount := len(recentVals) - rtcResetCount
 	recentBadCount := recentSampleCount - len(goodSamples)
 	var goodFraction float64
 	if recentSampleCount > 0 {
@@ -586,8 +636,9 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 		}
 	} else {
 		// Normal path: if there are good samples, use their median
-		// (filters out rare outliers in ≥80% good case).
-		if len(goodSamples) > 0 && recentBadCount > 0 {
+		// (filters out rare outliers in ≥80% good case, and rejects
+		// RTC-reset outliers regardless of bimodal/bad counts — #1285).
+		if len(goodSamples) > 0 {
 			recentSkew = median(goodSamples)
 		}
 		severity = classifySkew(math.Abs(recentSkew))
@@ -668,7 +719,7 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 		recentEvidence = append(recentEvidence, HashEvidence{
 			Hash:                   eh.hash,
 			Observers:              observers,
-			MedianCorrectedSkewSec: round(median(corrSkews), 1),
+			MedianCorrectedSkewSec: round(hashEvidenceMedian(corrSkews), 1),
 			Timestamp:              eh.ts,
 		})
 	}
@@ -688,15 +739,47 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 		Samples:              samples,
 		GoodFraction:         round(goodFraction, 2),
 		RecentBadSampleCount: recentBadCount,
+		RecentBadSamples:     recentBadSamples,
 		RecentSampleCount:    recentSampleCount,
 		RecentHashEvidence:   recentEvidence,
 		CalibrationSummary:   &calSummary,
 	}
 }
 
-// GetFleetClockSkew returns clock skew data for all nodes that have skew data.
-// Must NOT be called with s.mu held.
-func (s *PacketStore) GetFleetClockSkew() []*NodeClockSkew {
+// GetFleetClockSkew returns clock skew data for all nodes, optionally
+// filtered to area. With no area, prefers the steady-state recomputer
+// snapshot (issue #1265). Must NOT be called with s.mu held.
+func (s *PacketStore) GetFleetClockSkew(area string) []*NodeClockSkew {
+	if area == "" {
+		s.analyticsRecomputerMu.RLock()
+		rc := s.recompNodesClockSkew
+		s.analyticsRecomputerMu.RUnlock()
+		if rc != nil {
+			if v := rc.Load(); v != nil {
+				if r, ok := v.([]*NodeClockSkew); ok {
+					return r
+				}
+			}
+		}
+	}
+	return s.computeFleetClockSkewForArea(area)
+}
+
+// computeFleetClockSkew wraps computeFleetClockSkewForArea with no area
+// filter; called by the steady-state recomputer. Must NOT be called with
+// s.mu held.
+func (s *PacketStore) computeFleetClockSkew() []*NodeClockSkew {
+	return s.computeFleetClockSkewForArea("")
+}
+
+// computeFleetClockSkewForArea is the underlying compute. Must NOT be
+// called with s.mu held.
+func (s *PacketStore) computeFleetClockSkewForArea(area string) []*NodeClockSkew {
+	var areaNodes map[string]bool
+	if area != "" {
+		areaNodes = s.resolveAreaNodes(area)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -707,8 +790,11 @@ func (s *PacketStore) GetFleetClockSkew() []*NodeClockSkew {
 		nameMap[ni.PublicKey] = ni
 	}
 
-	var results []*NodeClockSkew
+	var results = []*NodeClockSkew{}
 	for pubkey := range s.byNode {
+		if areaNodes != nil && !areaNodes[pubkey] {
+			continue
+		}
 		cs := s.getNodeClockSkewLocked(pubkey)
 		if cs == nil {
 			continue
@@ -727,8 +813,26 @@ func (s *PacketStore) GetFleetClockSkew() []*NodeClockSkew {
 	return results
 }
 
-// GetObserverCalibrations returns the current observer clock offsets.
+// GetObserverCalibrations returns the current observer clock offsets,
+// preferring the steady-state recomputer snapshot (issue #1265). Falls
+// back to an on-request compute when the recomputer is not running.
 func (s *PacketStore) GetObserverCalibrations() []ObserverCalibration {
+	s.analyticsRecomputerMu.RLock()
+	rc := s.recompObserversClockSkew
+	s.analyticsRecomputerMu.RUnlock()
+	if rc != nil {
+		if v := rc.Load(); v != nil {
+			if r, ok := v.([]ObserverCalibration); ok {
+				return r
+			}
+		}
+	}
+	return s.computeObserverCalibrations()
+}
+
+// computeObserverCalibrations is the underlying compute used by the
+// recomputer and on-request fallback. Must NOT be called with s.mu held.
+func (s *PacketStore) computeObserverCalibrations() []ObserverCalibration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -768,6 +872,23 @@ func median(vals []float64) float64 {
 	return sorted[n/2]
 }
 
+// hashEvidenceMedian returns the median corrected skew for a single
+// transmission hash, filtering out RTC-reset outliers (|skew| > 24h —
+// firmware emitting factory timestamp). Issue #1285: a single outlier
+// observer was dragging the displayed median to ~-704d on an otherwise
+// healthy node. If filtering leaves zero usable samples (every observer
+// of this hash saw a reset-shaped advert), return 0 so the UI can render
+// "insufficient data" rather than the garbage outlier value.
+func hashEvidenceMedian(vals []float64) float64 {
+	clean := vals[:0:0]
+	for _, v := range vals {
+		if math.Abs(v) <= rtcResetOutlierThresholdSec {
+			clean = append(clean, v)
+		}
+	}
+	return median(clean)
+}
+
 func mean(vals []float64) float64 {
 	if len(vals) == 0 {
 		return 0
@@ -779,10 +900,16 @@ func mean(vals []float64) float64 {
 	return sum / float64(len(vals))
 }
 
-// tsSkewPair is a (timestamp, skew) pair for drift estimation.
+// tsSkewPair is a (timestamp, skew) pair for drift estimation. Also carries
+// the source hash + advertTS so callers building per-sample evidence (e.g.
+// recentBadSamples for #1094) can identify the offending packet without a
+// second pass. Drift code reads only ts/skew; the extra fields are inert
+// there.
 type tsSkewPair struct {
-	ts   int64
-	skew float64
+	ts       int64
+	skew     float64
+	hash     string
+	advertTS int64
 }
 
 // computeDrift estimates linear drift in seconds per day from time-ordered

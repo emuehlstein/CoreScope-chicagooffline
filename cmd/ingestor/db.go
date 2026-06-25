@@ -1,17 +1,20 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/meshcore-analyzer/dbschema"
 	"github.com/meshcore-analyzer/packetpath"
 	_ "modernc.org/sqlite"
 )
@@ -62,15 +65,16 @@ func (s *DBStats) SnapshotBackfills() map[string]int64 {
 // Store wraps the SQLite database for packet ingestion.
 type Store struct {
 	db    *sql.DB
+	path  string // filesystem path to the SQLite DB (used to resolve queue dirs)
 	Stats DBStats
 
-	stmtGetTxByHash          *sql.Stmt
-	stmtInsertTransmission   *sql.Stmt
-	stmtUpdateTxFirstSeen    *sql.Stmt
-	stmtInsertObservation    *sql.Stmt
-	stmtUpsertNode           *sql.Stmt
-	stmtIncrementAdvertCount *sql.Stmt
-	stmtUpsertObserver       *sql.Stmt
+	stmtGetTxByHash            *sql.Stmt
+	stmtInsertTransmission     *sql.Stmt
+	stmtUpdateTxFirstSeen      *sql.Stmt
+	stmtInsertObservation      *sql.Stmt
+	stmtUpsertNode             *sql.Stmt
+	stmtIncrementAdvertCount   *sql.Stmt
+	stmtUpsertObserver         *sql.Stmt
 	stmtGetObserverRowid       *sql.Stmt
 	stmtUpdateObserverLastSeen *sql.Stmt
 	stmtUpdateNodeTelemetry    *sql.Stmt
@@ -78,6 +82,16 @@ type Store struct {
 
 	sampleIntervalSec int
 	backfillWg        sync.WaitGroup
+
+	// prefixIdx holds the prefix → pubkey index used by the
+	// resolved_path writer (#1547). Rebuilt on startup and once per
+	// neighbor-edges builder tick (60s).
+	prefixIdx prefixIdxHolder
+
+	// neighborGraph holds the in-memory NeighborGraph snapshot used
+	// by the context-aware resolver (#1560). Rebuilt on startup and
+	// once per neighbor-edges builder tick (60s).
+	neighborGraph neighborGraphHolder
 }
 
 // OpenStore opens or creates a SQLite DB at the given path, applying the
@@ -110,9 +124,37 @@ func OpenStoreWithInterval(dbPath string, sampleIntervalSec int) (*Store, error)
 		return nil, fmt.Errorf("applying schema: %w", err)
 	}
 
-	s := &Store{db: db, sampleIntervalSec: sampleIntervalSec}
+	// Apply the additional server-originated migrations (now owned by
+	// the ingestor per #1287). Adds the indexes/columns that used to live
+	// in cmd/server/ensure_*.go: server now ASSERTS these exist.
+	if err := dbschema.Apply(db, log.Printf); err != nil {
+		return nil, fmt.Errorf("dbschema.Apply: %w", err)
+	}
+
+	s := &Store{db: db, path: dbPath, sampleIntervalSec: sampleIntervalSec}
 	if err := s.prepareStatements(); err != nil {
 		return nil, fmt.Errorf("preparing statements: %w", err)
+	}
+
+	// Schedule async migrations. These must NOT block boot. See
+	// async_migration.go for the convention.
+	// PREFLIGHT: async=true reason="composite index build on observations (1.9M+ rows in prod) — converted from sync after v3.8.3"
+	var idxDone int
+	if s.db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'obs_observer_ts_idx_v1'").Scan(&idxDone) != nil {
+		if err := s.RunAsyncMigration(context.Background(), "obs_observer_ts_idx_v1",
+			func(ctx context.Context, d *sql.DB) error {
+				log.Println("[migration/async] Building (observer_idx, timestamp) composite index on observations...")
+				if _, err := d.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_observations_observer_idx_timestamp ON observations(observer_idx, timestamp)`); err != nil {
+					return err
+				}
+				if _, err := d.ExecContext(ctx, `INSERT OR IGNORE INTO _migrations (name) VALUES ('obs_observer_ts_idx_v1')`); err != nil {
+					return err
+				}
+				log.Println("[migration/async] observations(observer_idx, timestamp) index created")
+				return nil
+			}); err != nil {
+			log.Printf("[migration/async] scheduling obs_observer_ts_idx_v1 failed: %v", err)
+		}
 	}
 
 	return s, nil
@@ -152,7 +194,12 @@ func applySchema(db *sql.DB) error {
 			uptime_secs INTEGER,
 			noise_floor REAL,
 			inactive INTEGER DEFAULT 0,
-			last_packet_at TEXT DEFAULT NULL
+			last_packet_at TEXT DEFAULT NULL,
+			clock_skew_seconds INTEGER DEFAULT NULL,
+			clock_skew_count_24h INTEGER DEFAULT 0,
+			clock_last_naive_at TEXT DEFAULT NULL,
+			can_relay INTEGER DEFAULT 1,
+			can_relay_seen INTEGER DEFAULT 0
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen);
@@ -351,6 +398,39 @@ func applySchema(db *sql.DB) error {
 		log.Println("[migration] observations timestamp index created")
 	}
 
+	// #1481 P0-3: covering index for GetObserverPacketCounts. The query
+	// joins observations → observers and GROUP BYs observer_idx with a
+	// timestamp WHERE filter; a composite (observer_idx, timestamp)
+	// index lets SQLite resolve the grouping + range filter from the
+	// index alone instead of a 1.9M-row scan.
+	//
+	// CONVERTED TO ASYNC (preflight-async-migration-gate). Scheduling
+	// happens in OpenStore() once the real *Store exists so the
+	// backfill WaitGroup is shared with the rest of the ingestor.
+	// The legacy `_migrations` gate is preserved by the async fn so
+	// DBs that already completed the sync build stay no-op.
+
+	// #1483: normalize nodes.public_key to lowercase. The server's
+	// GetNodeLocationsByKeys lookup dropped LOWER(public_key) for perf
+	// (#1481 P0-3) and now relies on stored keys being lowercase. The
+	// decoder writes lowercase today, but legacy/admin/API inserts may
+	// have left mixed-case rows. Idempotent: counts and lowers any
+	// non-lowercase rows on every boot, runs once via _migrations gate
+	// for the bulk fix. Re-running stays cheap because subsequent
+	// passes match zero rows.
+	if r := db.QueryRow("SELECT COUNT(*) FROM nodes WHERE public_key != lower(public_key)"); r != nil {
+		var n int64
+		_ = r.Scan(&n)
+		if n > 0 {
+			log.Printf("[migration] Normalizing %d nodes.public_key row(s) to lowercase (#1483)...", n)
+			if _, err := db.Exec(`UPDATE nodes SET public_key = lower(public_key) WHERE public_key != lower(public_key)`); err != nil {
+				log.Printf("[migration] public_key lowercase normalize failed: %v", err)
+			} else {
+				log.Printf("[migration] public_key lowercase normalize complete (%d rows)", n)
+			}
+		}
+	}
+
 	// observer_metrics table for RF health dashboard
 	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'observer_metrics_v1'")
 	if row.Scan(&migDone) != nil {
@@ -457,14 +537,14 @@ func applySchema(db *sql.DB) error {
 		log.Println("[migration] dropped_packets table created")
 	}
 
-	// Migration: add raw_hex column to observations (#881)
-	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'observations_raw_hex_v1'")
-	if row.Scan(&migDone) != nil {
-		log.Println("[migration] Adding raw_hex column to observations...")
-		db.Exec(`ALTER TABLE observations ADD COLUMN raw_hex TEXT`)
-		db.Exec(`INSERT INTO _migrations (name) VALUES ('observations_raw_hex_v1')`)
-		log.Println("[migration] observations.raw_hex column added")
-	}
+	// Migration: observations.raw_hex (#881) is now owned by
+	// internal/dbschema/dbschema.go (#1321). The server PRAGMA-detects
+	// this column as hasObsRawHex; keeping a single canonical Apply
+	// path closes the startup race where the server's detector ran
+	// before this ALTER finished.
+
+	// Migration: transmissions.scope_name (#899) is now owned by
+	// internal/dbschema/dbschema.go (#1321). See above.
 
 	// Migration: add last_packet_at column to observers (#last-packet-at)
 	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'observers_last_packet_at_v1'")
@@ -486,6 +566,28 @@ func applySchema(db *sql.DB) error {
 		}
 		db.Exec(`INSERT INTO _migrations (name) VALUES ('observers_last_packet_at_v1')`)
 		log.Println("[migration] observers.last_packet_at column added")
+	}
+
+	// Migration: per-observer naive-clock skew tracking (#1478).
+	// When the ingestor clamps a packet's envelope timestamp because the
+	// observer emitted a zone-less local-time string off from UTC by >15min
+	// (resolveRxTime in main.go), we record the event here so the UI can
+	// surface a ⚠️ chip + banner. Decays after 24h via server-side read sweep.
+	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'observers_clock_naive_v1'")
+	if row.Scan(&migDone) != nil {
+		log.Println("[migration] Adding clock-naive columns to observers (#1478)...")
+		// Each ALTER is independent — ignore "duplicate column" so reruns are safe.
+		for _, stmt := range []string{
+			`ALTER TABLE observers ADD COLUMN clock_skew_seconds INTEGER DEFAULT NULL`,
+			`ALTER TABLE observers ADD COLUMN clock_skew_count_24h INTEGER DEFAULT 0`,
+			`ALTER TABLE observers ADD COLUMN clock_last_naive_at TEXT DEFAULT NULL`,
+		} {
+			if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("clock_naive migration: %w", err)
+			}
+		}
+		db.Exec(`INSERT INTO _migrations (name) VALUES ('observers_clock_naive_v1')`)
+		log.Println("[migration] observers.clock_naive columns added")
 	}
 
 	// Migration: backfill observations.path_json from raw_hex (#888)
@@ -542,6 +644,31 @@ func applySchema(db *sql.DB) error {
 		log.Println("[migration] from_pubkey column + index added")
 	}
 
+	// Migration: nodes.default_scope (#899 Feature 3) is now owned by
+	// internal/dbschema/dbschema.go (#1321). The server PRAGMA-detects
+	// this column as hasDefaultScope; keeping a single canonical Apply
+	// path closes the startup race that #1321 documented.
+
+	// Migration: normalize known channel_hash values for existing rows.
+	// Before this PR, config key "public" was stored as channel_hash="public".
+	// After this PR, new rows use channel_hash="Public". Without backfill,
+	// channel grouping queries split into two buckets across the upgrade boundary.
+	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'channel_hash_casing_v1'")
+	if row.Scan(&migDone) != nil {
+		log.Println("[migration] Normalizing known channel_hash values...")
+		res, err := db.Exec(`UPDATE transmissions SET channel_hash = 'Public' WHERE channel_hash = 'public' AND payload_type = 5`)
+		if err != nil {
+			log.Printf("[migration] ERROR: failed to normalize channel_hash: %v", err)
+			return fmt.Errorf("migration channel_hash_casing_v1 UPDATE failed: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		log.Printf("[migration] Normalized %d channel_hash rows from 'public' to 'Public'", n)
+		if _, err := db.Exec(`INSERT OR IGNORE INTO _migrations (name) VALUES ('channel_hash_casing_v1')`); err != nil {
+			log.Printf("[migration] WARNING: failed to record migration: %v", err)
+		}
+		log.Println("[migration] channel_hash casing normalization complete")
+	}
+
 	return nil
 }
 
@@ -554,8 +681,8 @@ func (s *Store) prepareStatements() error {
 	}
 
 	s.stmtInsertTransmission, err = s.db.Prepare(`
-		INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, payload_version, decoded_json, channel_hash, from_pubkey)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO transmissions (raw_hex, hash, first_seen, route_type, payload_type, payload_version, decoded_json, channel_hash, scope_name, from_pubkey)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -567,13 +694,14 @@ func (s *Store) prepareStatements() error {
 	}
 
 	s.stmtInsertObservation, err = s.db.Prepare(`
-		INSERT INTO observations (transmission_id, observer_idx, direction, snr, rssi, score, path_json, timestamp, raw_hex)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO observations (transmission_id, observer_idx, direction, snr, rssi, score, path_json, timestamp, raw_hex, resolved_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(transmission_id, observer_idx, COALESCE(path_json, '')) DO UPDATE SET
-			snr     = COALESCE(excluded.snr,     snr),
-			rssi    = COALESCE(excluded.rssi,    rssi),
-			score   = COALESCE(excluded.score,   score),
-			raw_hex = COALESCE(excluded.raw_hex, raw_hex)
+			snr           = COALESCE(excluded.snr,           snr),
+			rssi          = COALESCE(excluded.rssi,          rssi),
+			score         = COALESCE(excluded.score,         score),
+			raw_hex       = COALESCE(excluded.raw_hex,       raw_hex),
+			resolved_path = COALESCE(excluded.resolved_path, resolved_path)
 	`)
 	if err != nil {
 		return err
@@ -587,7 +715,7 @@ func (s *Store) prepareStatements() error {
 			role = COALESCE(?, role),
 			lat = COALESCE(?, lat),
 			lon = COALESCE(?, lon),
-			last_seen = ?
+			last_seen = MAX(MIN(COALESCE(last_seen, ''), ?), ?)
 	`)
 	if err != nil {
 		return err
@@ -601,12 +729,12 @@ func (s *Store) prepareStatements() error {
 	}
 
 	s.stmtUpsertObserver, err = s.db.Prepare(`
-		INSERT INTO observers (id, name, iata, last_seen, first_seen, packet_count, model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor)
-		VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO observers (id, name, iata, last_seen, first_seen, packet_count, model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor, can_relay, can_relay_seen)
+		VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 1), CASE WHEN ? IS NULL THEN 0 ELSE 1 END)
 		ON CONFLICT(id) DO UPDATE SET
 			name = COALESCE(?, name),
 			iata = COALESCE(?, iata),
-			last_seen = ?,
+			last_seen = MAX(MIN(COALESCE(last_seen, ''), ?), ?),
 			packet_count = packet_count + 1,
 			model = COALESCE(?, model),
 			firmware = COALESCE(?, firmware),
@@ -614,7 +742,9 @@ func (s *Store) prepareStatements() error {
 			radio = COALESCE(?, radio),
 			battery_mv = COALESCE(?, battery_mv),
 			uptime_secs = COALESCE(?, uptime_secs),
-			noise_floor = COALESCE(?, noise_floor)
+			noise_floor = COALESCE(?, noise_floor),
+			can_relay = COALESCE(?, can_relay),
+			can_relay_seen = CASE WHEN ? IS NULL THEN can_relay_seen ELSE 1 END
 	`)
 	if err != nil {
 		return err
@@ -625,7 +755,14 @@ func (s *Store) prepareStatements() error {
 		return err
 	}
 
-	s.stmtUpdateObserverLastSeen, err = s.db.Prepare("UPDATE observers SET last_seen = ?, last_packet_at = ? WHERE rowid = ?")
+	// Args: ingestNow, rxTime, ingestNow, rxTime, rowid
+	// MIN(existing, ingestNow) clamps any future value already in the DB before
+	// taking MAX with rxTime, so the guard never locks in a past bug's stale future.
+	s.stmtUpdateObserverLastSeen, err = s.db.Prepare(`
+		UPDATE observers SET
+			last_seen      = MAX(MIN(COALESCE(last_seen, ''), ?), ?),
+			last_packet_at = MAX(MIN(COALESCE(last_packet_at, ''), ?), ?)
+		WHERE rowid = ?`)
 	if err != nil {
 		return err
 	}
@@ -659,9 +796,25 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 		return false, nil
 	}
 
-	now := data.Timestamp
-	if now == "" {
-		now = time.Now().UTC().Format(time.RFC3339)
+	// Wait/hold instrumentation (#1340). The hot path uses prepared
+	// statements that auto-commit; gate the whole function under
+	// writerMu so concurrent mqtt_handler inserts queue behind any
+	// other writer (vacuum, prune, neighbor-builder) and the wait is
+	// Go-visible.
+	mqttWaitStart := time.Now()
+	writerMu.Lock()
+	mqttWait := time.Since(mqttWaitStart)
+	mqttHoldStart := time.Now()
+	defer func() {
+		mqttHold := time.Since(mqttHoldStart)
+		writerMu.Unlock()
+		recordWriterTiming("mqtt_handler", mqttWait, mqttHold, "InsertTransmission")
+	}()
+
+	rxTime := data.Timestamp
+	ingestNow := time.Now().UTC().Format(time.RFC3339)
+	if rxTime == "" {
+		rxTime = ingestNow
 	}
 
 	var txID int64
@@ -674,16 +827,17 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 	if err == nil {
 		// Existing transmission
 		txID = existingID
-		if now < existingFirstSeen {
-			_, _ = s.stmtUpdateTxFirstSeen.Exec(now, txID)
+		if rxTime < existingFirstSeen {
+			_, _ = s.stmtUpdateTxFirstSeen.Exec(rxTime, txID)
 		}
 	} else {
 		// New transmission
 		isNew = true
 		result, err := s.stmtInsertTransmission.Exec(
-			data.RawHex, hash, now,
+			data.RawHex, hash, rxTime,
 			data.RouteType, data.PayloadType, data.PayloadVersion,
 			data.DecodedJSON, nilIfEmpty(data.ChannelHash),
+			scopeNameForDB(data),
 			nilIfEmpty(data.FromPubkey),
 		)
 		if err != nil {
@@ -705,22 +859,39 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 		err := s.stmtGetObserverRowid.QueryRow(data.ObserverID).Scan(&rowid)
 		if err == nil {
 			observerIdx = &rowid
-			// Update observer last_seen and last_packet_at on every packet to prevent
-			// low-traffic observers from appearing offline (#463)
-			_, _ = s.stmtUpdateObserverLastSeen.Exec(now, now, rowid)
+			// observer.last_seen and last_packet_at answer "when did the analyzer
+			// last hear from this observer" — both are ingest-time questions.
+			// Per-packet rxTime is stored separately on observations/transmissions
+			// using envelope time (see InsertTransmission above). See #1465.
+			_, _ = s.stmtUpdateObserverLastSeen.Exec(ingestNow, ingestNow, ingestNow, ingestNow, rowid)
 		}
 	}
 
 	// Insert observation
 	epochTs := time.Now().Unix()
-	if t, err := time.Parse(time.RFC3339, now); err == nil {
+	if t, err := time.Parse(time.RFC3339, rxTime); err == nil {
 		epochTs = t.Unix()
 	}
+
+	// Resolve hop prefixes to full pubkeys for `observations.resolved_path`.
+	// Per #1547: this writer was lost in the #1289 refactor and lives in
+	// the ingestor now. Per #1560: use the context-aware resolver so
+	// 1-byte prefix collisions are disambiguated via NeighborGraph
+	// adjacency (anchored on from_pubkey for ADVERTs, previous hop
+	// otherwise). Empty resolved JSON → NULL via nilIfEmpty.
+	resolved := resolvePathWithContext(
+		parsePathArray(data.PathJSON),
+		strings.ToLower(data.FromPubkey),
+		s.neighborGraph.load(),
+		s.prefixIdx.load(),
+	)
+	resolvedJSON := marshalResolvedPath(resolved)
 
 	_, err = s.stmtInsertObservation.Exec(
 		txID, observerIdx, data.Direction,
 		data.SNR, data.RSSI, data.Score,
 		data.PathJSON, epochTs, nilIfEmpty(data.RawHex),
+		nilIfEmpty(resolvedJSON),
 	)
 	if err != nil {
 		s.Stats.WriteErrors.Add(1)
@@ -738,13 +909,14 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 
 // UpsertNode inserts or updates a node.
 func (s *Store) UpsertNode(pubKey, name, role string, lat, lon *float64, lastSeen string) error {
+	ingestNow := time.Now().UTC().Format(time.RFC3339)
 	now := lastSeen
 	if now == "" {
-		now = time.Now().UTC().Format(time.RFC3339)
+		now = ingestNow
 	}
 	_, err := s.stmtUpsertNode.Exec(
 		pubKey, name, role, lat, lon, now, now,
-		name, role, lat, lon, now,
+		name, role, lat, lon, ingestNow, now,
 	)
 	if err != nil {
 		s.Stats.WriteErrors.Add(1)
@@ -805,15 +977,36 @@ type ObserverMeta struct {
 	RecvErrors    *int     // cumulative CRC/decode failures since boot
 	PacketsSent   *int     // cumulative packets sent since boot
 	PacketsRecv   *int     // cumulative packets received since boot
+	// CanRelay reflects the firmware 1.16 /status `repeat` flag (#1290).
+	// nil means the firmware did not send the field — caller must
+	// preserve the existing observers.can_relay value (default 1).
+	// true → relay-capable (`repeat:on`); false → listener-only
+	// (`repeat:off`), which causes the server-side disambiguator to
+	// exclude this observer's pubkey from path-hop candidate sets.
+	CanRelay *bool
 }
 
-// UpsertObserver inserts or updates an observer with optional hardware metadata.
+// UpsertObserver inserts or updates an observer using the current wall-clock
+// time as last_seen. Use UpsertObserverAt when the message envelope provides
+// an observer receive-time (e.g. MQTT status and data packet handlers).
 func (s *Store) UpsertObserver(id, name, iata string, meta *ObserverMeta) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	return s.UpsertObserverAt(id, name, iata, meta, time.Now().UTC().Format(time.RFC3339))
+}
+
+// UpsertObserverAt inserts or updates an observer with an explicit lastSeen
+// timestamp (typically the observer receive-time from the MQTT envelope). The
+// SQL uses MAX so last_seen never moves backwards — a retained or replayed
+// message whose rxTime pre-dates the existing last_seen is a no-op for that
+// field, preventing offline observers from flashing as Online on reconnect.
+func (s *Store) UpsertObserverAt(id, name, iata string, meta *ObserverMeta, lastSeen string) error {
+	ingestNow := time.Now().UTC().Format(time.RFC3339)
+	if lastSeen == "" {
+		lastSeen = ingestNow
+	}
 	normalizedIATA := strings.TrimSpace(strings.ToUpper(iata))
 
 	var model, firmware, clientVersion, radio interface{}
-	var batteryMv, uptimeSecs, noiseFloor interface{}
+	var batteryMv, uptimeSecs, noiseFloor, canRelay interface{}
 	if meta != nil {
 		if meta.Model != nil {
 			model = *meta.Model
@@ -836,11 +1029,22 @@ func (s *Store) UpsertObserver(id, name, iata string, meta *ObserverMeta) error 
 		if meta.NoiseFloor != nil {
 			noiseFloor = *meta.NoiseFloor
 		}
+		// Issue #1290: nil → leave DB column unchanged (COALESCE in
+		// the prepared stmt); 0/1 written when firmware provided
+		// the `repeat` field. INSERT branch defaults to 1 via the
+		// COALESCE in the VALUES clause.
+		if meta.CanRelay != nil {
+			if *meta.CanRelay {
+				canRelay = 1
+			} else {
+				canRelay = 0
+			}
+		}
 	}
 
 	_, err := s.stmtUpsertObserver.Exec(
-		id, name, normalizedIATA, now, now, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor,
-		name, normalizedIATA, now, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor,
+		id, name, normalizedIATA, lastSeen, lastSeen, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay, canRelay,
+		name, normalizedIATA, ingestNow, lastSeen, model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay, canRelay,
 	)
 	if err != nil {
 		s.Stats.WriteErrors.Add(1)
@@ -922,7 +1126,8 @@ func (s *Store) InsertMetrics(data *MetricsData) error {
 // PruneOldMetrics deletes observer_metrics rows older than retentionDays.
 func (s *Store) PruneOldMetrics(retentionDays int) (int64, error) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format(time.RFC3339)
-	result, err := s.db.Exec(`DELETE FROM observer_metrics WHERE timestamp < ?`, cutoff)
+	// Tagged for /api/perf writer-lock visibility (#1340).
+	result, err := s.instrumentedExec("prune_metrics", `DELETE FROM observer_metrics WHERE timestamp < ?`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("prune metrics: %w", err)
 	}
@@ -963,11 +1168,11 @@ func (s *Store) CheckAutoVacuum(cfg *Config) {
 		log.Printf("[db] vacuumOnStartup=true — starting one-time full VACUUM (ensure 2x DB size free disk space)...")
 		start := time.Now()
 
-		if _, err := s.db.Exec("PRAGMA auto_vacuum = INCREMENTAL"); err != nil {
+		if _, err := s.instrumentedExec("vacuum", "PRAGMA auto_vacuum = INCREMENTAL"); err != nil {
 			log.Printf("[db] VACUUM failed: could not set auto_vacuum: %v", err)
 			return
 		}
-		if _, err := s.db.Exec("VACUUM"); err != nil {
+		if _, err := s.instrumentedExec("vacuum", "VACUUM"); err != nil {
 			log.Printf("[db] VACUUM failed: %v", err)
 			return
 		}
@@ -980,19 +1185,26 @@ func (s *Store) CheckAutoVacuum(cfg *Config) {
 // RunIncrementalVacuum returns free pages to the OS (#919).
 // Safe to call on auto_vacuum=NONE databases (noop).
 func (s *Store) RunIncrementalVacuum(pages int) {
-	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pages)); err != nil {
+	// Tagged for /api/perf writer-lock visibility (#1340).
+	if _, err := s.instrumentedExec("vacuum", fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pages)); err != nil {
 		log.Printf("[vacuum] incremental_vacuum error: %v", err)
 	}
 }
 
-// Checkpoint forces a WAL checkpoint to release the WAL lock file,
-// preventing lock contention with a new process starting up.
-func (s *Store) Checkpoint() {
-	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+// Checkpoint runs a WAL checkpoint (TRUNCATE mode).
+// Returns the number of WAL frames checkpointed (0 if WAL was already empty).
+// TRUNCATE resets the WAL file to zero bytes when all frames are checkpointed;
+// if active readers hold frames, it checkpoints what it can and leaves the rest.
+func (s *Store) Checkpoint() int {
+	var busy, walFrames, checkpointed int
+	if err := s.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &walFrames, &checkpointed); err != nil {
 		log.Printf("[db] WAL checkpoint error: %v", err)
-	} else {
-		log.Println("[db] WAL checkpoint complete")
+		return 0
 	}
+	if walFrames > 0 {
+		log.Printf("[db] WAL checkpoint: %d/%d frames checkpointed (blocked=%v)", checkpointed, walFrames, busy != 0)
+	}
+	return checkpointed
 }
 
 // BackfillPathJSONAsync launches the path_json backfill in a background goroutine.
@@ -1086,6 +1298,58 @@ func (s *Store) BackfillPathJSONAsync() {
 	}()
 }
 
+// BackfillDefaultScopeAsync populates default_scope for existing nodes that have
+// transport-scoped ADVERT rows (scope_name IS NOT NULL AND scope_name != “).
+// Runs in a background goroutine so it does not block MQTT startup.
+// Uses the from_pubkey index — O(nodes × indexed lookup), not a full table scan.
+//
+// Concurrency: the store uses SetMaxOpenConns(1) so all DB writes — including
+// MQTT packet inserts and any concurrent backfill goroutines — serialize through
+// the single connection pool. busy_timeout(5000) handles transient cross-process
+// contention with the read-only server process. No additional locking is needed.
+func (s *Store) BackfillDefaultScopeAsync(regionKeys map[string][]byte) {
+	// No region keys configured — all scope_name values will be NULL, nothing to backfill.
+	if len(regionKeys) == 0 {
+		return
+	}
+	s.backfillWg.Add(1)
+	go func() {
+		defer s.backfillWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[backfill] default_scope async panic recovered: %v", r)
+			}
+		}()
+
+		var done int
+		if s.db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'backfill_default_scope_v1'").Scan(&done) == nil {
+			return // already ran
+		}
+
+		res, err := s.db.Exec(`
+			UPDATE nodes SET default_scope = (
+				SELECT t.scope_name FROM transmissions t
+				WHERE t.from_pubkey = nodes.public_key
+				  AND t.payload_type = 4
+				  AND t.scope_name IS NOT NULL AND t.scope_name != ''
+				ORDER BY t.first_seen DESC LIMIT 1  -- most-recently observed scope wins; first_seen is insertion time
+			) WHERE EXISTS (
+				SELECT 1 FROM transmissions t
+				WHERE t.from_pubkey = nodes.public_key
+				  AND t.payload_type = 4
+				  AND t.scope_name IS NOT NULL AND t.scope_name != ''
+			)`)
+		if err != nil {
+			log.Printf("[backfill] default_scope: %v", err)
+			return
+		}
+		n, _ := res.RowsAffected()
+		s.Stats.IncBackfill("default_scope")
+		log.Printf("[backfill] default_scope populated for %d nodes", n)
+		s.db.Exec(`INSERT INTO _migrations (name) VALUES ('backfill_default_scope_v1')`)
+	}()
+}
+
 // LogStats logs current operational metrics.
 func (s *Store) LogStats() {
 	log.Printf("[stats] tx_inserted=%d tx_dupes=%d obs_inserted=%d node_upserts=%d observer_upserts=%d write_errors=%d sig_drops=%d",
@@ -1137,14 +1401,15 @@ func (s *Store) RemoveStaleObservers(observerDays int) (int64, error) {
 		return 0, nil // keep forever
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -observerDays).Format(time.RFC3339)
-	result, err := s.db.Exec(`UPDATE observers SET inactive = 1 WHERE last_seen < ? AND (inactive IS NULL OR inactive = 0)`, cutoff)
+	// Tagged for /api/perf writer-lock visibility (#1340).
+	result, err := s.instrumentedExec("prune_observers", `UPDATE observers SET inactive = 1 WHERE last_seen < ? AND (inactive IS NULL OR inactive = 0)`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("mark stale observers inactive: %w", err)
 	}
 	removed, _ := result.RowsAffected()
 	if removed > 0 {
 		// Clean up orphaned metrics for now-inactive observers
-		s.db.Exec(`DELETE FROM observer_metrics WHERE observer_id IN (SELECT id FROM observers WHERE inactive = 1)`)
+		_, _ = s.instrumentedExec("prune_observers", `DELETE FROM observer_metrics WHERE observer_id IN (SELECT id FROM observers WHERE inactive = 1)`)
 		log.Printf("Marked %d observer(s) as inactive (not seen in %d days)", removed, observerDays)
 	}
 	return removed, nil
@@ -1194,24 +1459,26 @@ func (s *Store) PruneDroppedPackets(retentionDays int) (int64, error) {
 
 // PacketData holds the data needed to insert a packet into the DB.
 type PacketData struct {
-	RawHex         string
-	Timestamp      string
-	ObserverID     string
-	ObserverName   string
-	SNR            *float64
-	RSSI           *float64
-	Score          *float64
-	Direction      *string
-	Hash           string
-	RouteType      int
-	PayloadType    int
-	PayloadVersion int
-	PathJSON       string
-	DecodedJSON    string
-	ChannelHash    string // grouping key for channel queries (#762)
-	Region         string // observer region: payload > topic > source config (#788)
-	Foreign        bool   // true when ADVERT GPS lies outside configured geofilter (#730)
-	FromPubkey     string // pubkey of the originating node, for exact-match attribution (#1143)
+	RawHex            string
+	Timestamp         string
+	ObserverID        string
+	ObserverName      string
+	SNR               *float64
+	RSSI              *float64
+	Score             *float64
+	Direction         *string
+	Hash              string
+	RouteType         int
+	PayloadType       int
+	PayloadVersion    int
+	PathJSON          string
+	DecodedJSON       string
+	ChannelHash       string // grouping key for channel queries (#762)
+	ScopeName         string // matched region name, or "" for unknown-scoped
+	IsTransportScoped bool   // true when route_type IN (0,3) AND Code1 ≠ "0000"
+	Region            string // observer region: payload > topic > source config (#788)
+	Foreign           bool   // true when ADVERT GPS lies outside configured geofilter (#730)
+	FromPubkey        string // pubkey of the originating node, for exact-match attribution (#1143)
 }
 
 // nilIfEmpty returns nil for empty strings (for nullable DB columns).
@@ -1222,6 +1489,77 @@ func nilIfEmpty(s string) interface{} {
 	return s
 }
 
+// scopeNameForDB encodes PacketData scope semantics for DB storage:
+// non-transport-scoped → nil (SQL NULL); transport-scoped → pointer to ScopeName
+// (may be "" for unknown region, "#name" for matched region).
+func scopeNameForDB(data *PacketData) *string {
+	if !data.IsTransportScoped {
+		return nil
+	}
+	s := data.ScopeName
+	return &s
+}
+
+// UpdateNodeDefaultScope records the most-recently observed region scope for a
+// node. Skips the UPDATE when the stored value already matches to avoid
+// redundant writes on the hot MQTT ingest path. Updates both nodes and
+// inactive_nodes to stay consistent.
+//
+// Defense-in-depth (#1534): an empty scope is treated as a no-op. The call
+// site at handleMessage is the primary guard (shouldUpdateDefaultScope),
+// but this layer refuses the invalid write so a future caller cannot
+// reintroduce the bug by passing "" directly.
+func (s *Store) UpdateNodeDefaultScope(pubkey, scope string) error {
+	if scope == "" {
+		return nil
+	}
+	// Short-circuit: skip if already stored.
+	var cur sql.NullString
+	row := s.db.QueryRow(`SELECT default_scope FROM nodes WHERE public_key = ?`, pubkey)
+	if row.Scan(&cur) == nil && cur.Valid && cur.String == scope {
+		return nil
+	}
+	if _, err := s.db.Exec(`UPDATE nodes SET default_scope = ? WHERE public_key = ?`, scope, pubkey); err != nil {
+		return err
+	}
+	// Mirror to inactive_nodes (node may be there if recently moved by retention).
+	_, err := s.db.Exec(`UPDATE inactive_nodes SET default_scope = ? WHERE public_key = ?`, scope, pubkey)
+	return err
+}
+
+// RecordNaiveSkew is called when resolveRxTime() clamps a packet's envelope
+// timestamp because the observer is emitting a zone-less local-time string
+// off from UTC by more than 15 min (issue #1478). Stamps the observer's
+// clock_skew_seconds / clock_skew_count_24h / clock_last_naive_at so the
+// server can surface a ⚠️ chip + banner in the UI.
+//
+// The count is reset to 1 (not incremented) if no event has been recorded in
+// the past 24h, otherwise incremented. deltaSec is signed: negative = observer
+// clock is behind UTC, positive = ahead.
+func (s *Store) RecordNaiveSkew(observerID string, deltaSec int64, now time.Time) error {
+	if observerID == "" {
+		return nil
+	}
+	nowStr := now.UTC().Format(time.RFC3339)
+	cutoff := now.Add(-24 * time.Hour).UTC().Format(time.RFC3339)
+	// One INSERT-or-UPDATE round trip. ON CONFLICT path resets the rolling
+	// counter when the previous event is older than the 24h window, otherwise
+	// increments it.
+	_, err := s.db.Exec(`
+		INSERT INTO observers (id, clock_skew_seconds, clock_skew_count_24h, clock_last_naive_at)
+		VALUES (?, ?, 1, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			clock_skew_seconds = excluded.clock_skew_seconds,
+			clock_last_naive_at = excluded.clock_last_naive_at,
+			clock_skew_count_24h = CASE
+				WHEN clock_last_naive_at IS NULL OR clock_last_naive_at < ?
+					THEN 1
+				ELSE COALESCE(clock_skew_count_24h, 0) + 1
+			END
+	`, observerID, deltaSec, nowStr, cutoff)
+	return err
+}
+
 // MQTTPacketMessage is the JSON payload from an MQTT raw packet message.
 type MQTTPacketMessage struct {
 	Raw       string   `json:"raw"`
@@ -1230,15 +1568,26 @@ type MQTTPacketMessage struct {
 	Score     *float64 `json:"score"`
 	Direction *string  `json:"direction"`
 	Origin    string   `json:"origin"`
-	Region    string   `json:"region,omitempty"` // optional region override (#788)
+	Region    string   `json:"region,omitempty"`    // optional region override (#788)
+	Timestamp string   `json:"timestamp,omitempty"` // observer receive time, resolved by handler
 }
 
 // BuildPacketData constructs a PacketData from a decoded packet and MQTT message.
 // path_json is derived directly from raw_hex header bytes (not decoded.Path.Hops)
 // to guarantee the stored path always matches the raw bytes. This matters for
 // TRACE packets where decoded.Path.Hops is overwritten with payload hops (#886).
-func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID, region string) *PacketData {
-	now := time.Now().UTC().Format(time.RFC3339)
+//
+// Timestamp is server ingest time (time.Now()), NOT msg.Timestamp (#1370):
+// PR #1233 (commit 498fbc03) routed the envelope timestamp into
+// PacketData.Timestamp on the premise that uploader-stamped envelope time
+// was trustworthy. Issue #1370 disproved that premise — observers with
+// broken client clocks (staging Voodoo3 tx 304114: 4/5 obs stamped 18:42
+// while genuine receive was 01:42) poisoned transmissions.first_seen /
+// observations.timestamp and dragged the /api/channels lastActivity 7h
+// into the past. Packet ordering is owned by the server clock; client
+// clocks are untrusted. msg.Timestamp still flows into observer.last_seen
+// via UpsertObserverAt — that's #1233's MAX/MIN guarded path and is fine.
+func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID, region string, regionKeys map[string][]byte) *PacketData {
 	pathJSON := "[]"
 	// For TRACE packets, path_json must be the payload-decoded route hops
 	// (decoded.Path.Hops), NOT the raw_hex header bytes which are SNR values.
@@ -1255,7 +1604,7 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 
 	pd := &PacketData{
 		RawHex:         msg.Raw,
-		Timestamp:      now,
+		Timestamp:      time.Now().UTC().Format(time.RFC3339), // #1370 (counters #1233)
 		ObserverID:     observerID,
 		ObserverName:   msg.Origin,
 		SNR:            msg.SNR,
@@ -1286,6 +1635,11 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 		}
 	}
 
+	if decoded.TransportCodes != nil && decoded.TransportCodes.Code1 != "0000" {
+		pd.IsTransportScoped = true
+		pd.ScopeName = matchScope(regionKeys, byte(decoded.Header.PayloadType), decoded.payloadRaw, decoded.TransportCodes.Code1)
+	}
+
 	// Populate from_pubkey at write time (#1143). ADVERTs carry the
 	// originating node's pubkey directly; other packet types stay NULL
 	// (downstream attribution queries handle NULL gracefully).
@@ -1294,4 +1648,293 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 	}
 
 	return pd
+}
+
+
+// ─── Writer-lock instrumentation (issue #1340) ────────────────────────────
+//
+// Make SQLite writer-lock starvation visible to operators. Per-component
+// wait_ms / hold_ms / contention_total histograms, surfaced via
+// /api/perf/write-sources under the "writer_perf" key. Component tags:
+// neighbor_builder, mqtt_handler, prune_packets, prune_observers,
+// prune_metrics, mbcap_persist (deferred — see PR body), vacuum.
+//
+// The single writer connection (SetMaxOpenConns(1)) means writes serialise
+// inside the driver and the wait is invisible to Go. writerMu measures the
+// wait Go can see (everyone queueing behind the current holder) by gating
+// every wrapped call site through the same package-level mutex.
+
+// WriterStatsSnapshot is a per-component wait/hold latency snapshot
+// surfaced via /api/perf to make SQLite writer-lock starvation visible
+// to operators (issue #1340). Times are in milliseconds.
+type WriterStatsSnapshot struct {
+	Count           int64   `json:"count"`
+	ContentionTotal int64   `json:"contention_total"`
+	WaitMsP50       float64 `json:"wait_ms_p50"`
+	WaitMsP95       float64 `json:"wait_ms_p95"`
+	WaitMsP99       float64 `json:"wait_ms_p99"`
+	WaitMsMax       float64 `json:"wait_ms_max"`
+	HoldMsP50       float64 `json:"hold_ms_p50"`
+	HoldMsP95       float64 `json:"hold_ms_p95"`
+	HoldMsP99       float64 `json:"hold_ms_p99"`
+	HoldMsMax       float64 `json:"hold_ms_max"`
+}
+
+const (
+	// writerSampleWindow bounds the per-component rolling window so a
+	// long-running ingestor doesn't grow this unbounded.
+	writerSampleWindow = 1024
+	// contentionThresholdMs: wait_ms above this counts as a "contended"
+	// write (per #1340 spec).
+	contentionThresholdMs = 100.0
+	defaultSlowWriterMs   = 500.0
+)
+
+// slowWriterThresholdMsAtomic — hold_ms threshold above which writes
+// emit a [db-slow-writer] log line. Read on the hot path; written once
+// at startup by SetSlowWriterThresholdMs.
+var slowWriterThresholdMsAtomic atomic.Uint64
+
+// SetSlowWriterThresholdMs sets the [db-slow-writer] log threshold.
+// ms<=0 restores the 500ms default. Operators can also set
+// CORESCOPE_DB_SLOW_WRITER_MS at process start — see initSlowWriterFromEnv.
+func SetSlowWriterThresholdMs(ms float64) {
+	if ms <= 0 {
+		ms = defaultSlowWriterMs
+	}
+	slowWriterThresholdMsAtomic.Store(uint64(ms))
+}
+
+func getSlowWriterThresholdMs() float64 {
+	v := slowWriterThresholdMsAtomic.Load()
+	if v == 0 {
+		return defaultSlowWriterMs
+	}
+	return float64(v)
+}
+
+// initSlowWriterFromEnv is called once from package init so operators can
+// override the threshold via CORESCOPE_DB_SLOW_WRITER_MS without a
+// Go-side Config change.
+func initSlowWriterFromEnv() {
+	v := os.Getenv("CORESCOPE_DB_SLOW_WRITER_MS")
+	if v == "" {
+		return
+	}
+	var ms float64
+	if _, err := fmt.Sscanf(v, "%f", &ms); err == nil && ms > 0 {
+		SetSlowWriterThresholdMs(ms)
+	}
+}
+
+func init() { initSlowWriterFromEnv() }
+
+type writerComponentStats struct {
+	mu              sync.Mutex
+	count           int64
+	contentionTotal int64
+	waitMs          []float64
+	holdMs          []float64
+	waitMax         float64
+	holdMax         float64
+}
+
+func (c *writerComponentStats) record(waitMs, holdMs float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.count++
+	if waitMs > contentionThresholdMs {
+		c.contentionTotal++
+	}
+	if waitMs > c.waitMax {
+		c.waitMax = waitMs
+	}
+	if holdMs > c.holdMax {
+		c.holdMax = holdMs
+	}
+	c.waitMs = appendBoundedFloat(c.waitMs, waitMs, writerSampleWindow)
+	c.holdMs = appendBoundedFloat(c.holdMs, holdMs, writerSampleWindow)
+}
+
+func appendBoundedFloat(s []float64, v float64, max int) []float64 {
+	if len(s) < max {
+		return append(s, v)
+	}
+	copy(s, s[1:])
+	s[len(s)-1] = v
+	return s
+}
+
+func (c *writerComponentStats) snapshot() WriterStatsSnapshot {
+	c.mu.Lock()
+	wait := append([]float64(nil), c.waitMs...)
+	hold := append([]float64(nil), c.holdMs...)
+	snap := WriterStatsSnapshot{
+		Count:           c.count,
+		ContentionTotal: c.contentionTotal,
+		WaitMsMax:       c.waitMax,
+		HoldMsMax:       c.holdMax,
+	}
+	c.mu.Unlock()
+	sort.Float64s(wait)
+	sort.Float64s(hold)
+	snap.WaitMsP50 = nearestRankPercentile(wait, 0.50)
+	snap.WaitMsP95 = nearestRankPercentile(wait, 0.95)
+	snap.WaitMsP99 = nearestRankPercentile(wait, 0.99)
+	snap.HoldMsP50 = nearestRankPercentile(hold, 0.50)
+	snap.HoldMsP95 = nearestRankPercentile(hold, 0.95)
+	snap.HoldMsP99 = nearestRankPercentile(hold, 0.99)
+	return snap
+}
+
+func nearestRankPercentile(sorted []float64, p float64) float64 {
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 {
+		return sorted[0]
+	}
+	idx := int(p*float64(n-1) + 0.5)
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+	return sorted[idx]
+}
+
+type writerStatsAggregator struct {
+	mu         sync.Mutex
+	components map[string]*writerComponentStats
+}
+
+var writerStatsAgg = &writerStatsAggregator{
+	components: make(map[string]*writerComponentStats),
+}
+
+func (a *writerStatsAggregator) get(component string) *writerComponentStats {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	c, ok := a.components[component]
+	if !ok {
+		c = &writerComponentStats{}
+		a.components[component] = c
+	}
+	return c
+}
+
+// reset clears all per-component samples. Test-only: lets a single
+// scenario assert against a clean aggregator without prior-test noise
+// in the same package run (TestWriterStarvationVisibleInPerf would
+// otherwise mix this run's 5 starved samples with thousands of fast
+// InsertTransmission samples from earlier tests and the p99 would
+// collapse below the 50s threshold).
+func (a *writerStatsAggregator) reset() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.components = make(map[string]*writerComponentStats)
+}
+
+// ResetWriterStatsForTest wipes the per-component writer stats
+// aggregator. Test-only; not safe to call from production code paths.
+func ResetWriterStatsForTest() { writerStatsAgg.reset() }
+
+func (a *writerStatsAggregator) snapshot() map[string]WriterStatsSnapshot {
+	a.mu.Lock()
+	keys := make([]string, 0, len(a.components))
+	stats := make([]*writerComponentStats, 0, len(a.components))
+	for k, v := range a.components {
+		keys = append(keys, k)
+		stats = append(stats, v)
+	}
+	a.mu.Unlock()
+	out := make(map[string]WriterStatsSnapshot, len(keys))
+	for i, k := range keys {
+		out[k] = stats[i].snapshot()
+	}
+	return out
+}
+
+// WriterStatsSnapshot returns a per-component wait/hold/contention
+// snapshot for exposure on /api/perf/write-sources (issue #1340).
+func (s *Store) WriterStatsSnapshot() map[string]WriterStatsSnapshot {
+	return writerStatsAgg.snapshot()
+}
+
+// recordWriterTiming aggregates a single sample under component and
+// emits [db-slow-writer] if hold_ms > configured threshold (default
+// 500ms). queryForLog is truncated to 200 chars.
+func recordWriterTiming(component string, wait, hold time.Duration, queryForLog string) {
+	waitMs := float64(wait.Nanoseconds()) / 1e6
+	holdMs := float64(hold.Nanoseconds()) / 1e6
+	writerStatsAgg.get(component).record(waitMs, holdMs)
+	if holdMs > getSlowWriterThresholdMs() {
+		q := queryForLog
+		if len(q) > 200 {
+			q = q[:200]
+		}
+		log.Printf("[db-slow-writer] component=%s duration=%.1fms query=%s", component, holdMs, q)
+	}
+}
+
+// writerMu serialises every wrapped writer call so the wait the next
+// caller sees is the wait the perf snapshot can attribute. The
+// SQLite driver also enforces serial writes (SetMaxOpenConns(1)),
+// but the wait inside the driver is invisible to Go — writerMu makes
+// it Go-visible.
+var writerMu sync.Mutex
+
+// WriterExec wraps s.db.Exec with per-component wait/hold/contention
+// instrumentation (issue #1340).
+func (s *Store) WriterExec(component, query string, args ...interface{}) (sql.Result, error) {
+	waitStart := time.Now()
+	writerMu.Lock()
+	wait := time.Since(waitStart)
+	holdStart := time.Now()
+	res, err := s.db.Exec(query, args...)
+	hold := time.Since(holdStart)
+	writerMu.Unlock()
+	recordWriterTiming(component, wait, hold, query)
+	return res, err
+}
+
+// WriterTx wraps Begin → fn → Commit under component tagging.
+// hold_ms covers the whole tx so a slow body counts against its owner.
+func (s *Store) WriterTx(component string, fn func(*sql.Tx) error) error {
+	waitStart := time.Now()
+	writerMu.Lock()
+	wait := time.Since(waitStart)
+	holdStart := time.Now()
+	tx, err := s.db.Begin()
+	if err != nil {
+		hold := time.Since(holdStart)
+		writerMu.Unlock()
+		recordWriterTiming(component, wait, hold, "BEGIN")
+		return err
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		hold := time.Since(holdStart)
+		writerMu.Unlock()
+		recordWriterTiming(component, wait, hold, "tx-body")
+		return err
+	}
+	err = tx.Commit()
+	hold := time.Since(holdStart)
+	writerMu.Unlock()
+	recordWriterTiming(component, wait, hold, "COMMIT")
+	return err
+}
+
+// Wrap helpers below tag existing call sites with the canonical
+// component names so the call sites read naturally. These keep the
+// instrumentation out of the hot-path business logic.
+
+// instrumentedExec is the package-internal pass-through used by call
+// sites already inside db.go (PruneOldMetrics, RemoveStaleObservers,
+// vacuum). Equivalent to WriterExec, kept short for readability.
+func (s *Store) instrumentedExec(component, query string, args ...interface{}) (sql.Result, error) {
+	return s.WriterExec(component, query, args...)
 }

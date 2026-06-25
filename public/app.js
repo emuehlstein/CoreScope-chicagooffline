@@ -130,6 +130,55 @@ async function api(path, { ttl = 0, bust = false } = {}) {
   return promise;
 }
 
+// Fetch the COMPLETE /api/nodes set, transparently paging around the server's
+// per-request row cap. /api/nodes clamps ?limit to `listLimits.nodesMax`
+// (default 2000, operator-configurable; originally a hard 500 in PR #1540,
+// raised/made configurable in PR #1589). A single ?limit=N fetch therefore
+// silently truncates to the top nodesMax rows by last_seen DESC, so on a mesh
+// with more nodes than that cap every node-list consumer (map, live,
+// analytics, packets, area-map) loses the older-advert tail — a node that
+// relays constantly but last self-advertised hours ago drops off the map even
+// though it is plainly alive. #1606 fixed this for the Nodes page; this helper
+// generalizes the same loop for all callers, using a fixed client page size
+// well under the server cap.
+//
+// extraQuery: query fragment appended after the paged limit/offset, each piece
+//   already '&'-prefixed exactly as callers build it today
+//   (e.g. '&lastHeard=30d&area=x', '&sortBy=lastSeen&region=y'); pass '' for none.
+// safetyCap: hard ceiling on BOTH pages fetched and nodes returned — the result
+//   is sliced to it (callers like live.js pass their render ceiling here).
+// Returns { nodes, counts, total }: counts is from the first page; total is the
+//   real deduped/capped node count (NOT the server's per-query `total`).
+async function fetchAllNodes(extraQuery = '', { ttl = 0, pageSize = 500, safetyCap = 10000 } = {}) {
+  const accumulated = [];
+  let counts = {};
+  for (let offset = 0; offset < safetyCap; offset += pageSize) {
+    const data = await api(`/nodes?limit=${pageSize}&offset=${offset}${extraQuery}`, { ttl });
+    const page = data && Array.isArray(data.nodes) ? data.nodes
+      : (Array.isArray(data) ? data : []);
+    accumulated.push.apply(accumulated, page);
+    if (offset === 0) counts = (data && data.counts) || {};
+    // Canonical stop: a short page is the end. The server's `total` is a real
+    // COUNT(*) for the query, but the handler overwrites it with the filtered
+    // length under area/geo/blacklist filtering — so we never loop on it, nor
+    // surface it; a short page is the reliable end-of-data signal. See #1606.
+    if (page.length < pageSize) break;
+  }
+  // Dedup by public_key: the sort window (last_seen DESC by default) can shift
+  // under concurrent ingest, repeating a row across a page boundary. Rows
+  // missing a public_key get a unique synthetic key so they are NOT collapsed.
+  const seen = new Map();
+  for (let i = 0; i < accumulated.length; i++) {
+    const n = accumulated[i];
+    seen.set((n && n.public_key) || ('__nokey' + i), n);
+  }
+  // Enforce safetyCap as a real node-count ceiling (the page loop only bounds
+  // it to the next pageSize multiple), so e.g. live.js's LIVE_MAP_MAX_NODES is
+  // honored exactly rather than overshooting by up to pageSize-1.
+  const nodes = Array.from(seen.values()).slice(0, safetyCap);
+  return { nodes, counts, total: nodes.length };
+}
+
 function invalidateApiCache(prefix) {
   for (const key of _apiCache.keys()) {
     if (key.startsWith(prefix || '')) _apiCache.delete(key);
@@ -173,6 +222,21 @@ function timeAgo(iso) {
 
 function getHashParams() {
   return new URLSearchParams(location.hash.split('?')[1] || '');
+}
+
+// shouldEmbedRoute — issue #1369. Returns true when the SPA should render in
+// "embed" mode (chrome suppressed: no top-nav, no bottom-nav, no side drawer,
+// content full-bleed). Triggered by ?embed=1 in the hash query string.
+//
+// Allowlisted to /#/map and /#/channels — the two surfaces operators asked
+// for in the cross-domain embed scenario. Other pages have chrome assumptions
+// we are not committing to in embed mode (Tufte: ship narrow, expand later
+// only when there is a real ask).
+function shouldEmbedRoute(basePage, hashSearch) {
+  if (basePage !== 'map' && basePage !== 'channels') return false;
+  if (!hashSearch) return false;
+  var params = new URLSearchParams(hashSearch);
+  return params.get('embed') === '1';
 }
 
 function getDistanceUnit() {
@@ -347,35 +411,6 @@ function truncate(str, len) {
   return str.length > len ? str.slice(0, len) + '…' : str;
 }
 
-function formatEngineBadge(engine) {
-  if (!engine) return '';
-  return ` <span class="engine-badge">${engine}</span>`;
-}
-
-function formatVersionBadge(version, commit, engine, buildTime) {
-  if (!version && !commit && !engine) return '';
-  var buildAge = '';
-  if (buildTime && buildTime !== 'unknown') {
-    var age = timeAgo(buildTime);
-    if (age && age !== '—') buildAge = ' <span class="build-age">(' + age + ')</span>';
-  }
-  var port = (typeof location !== 'undefined' && location.port) || '';
-  var isProd = !port || port === '80' || port === '443';
-  var GH = 'https://github.com/Kpa-clawbot/corescope';
-  var parts = [];
-  if (version && isProd) {
-    var vTag = version.charAt(0) === 'v' ? version : 'v' + version;
-    parts.push('<a href="' + GH + '/releases/tag/' + vTag + '" target="_blank" rel="noopener">' + vTag + '</a>');
-  }
-  if (commit && commit !== 'unknown') {
-    var short = commit.length > 7 ? commit.slice(0, 7) : commit;
-    parts.push('<a href="' + GH + '/commit/' + commit + '" target="_blank" rel="noopener">' + short + '</a>' + buildAge);
-  }
-  if (engine) parts.push('<span class="engine-badge">' + engine + '</span>');
-  if (parts.length === 0) return '';
-  return ' <span class="version-badge">' + parts.join(' · ') + '</span>';
-}
-
 // --- Favorites ---
 const FAV_KEY = 'meshcore-favorites';
 function getFavorites() {
@@ -389,9 +424,13 @@ function toggleFavorite(pubkey) {
   localStorage.setItem(FAV_KEY, JSON.stringify(favs));
   return idx < 0; // true if now favorited
 }
+function favStarIconHtml(on) {
+  var id = on ? 'ph-star-fill' : 'ph-star';
+  return '<svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#' + id + '"/></svg>';
+}
 function favStar(pubkey, cls) {
   const on = isFavorite(pubkey);
-  return '<button class="fav-star ' + (cls || '') + (on ? ' on' : '') + '" data-fav="' + pubkey + '" title="' + (on ? 'Remove from favorites' : 'Add to favorites') + '">' + (on ? '★' : '☆') + '</button>';
+  return '<button class="fav-star ' + (cls || '') + (on ? ' on' : '') + '" data-fav="' + pubkey + '" aria-label="Toggle favorite" aria-pressed="' + (on ? 'true' : 'false') + '" title="' + (on ? 'Remove from favorites' : 'Add to favorites') + '">' + favStarIconHtml(on) + '</button>';
 }
 function bindFavStars(container, onToggle) {
   container.querySelectorAll('.fav-star').forEach(btn => {
@@ -399,8 +438,9 @@ function bindFavStars(container, onToggle) {
       e.stopPropagation();
       const pk = btn.dataset.fav;
       const nowOn = toggleFavorite(pk);
-      btn.textContent = nowOn ? '★' : '☆';
+      btn.innerHTML = favStarIconHtml(nowOn);
       btn.classList.toggle('on', nowOn);
+      btn.setAttribute('aria-pressed', nowOn ? 'true' : 'false');
       btn.title = nowOn ? 'Remove from favorites' : 'Add to favorites';
       if (onToggle) onToggle(pk, nowOn);
     });
@@ -697,11 +737,11 @@ function _showPullToast(msg, ok) {
 }
 
 function pullReconnect() {
-  // If WS is connected (readyState OPEN), give a brief "Connected ✓"
+  // If WS is connected (readyState OPEN), give a brief "Connected"
   // confirmation but still cycle so the user sees fresh data.
   const wasOpen = ws && ws.readyState === 1;
   if (wasOpen) {
-    _showPullToast('Connected ✓', true);
+    _showPullToast('Connected', true);
     // Fast cycle: close and let onclose reconnect immediately
     try { ws.close(); } catch (e) {}
   } else {
@@ -805,10 +845,24 @@ window.pullReconnect = pullReconnect;
 window.setupPullToReconnect = setupPullToReconnect;
 window.connectWS = connectWS;
 
-/* Global escapeHtml — used by multiple pages */
+/* Global escapeHtml — used by multiple pages.
+   5-char OWASP set: escapes ' too so this helper is safe in both
+   double-quoted AND single-quoted attribute contexts (e.g. the
+   data-conflict='${escapeHtml(JSON.stringify(...))}' attr in
+   hop-display.js, where JSON containing a single quote would
+   otherwise break out of the attribute). Fixes #1536.
+
+   CANONICAL ESCAPE for HTML sinks that interpolate node-controlled or
+   MQTT-controlled fields (name, adv_name, observer, sender, channel,
+   pubkey, body, …). Enforced at PR-creation time by:
+     - scripts/check-xss-sinks.sh                            (local mirror)
+     - ~/.openclaw/skills/pr-preflight/scripts/check-xss-sinks.sh  (canonical)
+     - test-preflight-xss-gate.js                            (CI gate)
+   See also: escapeAttr (public/home.js, public/path-inspector.js) for
+   attribute-only contexts. */
 function escapeHtml(s) {
   if (s == null) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 /* Global debounce */
@@ -849,8 +903,8 @@ registerPage('tools-landing', {
       '<div class="tools-landing">' +
         '<h2>Tools</h2>' +
         '<div class="tools-menu">' +
-          '<a href="#/tools/path-inspector" class="tools-card"><h3>🔍 Path Inspector</h3><p>Resolve prefix paths to candidate full-pubkey routes with confidence scoring.</p></a>' +
-          '<a href="#/tools/trace/" class="tools-card"><h3>📡 Trace Viewer</h3><p>View detailed packet traces by hash.</p></a>' +
+          '<a href="#/tools/path-inspector" class="tools-card"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Path Inspector</h3><p>Resolve prefix paths to candidate full-pubkey routes with confidence scoring.</p></a>' +
+          '<a href="#/tools/trace/" class="tools-card"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Trace Viewer</h3><p>View detailed packet traces by hash.</p></a>' +
         '</div>' +
       '</div>';
   },
@@ -908,6 +962,11 @@ function navigate() {
     basePage = 'node-analytics';
   }
 
+  // Special route: nodes/PUBKEY/reach → node-reach page
+  if (basePage === 'nodes' && routeParam && routeParam.endsWith('/reach')) {
+    basePage = 'node-reach';
+  }
+
   // Special route: packet/123 → standalone packet detail page
   if (basePage === 'packet' && routeParam) {
     basePage = 'packet-detail';
@@ -953,10 +1012,26 @@ function navigate() {
   }
   currentPage = basePage;
 
+  // #1572 — defensive: ensure body.live-fullscreen is cleared whenever
+  // we navigate to a non-live route. Live page's destroy() also clears
+  // it, but this guards against any boot path (deep-link, restore) that
+  // somehow puts the body into fullscreen state outside /live.
+  if (basePage !== 'live' && document.body) {
+    document.body.classList.remove('live-fullscreen');
+  }
+
   const app = document.getElementById('app');
   // Pages with fixed-height containers (maps, virtual-scroll, split-panels)
   const fixedPages = { packets: 1, nodes: 1, map: 1, live: 1, channels: 1, 'audio-lab': 1, globe: 1 };
   app.classList.toggle('app-fixed', basePage in fixedPages);
+
+  // Issue #1369: ?embed=1 chrome suppression for cross-domain iframe embeds.
+  // Toggles body.embed; CSS in style.css hides top-nav / bottom-nav / nav-drawer
+  // and zeroes body padding so /#/map and /#/channels render full-bleed.
+  try {
+    var hashSearch = (location.hash.split('?')[1] || '');
+    document.body.classList.toggle('embed', shouldEmbedRoute(basePage, hashSearch));
+  } catch (_) { /* DOM may be missing in some test contexts */ }
   if (pages[basePage]?.init) {
     const t0 = performance.now();
     pages[basePage].init(app, routeParam);
@@ -1036,7 +1111,7 @@ window.addEventListener('DOMContentLoaded', () => {
         if (themeData[key]) root.setProperty(varMap[key], themeData[key]);
       }
       if (themeData.background) root.setProperty('--content-bg', themeData.contentBg || themeData.background);
-      if (themeData.surface1) root.setProperty('--card-bg', themeData.cardBg || themeData.surface1);
+      if (themeData.surface1) root.setProperty('--card-bg', themeData.cardBg || themeData.surface2 || themeData.surface1);
       // Nav gradient
       if (themeData.navBg) {
         var nav = document.querySelector('.top-nav');
@@ -1052,19 +1127,46 @@ window.addEventListener('DOMContentLoaded', () => {
   } else {
     applyTheme('light');
   }
-  // Listen to checkbox change event (more reliable than label click)
   if (darkCheckbox) {
-    darkCheckbox.addEventListener('change', function() {
-      console.log('[theme] Toggle clicked');
-      applyTheme(this.checked ? 'dark' : 'light');
+    darkCheckbox.addEventListener('change', () => {
+      applyTheme(darkCheckbox.checked ? 'dark' : 'light');
+    });
+  } else {
+    // Fallback for button-style toggle (upstream compatibility)
+    darkToggle.addEventListener('click', () => {
+      const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+      applyTheme(isDark ? 'light' : 'dark');
     });
   }
-  // Fallback: label click
-  if (darkToggle) {
-    darkToggle.addEventListener('click', function(e) {
-      console.log('[theme] Label clicked');
-    });
-  }
+  // PR #893 follow-up: cross-tab sync — when another tab toggles theme,
+  // mirror it here without re-persisting (avoid loop). Matches the pattern
+  // used by the cb-presets storage listener below.
+  window.addEventListener('storage', function (ev) {
+    if (!ev || ev.key !== 'meshcore-theme' || !ev.newValue) return;
+    if (ev.newValue !== 'dark' && ev.newValue !== 'light') return;
+    document.documentElement.setAttribute('data-theme', ev.newValue);
+    if (darkCheckbox) darkCheckbox.checked = ev.newValue === 'dark';
+    try { reapplyUserThemeVars(ev.newValue === 'dark'); } catch (_) {}
+  });
+
+  // --- #1361 Colorblind preset bootstrap & cross-tab sync ---
+  // cb-presets.js auto-inits on module load, but body may not have existed
+  // yet (script loads in <head>); re-apply now that DOMContentLoaded fired
+  // so body[data-cb-preset] is set before first paint of map/cluster bubbles.
+  try {
+    if (window.MeshCorePresets && typeof window.MeshCorePresets.initFromStorage === 'function') {
+      window.MeshCorePresets.initFromStorage();
+    }
+  } catch (e) { console.error('[cb-preset] init failed:', e); }
+  // Cross-tab sync: storage event listener is also registered inside
+  // cb-presets.js, but we wire a redundant one here so any future refactor
+  // of the module still leaves the cross-tab guarantee intact.
+  window.addEventListener('storage', function (ev) {
+    if (!ev || ev.key !== 'meshcore-cb-preset') return;
+    if (window.MeshCorePresets && ev.newValue) {
+      window.MeshCorePresets.applyPreset(ev.newValue, { skipPersist: true });
+    }
+  });
 
   // --- Hamburger Menu ---
   const hamburger = document.getElementById('hamburger');
@@ -1092,6 +1194,7 @@ window.addEventListener('DOMContentLoaded', () => {
   // Belt-and-braces null guards (#1105 MINOR 4): the outer block measures
   // and mutates all of these; if any are missing the layout math throws
   // before we can fall back gracefully.
+  let navPriorityFn = null;
   if (navMoreBtn && navMoreMenu && navMoreWrap && navLeft && navRightEl && linksContainer && navTop) {
     // Measure available room and decide which links overflow.
     // Algorithm: try to fit all links inline. If the link strip doesn't
@@ -1107,9 +1210,22 @@ window.addEventListener('DOMContentLoaded', () => {
     // only signal — if you ever need finer ordering, switch to a numeric
     // attribute (e.g. data-overflow-order="3") rather than re-shuffling
     // index in HTML.
-    const overflowQueue = allLinks.filter(a => a.dataset.priority !== 'high')
-                                  .reverse() // right-to-left
-                                  .concat(allLinks.filter(a => a.dataset.priority === 'high').reverse());
+    // #1391: ALSO exclude the currently-active link from the queue.
+    // The active pill has wider rendered width (background + padding),
+    // and acceptance for #1391 requires "Active-route pill MUST always
+    // be visible inline (never overflowed to More) at any viewport
+    // ≥768px." The queue is rebuilt on hashchange (applyNavPriority
+    // is wired to hashchange below), so the exclusion tracks the
+    // current route automatically.
+    function buildOverflowQueue() {
+      var isPinned = function(a) {
+        return a.dataset.priority === 'high' || a.classList.contains('active');
+      };
+      return allLinks.filter(a => !isPinned(a))
+                     .reverse() // right-to-left
+                     .concat(allLinks.filter(a => a.dataset.priority === 'high' && !a.classList.contains('active')).reverse());
+    }
+    var overflowQueue = buildOverflowQueue();
 
     function rebuildMoreMenu() {
       navMoreMenu.innerHTML = '';
@@ -1177,7 +1293,14 @@ window.addEventListener('DOMContentLoaded', () => {
       // owns the decision (and at 2560px nothing overflows).
       if (window.innerWidth <= 1100) {
         allLinks.forEach(a => {
-          if (a.dataset.priority !== 'high') a.classList.add('is-overflow');
+          // #1391: never overflow the active-route pill, even in the
+          // narrow-desktop CSS branch — acceptance requires it stay
+          // inline at any viewport ≥768px. Without this guard, a
+          // non-high-priority active route (e.g. /#/perf) would be
+          // shoved into More alongside the rest.
+          if (a.dataset.priority !== 'high' && !a.classList.contains('active')) {
+            a.classList.add('is-overflow');
+          }
         });
         rebuildMoreMenu();
         return;
@@ -1234,13 +1357,36 @@ window.addEventListener('DOMContentLoaded', () => {
         return needed <= window.innerWidth;
       }
       let i = 0;
+      // #1391: rebuild queue here so it reflects the CURRENT active
+      // link (hashchange wakes applyNavPriority, but the queue was
+      // captured at init-time; we need to re-evaluate which link is
+      // active on every run). Cheap — just filters allLinks twice.
+      overflowQueue = buildOverflowQueue();
+      // #1311 floor: protect data-priority="high" links from being
+      // dropped by the greedy fit loop. The bug was that on a non-high
+      // active route (e.g. /#/perf, /#/audio-lab) at ~1101-1200px, the
+      // active-route pill renders wider than other links, fits() keeps
+      // returning false even after every non-high link is in overflow,
+      // and the loop happily walked into the high-priority tail of
+      // overflowQueue and dropped Home/Packets/Map/Live/Nodes too —
+      // leaving the user with just brand + "More ▾" + the active pill.
+      // High-priority links are inline-pinned by contract; if the strip
+      // still doesn't fit at that point, that's a layout issue (e.g.
+      // shrink the active pill, drop nav-stats earlier) — never the
+      // measurer's call to delete primary navigation.
+      //
+      // #1391: also break on .active — buildOverflowQueue already
+      // excludes the active link from the queue, but the break is a
+      // defensive belt for any future code that re-enqueues it.
       while (!fits() && i < overflowQueue.length) {
+        if (overflowQueue[i].dataset.priority === 'high') break;
+        if (overflowQueue[i].classList.contains('active')) break;
         overflowQueue[i].classList.add('is-overflow');
         i++;
       }
       // #1139 Bug B: floor the More menu at >=2 items. The greedy
       // fits() loop above is happy to stop after pushing exactly ONE
-      // link into overflow (commonly "🎵 Lab" at ~1600px viewports),
+      // link into overflow (commonly "🎵 Lab" at ~1600px viewports), // EMOJI-OK: comment referencing prior nav label
       // producing a degenerate single-item dropdown. If exactly one
       // link overflowed, promote one more from the queue so the user
       // sees a useful menu instead of a one-item fragment. Skip when
@@ -1248,7 +1394,12 @@ window.addEventListener('DOMContentLoaded', () => {
       // which is the correct UX) and skip when the queue is exhausted.
       var overflowedCount = allLinks.filter(a => a.classList.contains('is-overflow')).length;
       if (overflowedCount === 1) {
-        if (i < overflowQueue.length) {
+        // #1311: respect the high-priority floor here too — if the only
+        // remaining queue item is a high-priority link, do NOT promote
+        // it just to satisfy the >=2 More-menu floor. A degenerate
+        // 1-item dropdown is a smaller UX paper-cut than nuking a
+        // primary nav link.
+        if (i < overflowQueue.length && overflowQueue[i].dataset.priority !== 'high' && !overflowQueue[i].classList.contains('active')) {
           overflowQueue[i].classList.add('is-overflow');
           i++;
         } else {
@@ -1265,6 +1416,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
     // Run once on load, again after fonts settle (label widths shift),
     // and on resize (debounced via rAF).
+    navPriorityFn = applyNavPriority;
     applyNavPriority();
     if (document.fonts && document.fonts.ready) {
       document.fonts.ready.then(applyNavPriority);
@@ -1281,29 +1433,30 @@ window.addEventListener('DOMContentLoaded', () => {
       requestAnimationFrame(applyNavPriority);
     });
 
-    // Position fixed dropdown relative to More button
-    function positionMoreDropdown() {
-      if (!navMoreMenu.classList.contains('open')) return;
-      const rect = navMoreBtn.getBoundingClientRect();
-      navMoreMenu.style.top = (rect.bottom + 4) + 'px';
-      navMoreMenu.style.right = (window.innerWidth - rect.right) + 'px';
+    // #1406: position the fixed dropdown relative to the More button on each open.
+    // Required because .nav-more-menu is position:fixed (so it escapes
+    // .nav-more-wrap's layout box and doesn't inflate the parent flex line).
+    function positionMoreMenu() {
+      var wr = navMoreWrap.getBoundingClientRect();
+      navMoreMenu.style.top = (wr.bottom + 4) + 'px';
+      navMoreMenu.style.right = (window.innerWidth - wr.right) + 'px';
+      navMoreMenu.style.left = 'auto';
     }
-
     navMoreBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const opening = !navMoreMenu.classList.contains('open');
+      if (opening) positionMoreMenu();
       navMoreMenu.classList.toggle('open');
       navMoreBtn.setAttribute('aria-expanded', String(opening));
       if (opening) {
-        positionMoreDropdown();
         var firstLink = navMoreMenu.querySelector('.nav-link');
         if (firstLink) firstLink.focus();
       }
     });
-
-    // Reposition on scroll/resize
-    window.addEventListener('scroll', positionMoreDropdown, true);
-    window.addEventListener('resize', positionMoreDropdown);
+    // Re-position on window resize while open.
+    window.addEventListener('resize', () => {
+      if (navMoreMenu.classList.contains('open')) positionMoreMenu();
+    });
   }
 
   document.addEventListener('keydown', (e) => {
@@ -1351,7 +1504,7 @@ window.addEventListener('DOMContentLoaded', () => {
   async function renderFavDropdown() {
     const favs = getFavorites();
     if (!favs.length) {
-      favDropdown.innerHTML = '<div class="fav-dd-empty">No favorites yet.<br><small>Click ☆ on any node to add it.</small></div>';
+      favDropdown.innerHTML = '<div class="fav-dd-empty">No favorites yet.<br><small>Click the star on any node to add it.</small></div>';
       return;
     }
     favDropdown.innerHTML = '<div class="fav-dd-loading">Loading...</div>';
@@ -1359,16 +1512,17 @@ window.addEventListener('DOMContentLoaded', () => {
       try {
         const h = await api('/nodes/' + pk + '/health', { ttl: CLIENT_TTL.nodeHealth });
         const age = h.stats.lastHeard ? Date.now() - new Date(h.stats.lastHeard).getTime() : null;
-        const status = age === null ? '🔴' : age < HEALTH_THRESHOLDS.nodeDegradedMs ? '🟢' : age < HEALTH_THRESHOLDS.nodeSilentMs ? '🟡' : '🔴';
+        const statusCls = age === null ? 'status-err' : age < HEALTH_THRESHOLDS.nodeDegradedMs ? 'status-ok' : age < HEALTH_THRESHOLDS.nodeSilentMs ? 'status-warn' : 'status-err';
+        const statusLabel = age === null ? 'unknown' : age < HEALTH_THRESHOLDS.nodeDegradedMs ? 'healthy' : age < HEALTH_THRESHOLDS.nodeSilentMs ? 'degraded' : 'silent';
         return '<a href="#/nodes/' + pk + '" class="fav-dd-item" data-key="' + pk + '">'
-          + '<span class="fav-dd-status">' + status + '</span>'
+          + '<span class="fav-dd-status ' + statusCls + '" title="' + statusLabel + '" aria-label="' + statusLabel + '"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>'
           + '<span class="fav-dd-name">' + (h.node.name || truncate(pk, 12)) + '</span>'
           + '<span class="fav-dd-meta">' + (h.stats.lastHeard ? timeAgo(h.stats.lastHeard) : 'never') + '</span>'
           + favStar(pk, 'fav-dd-star')
           + '</a>';
       } catch {
         return '<a href="#/nodes/' + pk + '" class="fav-dd-item" data-key="' + pk + '">'
-          + '<span class="fav-dd-status">❓</span>'
+          + '<span class="fav-dd-status status-muted" title="not found" aria-label="not found"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-question"/></svg></span>'
           + '<span class="fav-dd-name">' + truncate(pk, 16) + '</span>'
           + '<span class="fav-dd-meta">not found</span>'
           + favStar(pk, 'fav-dd-star')
@@ -1439,14 +1593,14 @@ window.addEventListener('DOMContentLoaded', () => {
         for (const n of nodeList.slice(0, 5)) {
           if (n.name && n.name.toLowerCase().includes(q.toLowerCase())) {
             html += `<div class="search-result-item" tabindex="0" role="option" data-href="#/nodes/${n.public_key}">
-              <span class="search-result-type">Node</span>${n.name} — ${truncate(n.public_key || '', 16)}</div>`;
+              <span class="search-result-type">Node</span>${escapeHtml(n.name)} — ${truncate(n.public_key || '', 16)}</div>`;
           }
         }
         const chList = Array.isArray(channels) ? channels : [];
         for (const c of chList) {
           if (c.name && c.name.toLowerCase().includes(q.toLowerCase())) {
             html += `<div class="search-result-item" tabindex="0" role="option" data-href="#/channels/${c.channel_hash}">
-              <span class="search-result-type">Channel</span>${c.name}</div>`;
+              <span class="search-result-type">Channel</span>${escapeHtml(c.name)}</div>`;
           }
         }
         if (!html) html = '<div class="search-no-results">No results found</div>';
@@ -1501,6 +1655,7 @@ window.addEventListener('DOMContentLoaded', () => {
         el.innerHTML = `<span class="stat-val">${stats.totalPackets}</span> <svg width="14" height="14" viewBox="0 0 20 20" fill="none" class="stat-icon" title="packets"><rect x="2" y="2" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="12" y="2" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="2" y="12" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="12" y="12" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/></svg> · <span class="stat-val">${stats.totalNodes}</span> <svg width="14" height="14" viewBox="0 0 20 20" fill="none" class="stat-icon" title="nodes"><circle cx="10" cy="3" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="4" cy="12" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="16" cy="12" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="10" cy="17" r="2" stroke="currentColor" stroke-width="1.5"/><line x1="10" y1="5" x2="10" y2="15" stroke="currentColor" stroke-width="1.5"/><line x1="8.5" y1="4" x2="5.5" y2="11" stroke="currentColor" stroke-width="1.5"/><line x1="11.5" y1="4" x2="14.5" y2="11" stroke="currentColor" stroke-width="1.5"/></svg> · <span class="stat-val">${stats.totalObservers}</span> <svg width="14" height="14" viewBox="0 0 20 20" fill="none" class="stat-icon" title="observers"><path d="M10 2 L10 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="10" r="2" stroke="currentColor" stroke-width="1.5"/><path d="M4 6 L7.5 8.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M16 6 L12.5 8.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M3 14 L8 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M17 14 L12 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>${formatVersionBadge(stats.version, stats.commit, stats.engine, stats.buildTime)}`;
         el.querySelectorAll('.stat-val').forEach(s => s.classList.add('updated'));
         setTimeout(() => { el.querySelectorAll('.stat-val').forEach(s => s.classList.remove('updated')); }, 600);
+        if (navPriorityFn) requestAnimationFrame(navPriorityFn);
       }
     } catch {}
   }

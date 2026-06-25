@@ -68,8 +68,6 @@ type StatsResponse struct {
 	Commit             string     `json:"commit"`
 	BuildTime          string     `json:"buildTime"`
 	Counts             RoleCounts `json:"counts"`
-	Backfilling            bool       `json:"backfilling"`
-	BackfillProgress       float64    `json:"backfillProgress"`
 	SignatureDrops         int64      `json:"signatureDrops,omitempty"`
 	HashMigrationComplete  bool       `json:"hashMigrationComplete"`
 
@@ -88,6 +86,38 @@ type StatsResponse struct {
 	ProcessRSSMB  float64 `json:"processRSSMB"`  // process RSS from /proc (Linux) or runtime.Sys fallback
 	GoHeapInuseMB float64 `json:"goHeapInuseMB"` // runtime.MemStats.HeapInuse
 	GoSysMB       float64 `json:"goSysMB"`       // runtime.MemStats.Sys (total Go-managed)
+
+	// NeighborGraphCacheRebuildFailures counts panic/marshal failures in the
+	// background neighbor-graph cache recomputer. Non-zero = stale snapshot
+	// being served indefinitely. Surfaced for operator visibility. #1483 follow-up.
+	NeighborGraphCacheRebuildFailures uint64 `json:"neighborGraphCacheRebuildFailures"`
+}
+
+// ─── Scope Stats ───────────────────────────────────────────────────────────────
+
+type ScopeStatsSummary struct {
+	TransportTotal int `json:"transportTotal"`
+	Scoped         int `json:"scoped"`
+	Unscoped       int `json:"unscoped"`
+	UnknownScope   int `json:"unknownScope"`
+}
+
+type ScopeRegionCount struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+type ScopeTimePoint struct {
+	T        string `json:"t"`
+	Scoped   int    `json:"scoped"`
+	Unscoped int    `json:"unscoped"`
+}
+
+type ScopeStatsResponse struct {
+	Window     string             `json:"window"`
+	Summary    ScopeStatsSummary  `json:"summary"`
+	ByRegion   []ScopeRegionCount `json:"byRegion"`
+	TimeSeries []ScopeTimePoint   `json:"timeSeries"`
 }
 
 // ─── Health ────────────────────────────────────────────────────────────────────
@@ -264,6 +294,7 @@ type TransmissionResp struct {
 	ObservationCount int              `json:"observation_count"`
 	ObserverID       interface{}      `json:"observer_id"`
 	ObserverName     interface{}      `json:"observer_name"`
+	ObserverIATA     interface{}      `json:"observer_iata"`
 	SNR              interface{}      `json:"snr"`
 	RSSI             interface{}      `json:"rssi"`
 	PathJSON         interface{}      `json:"path_json"`
@@ -278,6 +309,7 @@ type ObservationResp struct {
 	Hash           interface{} `json:"hash,omitempty"`
 	ObserverID     interface{} `json:"observer_id"`
 	ObserverName   interface{} `json:"observer_name"`
+	ObserverIATA   interface{} `json:"observer_iata"`
 	SNR            interface{} `json:"snr"`
 	RSSI           interface{} `json:"rssi"`
 	PathJSON       interface{} `json:"path_json"`
@@ -295,6 +327,7 @@ type GroupedPacketResp struct {
 	Latest           string      `json:"latest"`
 	ObserverID       interface{} `json:"observer_id"`
 	ObserverName     interface{} `json:"observer_name"`
+	ObserverIATA     interface{} `json:"observer_iata"`
 	PathJSON         interface{} `json:"path_json"`
 	PayloadType      int         `json:"payload_type"`
 	RouteType        int         `json:"route_type"`
@@ -868,6 +901,19 @@ type ObserverResp struct {
 	Lat             interface{} `json:"lat"`
 	Lon             interface{} `json:"lon"`
 	NodeRole        interface{} `json:"nodeRole"`
+	// Issue #1478: surface naive-clock observers to the UI.
+	// `clock_naive` is derived from clock_last_naive_at being within the
+	// last 24h; once decayed, all three skew fields read as zero/null so the
+	// chip and banner clear automatically.
+	ClockNaive        bool        `json:"clock_naive"`
+	ClockSkewSeconds  interface{} `json:"clock_skew_seconds"`
+	ClockSkewCount24h int         `json:"clock_skew_count_24h"`
+	ClockLastNaiveAt  interface{} `json:"clock_last_naive_at"`
+	// Issue #1290: firmware 1.16 `repeat` flag — true=repeater,
+	// false=listener-only, nil=unknown (legacy observer never sent the
+	// field). UI tri-state badge renders nothing when nil so legacy
+	// rows don't masquerade as confirmed repeaters (PR #1624 MAJOR-2).
+	CanRelay *bool `json:"can_relay,omitempty"`
 }
 
 type ObserverListResponse struct {
@@ -936,6 +982,9 @@ type ThemeResponse struct {
 	NodeColors map[string]interface{} `json:"nodeColors"`
 	TypeColors map[string]interface{} `json:"typeColors"`
 	Home       interface{}            `json:"home"`
+	// #1488 — marker stroke overlay so the frontend can apply server-side
+	// defaults before the operator's localStorage override loads.
+	MarkerStroke map[string]interface{} `json:"markerStroke,omitempty"`
 }
 
 type MapConfigResponse struct {
@@ -946,7 +995,8 @@ type MapConfigResponse struct {
 type ClientConfigResponse struct {
 	Roles              interface{} `json:"roles"`
 	HealthThresholds   interface{} `json:"healthThresholds"`
-	Tiles              interface{} `json:"tiles"`
+	Map                interface{} `json:"map"`
+	Tiles              interface{} `json:"tiles,omitempty"` // deprecated
 	SnrThresholds      interface{} `json:"snrThresholds"`
 	DistThresholds     interface{} `json:"distThresholds"`
 	MaxHopDist         interface{} `json:"maxHopDist"`
@@ -956,8 +1006,19 @@ type ClientConfigResponse struct {
 	CacheInvalidateMs  interface{} `json:"cacheInvalidateMs"`
 	ExternalUrls       interface{} `json:"externalUrls"`
 	PropagationBufferMs float64         `json:"propagationBufferMs"`
+	LiveMapMaxNodes     int             `json:"liveMapMaxNodes"`
 	Timestamps          TimestampConfig `json:"timestamps"`
 	DebugAffinity       bool            `json:"debugAffinity,omitempty"`
+	MapDarkTileProvider string          `json:"mapDarkTileProvider,omitempty"` // deprecated. TODO: remove after v3.5.0
+	Customizer          CustomizerClientConfig `json:"customizer"`
+}
+
+// CustomizerClientConfig is the operator-side customizer-modal knobs that
+// /api/config/client surfaces to the frontend. Issue #1508. The field is
+// always present (DisabledTabs defaults to an empty slice) so the frontend
+// can blindly call `.disabledTabs.includes(...)` without an undefined guard.
+type CustomizerClientConfig struct {
+	DisabledTabs []string `json:"disabledTabs"`
 }
 
 // ─── IATA Coords ───────────────────────────────────────────────────────────────

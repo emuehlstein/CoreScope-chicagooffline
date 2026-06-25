@@ -104,6 +104,10 @@ func (s *Server) handleNodeNeighbors(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "Not found")
 		return
 	}
+	if s.isPubkeyHidden(pubkey) {
+		writeError(w, 404, "Not found")
+		return
+	}
 
 	minCount := 1
 	if v := r.URL.Query().Get("min_count"); v != "" {
@@ -236,6 +240,54 @@ func (s *Server) handleNeighborGraph(w http.ResponseWriter, r *http.Request) {
 	region := r.URL.Query().Get("region")
 	roleFilter := strings.ToLower(r.URL.Query().Get("role"))
 
+	// #1481 P0-1: serve the default-shape request from the atomic-pointer
+	// snapshot maintained by the background recomputer (5 min cadence).
+	// Default shape: minCount=5, minScore=0.1, no region, no role.
+	if minCount == 5 && minScore == 0.1 && region == "" && roleFilter == "" {
+		if raw, age, ok := s.loadNeighborGraphCacheBytes(); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Cache-Age-Seconds", cacheAgeSecondsHeader(age))
+			w.Write(raw)
+			return
+		}
+	}
+	// #1483: also serve the (minCount=1, minScore=0) shape from cache —
+	// that's what the analytics UI tab fetches so it can client-side
+	// slider over the full edge set. Without this branch the user-
+	// visible analytics tab still hit the cold compute path.
+	if minCount == 1 && minScore == 0 && region == "" && roleFilter == "" {
+		if raw, age, ok := s.loadNeighborGraphCacheBytesUnfiltered(); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Cache-Age-Seconds", cacheAgeSecondsHeader(age))
+			w.Write(raw)
+			return
+		}
+	}
+
+	resp := s.computeNeighborGraphResponseDispatch(minCount, minScore, region, roleFilter)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// computeNeighborGraphResponseDispatch routes to the test-injected
+// function when set, otherwise to the real pipeline. #1483 follow-up.
+func (s *Server) computeNeighborGraphResponseDispatch(minCount int, minScore float64, region, roleFilter string) NeighborGraphResponse {
+	if s.computeNeighborGraphResponseFn != nil {
+		return s.computeNeighborGraphResponseFn(minCount, minScore, region, roleFilter)
+	}
+	return s.computeNeighborGraphResponse(minCount, minScore, region, roleFilter)
+}
+
+// buildDefaultNeighborGraphResponse builds the default-shape response
+// used by the #1481 P0-1 recomputer. Goes through the dispatch so test
+// hooks can inject failures (#1483 follow-up).
+func (s *Server) buildDefaultNeighborGraphResponse() NeighborGraphResponse {
+	return s.computeNeighborGraphResponseDispatch(5, 0.1, "", "")
+}
+
+// computeNeighborGraphResponse does the full graph build + filter + score
+// pipeline previously inlined in handleNeighborGraph.
+func (s *Server) computeNeighborGraphResponse(minCount int, minScore float64, region, roleFilter string) NeighborGraphResponse {
 	graph := s.getNeighborGraph()
 	allEdges := graph.AllEdges()
 	now := time.Now()
@@ -284,6 +336,10 @@ func (s *Server) handleNeighborGraph(w http.ResponseWriter, r *http.Request) {
 
 		// Filter blacklisted nodes from graph.
 		if s.cfg != nil && (s.cfg.IsBlacklisted(e.NodeA) || s.cfg.IsBlacklisted(e.NodeB)) {
+			continue
+		}
+		// #1181: also drop edges touching a hidden-prefix node.
+		if s.isPubkeyHidden(e.NodeA) || s.isPubkeyHidden(e.NodeB) {
 			continue
 		}
 
@@ -349,7 +405,7 @@ func (s *Server) handleNeighborGraph(w http.ResponseWriter, r *http.Request) {
 		avgCluster = float64(len(filteredEdges)*2) / float64(len(nodes))
 	}
 
-	resp := NeighborGraphResponse{
+	return NeighborGraphResponse{
 		Nodes: nodes,
 		Edges: filteredEdges,
 		Stats: GraphStats{
@@ -360,9 +416,6 @@ func (s *Server) handleNeighborGraph(w http.ResponseWriter, r *http.Request) {
 			RejectedEdgesGeoFar: atomic.LoadUint64(&graph.RejectedEdgesGeoFar),
 		},
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -384,6 +437,9 @@ func (s *Server) buildNodeInfoMap() map[string]nodeInfo {
 	if s.store == nil {
 		return nil
 	}
+	// FirstSeen is folded into getAllNodes (and therefore into the 30s
+	// node cache) so callers like /api/nodes/{pk}/reach get the field
+	// without a per-request SELECT — fixes #1627 r3 regression.
 	nodes, _ := s.store.getCachedNodesAndPM()
 	m := make(map[string]nodeInfo, len(nodes))
 	for _, n := range nodes {

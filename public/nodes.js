@@ -53,12 +53,28 @@
       } else if (col === 'role') {
         va = (a.role || '').toLowerCase(); vb = (b.role || '').toLowerCase();
         return va < vb ? -dir : va > vb ? dir : 0;
+      } else if (col === 'default_scope') {
+        va = (a.default_scope || '').toLowerCase(); vb = (b.default_scope || '').toLowerCase();
+        if (!a.default_scope && b.default_scope) return 1;
+        if (a.default_scope && !b.default_scope) return -1;
+        return va < vb ? -dir : va > vb ? dir : 0;
       } else if (col === 'last_seen') {
         va = a.last_heard ? new Date(a.last_heard).getTime() : a.last_seen ? new Date(a.last_seen).getTime() : 0;
         vb = b.last_heard ? new Date(b.last_heard).getTime() : b.last_seen ? new Date(b.last_seen).getTime() : 0;
         return (va - vb) * dir;
       } else if (col === 'advert_count') {
         va = a.advert_count || 0; vb = b.advert_count || 0;
+        return (va - vb) * dir;
+      } else if (col === 'first_seen') {
+        // Issue #1166: sort by node first_seen. Empty cells always sort
+        // LAST (regardless of direction) so unknown timestamps don't
+        // clutter the top of the table.
+        var aHas = a.first_seen ? 1 : 0;
+        var bHas = b.first_seen ? 1 : 0;
+        if (aHas !== bHas) return bHas - aHas; // dated rows before empties
+        if (!aHas) return 0;
+        va = new Date(a.first_seen).getTime();
+        vb = new Date(b.first_seen).getTime();
         return (va - vb) * dir;
       }
       return 0;
@@ -68,6 +84,32 @@
   let statusFilter = localStorage.getItem('meshcore-nodes-status-filter') || 'all';
   let wsHandler = null;
   let detailMap = null;
+
+  // #1461 followup: node-detail inset map tile layer that honors the
+  // customizer dark-tile-provider pick (#1420/#1430). Falls back to
+  // window.getTileUrl() output if the registry isn't loaded. Also applies
+  // the provider's invert CSS filter to the tile pane when needed.
+  function _applyTilesToNodeMap(map) {
+    if (!map) return;
+    var tileUrl = (window.getTileUrl && window.getTileUrl()) || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+    var provider = window.getActiveTileProvider && window.getActiveTileProvider();
+    var attribution = (provider && provider.attribution) || '© OpenStreetMap contributors';
+    var layer = L.tileLayer(tileUrl, { maxZoom: 18, attribution: attribution }).addTo(map);
+    // Esri 2-layer provider: add the labels reference overlay too
+    if (provider && provider.refUrl) {
+      try { L.tileLayer(provider.refUrl, { maxZoom: 18 }).addTo(map); } catch (_e) {}
+    }
+    // Apply invert CSS filter to the tile pane if the provider needs it
+    try {
+      var pane = map.getPane && map.getPane('tilePane');
+      if (pane) pane.style.filter = (provider && provider.invertFilter) ? provider.invertFilter : '';
+    } catch (_e) {}
+    return layer;
+  }
+  // Exposed so the node-reach link-map (node-reach-map.js) reuses the user's
+  // configured tile provider instead of hardcoding OSM.
+  window._applyTilesToNodeMap = _applyTilesToNodeMap;
+
 
   // ROLE_COLORS loaded from shared roles.js
   const TABS = [
@@ -110,7 +152,7 @@
     }
     const f = formatTimestampWithTooltip(isoString, getTimestampMode());
     const warn = f.isFuture
-      ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed">⚠️</span>'
+      ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>'
       : '';
     return `<span class="timestamp-text" title="${escapeHtml(f.tooltip)}">${escapeHtml(f.text)}</span>${warn}`;
   }
@@ -149,7 +191,7 @@
     const lastHeardMs = lastHeardTime ? new Date(lastHeardTime).getTime() : 0;
     const status = getNodeStatus(role, lastHeardMs);
     const statusTooltip = getStatusTooltip(role, status);
-    const statusLabel = status === 'active' ? '🟢 Active' : '⚪ Stale';
+    const statusLabel = status === 'active' ? '<span style="color:var(--status-green)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> Active' : '<span style="color:var(--text-muted)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> Stale';
     const statusAge = lastHeardMs ? (Date.now() - lastHeardMs) : Infinity;
 
     let explanation = '';
@@ -174,10 +216,17 @@
     const info = getStatusInfo(n);
     let html = `<span class="badge" style="background:${roleColor}20;color:${roleColor}">${n.role}</span>`;
     if (n.hash_size) {
-      html += ` <span class="badge" style="background:var(--nav-bg);color:var(--nav-text);font-family:var(--mono)">${n.public_key.slice(0, n.hash_size * 2).toUpperCase()}</span>`;
+      html += ` <span class="badge pubkey-prefix-badge">${n.public_key.slice(0, n.hash_size * 2).toUpperCase()}</span>`;
+    }
+    // #1279 P2 #4: multibyte capability badge — surfaced from the observable
+    // multibyte hash_size (firmware Feat1/Feat2 carry the wire capability bits
+    // per AdvertDataHelpers.h:14-16, but Feat1/Feat2 aren't persisted per-node
+    // in CoreScope today; hash_size is the observed effective capability).
+    if (n.hash_size && Number(n.hash_size) >= 2) {
+      html += ` <span class="badge multibyte-badge" title="Node advertises multibyte hash path (firmware Feat1/Feat2)">Multibyte: ${Number(n.hash_size)}-byte</span>`;
     }
     if (n.hash_size_inconsistent) {
-      html += ` <a href="#/nodes/${encodeURIComponent(n.public_key)}?section=node-packets" class="badge" style="background:var(--status-yellow);color:#000;font-size:10px;cursor:pointer;text-decoration:none">⚠️ variable hash size</a>`;
+      html += ` <a href="#/nodes/${encodeURIComponent(n.public_key)}?section=node-packets" class="badge" style="background:var(--status-yellow);color:#000;font-size:10px;cursor:pointer;text-decoration:none"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> variable hash size</a>`;
     }
     html += ` <span title="${info.statusTooltip}">${info.statusLabel}</span>`;
     return html;
@@ -200,10 +249,10 @@
   var _neighborCache = {};
 
   function getConfidenceIndicator(entry) {
-    if (entry.ambiguous) return { icon: '⚠️', label: 'AMBIGUOUS', cls: 'confidence-ambiguous' };
-    if (entry.count <= 1) return { icon: '🔴', label: 'LOW', cls: 'confidence-low' };
-    if (entry.score >= 0.5 && entry.count >= 3) return { icon: '🟢', label: 'HIGH', cls: 'confidence-high' };
-    return { icon: '🟡', label: 'MEDIUM', cls: 'confidence-medium' };
+    if (entry.ambiguous) return { icon: '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg>', label: 'AMBIGUOUS', cls: 'confidence-ambiguous' };
+    if (entry.count <= 1) return { icon: '<span style="color:var(--status-red)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>', label: 'LOW', cls: 'confidence-low' };
+    if (entry.score >= 0.5 && entry.count >= 3) return { icon: '<span style="color:var(--status-green)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>', label: 'HIGH', cls: 'confidence-high' };
+    return { icon: '<span style="color:var(--status-yellow)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>', label: 'MEDIUM', cls: 'confidence-medium' };
   }
 
   function renderNeighborRows(neighbors, limit) {
@@ -227,7 +276,7 @@
         ? formatDistance(Number(nb.distance_km))
         : '<span class="text-muted">—</span>';
       var showOnMap = nb.pubkey
-        ? ' <button class="btn-link neighbor-show-map" data-pubkey="' + escapeHtml(nb.pubkey) + '" style="font-size:11px;padding:1px 6px;white-space:nowrap">📍 Map</button>'
+        ? ' <button class="btn-link neighbor-show-map" data-pubkey="' + escapeHtml(nb.pubkey) + '" style="font-size:11px;padding:1px 6px;white-space:nowrap"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-pin"/></svg> Map</button>'
         : '';
       var lastSeenVal = nb.last_seen ? new Date(nb.last_seen).getTime() : 0;
       var distanceVal = nb.distance_km != null ? Number(nb.distance_km) : '';
@@ -301,10 +350,10 @@
     }
     var html = renderNeighborTable(data.neighbors, limit);
     if (limit && data.neighbors.length > limit) {
-      html += '<div style="margin-top:6px;text-align:right"><button class="btn-link show-all-neighbors-btn" style="font-size:12px;cursor:pointer;background:none;border:none;color:var(--accent);padding:0">Show all ' + data.neighbors.length + ' neighbors ▼</button></div>';
+      html += '<div style="margin-top:6px;text-align:right"><button class="btn-link show-all-neighbors-btn" style="font-size:12px;cursor:pointer;background:none;border:none;color:var(--accent);padding:0">Show all ' + data.neighbors.length + ' neighbors <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-down"/></svg></button></div>';
     } else if (!limit && data.neighbors.length > 5) {
       // Collapse toggle when expanded (#855)
-      html += '<div style="margin-top:6px;text-align:right"><button class="btn-link collapse-neighbors-btn" style="font-size:12px;cursor:pointer;background:none;border:none;color:var(--accent);padding:0">Show fewer ▲</button></div>';
+      html += '<div style="margin-top:6px;text-align:right"><button class="btn-link collapse-neighbors-btn" style="font-size:12px;cursor:pointer;background:none;border:none;color:var(--accent);padding:0">Show fewer <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-up"/></svg></button></div>';
     }
     el.innerHTML = html;
 
@@ -352,7 +401,7 @@
 
     if (directNode) {
       // Full-screen single node view (desktop + mobile).
-      // Reached via the 🔍 Details link or a deep link to #/nodes/{pubkey}.
+      // Reached via the Details link or a deep link to #/nodes/{pubkey}.
       // Row clicks use history.replaceState (no hashchange → no re-init),
       // so the split-panel UX on desktop is preserved.
       app.innerHTML = `<div class="node-fullscreen">
@@ -400,6 +449,7 @@
         <div class="nodes-counts" id="nodeCounts"></div>
       </div>
       <div id="nodesRegionFilter" class="region-filter-container"></div>
+      <div id="nodesAreaFilter" style="display:none"></div>
       <div class="split-layout">
         <div class="panel-left" id="nodesLeft" aria-live="polite" aria-relevant="additions removals"></div>
         <div class="panel-right empty" id="nodesRight"><span>Select a node to view details</span></div>
@@ -407,7 +457,9 @@
     </div>`;
 
     RegionFilter.init(document.getElementById('nodesRegionFilter'));
+    AreaFilter.init(document.getElementById('nodesAreaFilter'));
     regionChangeHandler = RegionFilter.onChange(function () { _allNodes = null; _fleetSkew = null; loadNodes(); });
+    AreaFilter.onChange(function () { _allNodes = null; _fleetSkew = null; loadNodes(); });
 
     if (search) {
       var _si = document.getElementById('nodeSearch');
@@ -513,10 +565,11 @@
           <div style="margin:4px 0 6px">${renderNodeBadges(n, roleColor)}</div>
           ${renderHashInconsistencyWarning(n)}
           <div class="node-detail-key mono" style="font-size:11px;word-break:break-all;margin-bottom:6px">${n.public_key}</div>
-          <div>
-            <button class="btn-primary" id="copyUrlBtn" style="font-size:12px;padding:4px 10px">📋 Copy URL</button>
-            <button class="btn-primary" id="copyShortUrlBtn" title="Short URL using an 8-char pubkey prefix — easier to send over the mesh (issue #772)" style="font-size:12px;padding:4px 10px;margin-left:6px">📡 Copy short URL</button>
-            <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="display:inline-block;margin-left:6px;text-decoration:none;font-size:12px;padding:4px 10px">📊 Analytics</a>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            <button class="btn-primary" id="copyUrlBtn" style="flex:0 0 auto;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-clipboard-text"/></svg> Copy URL</button>
+            <button class="btn-primary" id="copyShortUrlBtn" title="Short URL using an 8-char pubkey prefix — easier to send over the mesh (issue #772)" style="flex:0 0 auto;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Copy short URL</button>
+            <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="flex:0 0 auto;text-decoration:none;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg> Analytics</a>
+            <a href="#/nodes/${encodeURIComponent(n.public_key)}/reach" class="btn-primary" style="flex:0 0 auto;text-decoration:none;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Reach</a>
           </div>
         </div>
 
@@ -531,9 +584,15 @@
         <table class="node-stats-table" id="node-stats">
           <tr><td>Status</td><td><span title="${si.statusTooltip}">${statusLabel}</span> <span style="font-size:11px;color:var(--text-muted);margin-left:4px">${statusExplanation}</span></td></tr>
           <tr><td>Last Heard</td><td>${renderNodeTimestampHtml(lastHeard || n.last_seen)}</td></tr>
-          ${(n.role === 'repeater' || n.role === 'room') ? `<tr><td title="Last time this repeater appeared as a relay hop in a non-advert packet observed by the network. Distinct from 'Last Heard' (which counts the repeater's own adverts). See issue #662.">Last Relayed</td><td>${n.last_relayed ? renderNodeTimestampHtml(n.last_relayed) + ' ' + (n.relay_active ? '<span style="color:var(--status-green);font-size:11px">🟢 actively relaying</span>' : '<span style="color:var(--status-yellow);font-size:11px">🟡 alive (idle)</span>') : '<span style="color:var(--text-muted)">never observed as relay hop</span> <span style="color:var(--status-yellow);font-size:11px">🟡 alive (idle)</span>'}${(n.relay_count_1h != null || n.relay_count_24h != null) ? ` <span style="color:var(--text-muted);font-size:11px;margin-left:4px">(${n.relay_count_1h || 0} relays/hr, ${n.relay_count_24h || 0} relays/24h)</span>` : ''}</td></tr>` : ''}
-          ${(n.role === 'repeater' || n.role === 'room') && n.usefulness_score != null ? (() => {
-            const s = Number(n.usefulness_score) || 0;
+          ${(n.role === 'repeater' || n.role === 'room') ? `<tr><td title="Last time this repeater appeared as a relay hop in a non-advert packet observed by the network. Distinct from 'Last Heard' (which counts the repeater's own adverts). See issue #662.">Last Relayed</td><td>${n.last_relayed ? renderNodeTimestampHtml(n.last_relayed) + ' ' + (n.relay_active ? '<span style="color:var(--status-green);font-size:11px"><span style="color:var(--status-green)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> actively relaying</span>' : '<span style="color:var(--status-yellow);font-size:11px"><span style="color:var(--status-yellow)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> alive (idle)</span>') : '<span style="color:var(--text-muted)">never observed as relay hop</span> <span style="color:var(--status-yellow);font-size:11px"><span style="color:var(--status-yellow)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> alive (idle)</span>'}${(n.relay_count_1h != null || n.relay_count_24h != null) ? ` <span style="color:var(--text-muted);font-size:11px;margin-left:4px">(${n.relay_count_1h || 0} relays/hr, ${n.relay_count_24h || 0} relays/24h)</span>` : ''}</td></tr>` : ''}
+          ${(n.role === 'repeater' || n.role === 'room') && (n.traffic_share_score != null || n.usefulness_score != null) ? (() => {
+            // #1456: prefer the new traffic_share_score field; fall back
+            // to legacy usefulness_score for graceful degradation
+            // against stale servers. The visible label is now "Traffic
+            // share" (the old "Usefulness" implied a composite that
+            // doesn't exist yet — see #672).
+            const raw = (n.traffic_share_score != null) ? n.traffic_share_score : n.usefulness_score;
+            const s = Number(raw) || 0;
             const pct = (s * 100).toFixed(1);
             // Visual indicator: width % bar with green→yellow→red color by score.
             // Per issue #672 classification table: 0.8+ Critical, 0.6+ Valuable,
@@ -545,7 +604,26 @@
             else if (s >= 0.1) { label = 'Marginal'; color = 'var(--status-orange, #e67e22)'; }
             else { label = 'Redundant'; color = 'var(--status-red, #e74c3c)'; }
             const barWidth = Math.max(2, Math.round(s * 100));
-            return `<tr id="row-usefulness-score" data-usefulness-score="${s.toFixed(4)}"><td title="Fraction of non-advert traffic in the network observed by CoreScope that this repeater carries as a relay hop (Traffic axis of issue #672). Range 0–1; higher = forwards more of the mesh's actual traffic.">Usefulness</td><td><span style="display:inline-block;vertical-align:middle;width:80px;height:8px;background:var(--bg-secondary,#333);border-radius:4px;overflow:hidden;margin-right:6px"><span style="display:block;width:${barWidth}%;height:100%;background:${color}"></span></span><span style="color:${color};font-weight:600">${pct}%</span> <span style="color:var(--text-muted);font-size:11px;margin-left:4px">${label}</span></td></tr>`;
+            const tooltip = "Fraction of all non-advert mesh traffic in the analyzer's memory that transited through this repeater as a relay hop. High = lots of packets pass through; low = quieter (may still be structurally important — see Bridge score). One of 4 planned scoring axes (#672); others pending.";
+            return `<tr id="row-usefulness-score" data-usefulness-score="${s.toFixed(4)}" data-traffic-share-score="${s.toFixed(4)}"><td title="${tooltip}">Traffic share <span style="color:var(--text-muted);cursor:help" aria-label="help">ⓘ</span></td><td><span style="display:inline-block;vertical-align:middle;width:80px;height:8px;background:var(--bg-secondary,#333);border-radius:4px;overflow:hidden;margin-right:6px"><span style="display:block;width:${barWidth}%;height:100%;background:${color}"></span></span><span style="color:${color};font-weight:600">${pct}%</span> <span style="color:var(--text-muted);font-size:11px;margin-left:4px">${label}</span></td></tr>`;
+          })() : ''}
+          ${(n.role === 'repeater' || n.role === 'room') && n.bridge_score != null ? (() => {
+            // Bridge axis (issue #672 axis 2 of 4): normalized betweenness
+            // centrality from the neighbor-edges graph. Distinct from the
+            // Traffic-share score above — bridge measures STRUCTURAL
+            // importance (how many shortest paths between other node
+            // pairs go through this one) regardless of current traffic.
+            const b = Number(n.bridge_score) || 0;
+            const bpct = (b * 100).toFixed(1);
+            let blabel, bcolor;
+            if (b >= 0.5) { blabel = 'Critical bridge'; bcolor = 'var(--status-green, #2ecc71)'; }
+            else if (b >= 0.2) { blabel = 'Important'; bcolor = 'var(--status-green, #2ecc71)'; }
+            else if (b >= 0.05) { blabel = 'Some role'; bcolor = 'var(--status-yellow, #f1c40f)'; }
+            else if (b > 0) { blabel = 'Marginal'; bcolor = 'var(--status-orange, #e67e22)'; }
+            else { blabel = 'No bridge role'; bcolor = 'var(--text-muted)'; }
+            const bbarWidth = Math.max(2, Math.round(b * 100));
+            const btooltip = "Normalized betweenness centrality (0..1). How often this node sits on the shortest path between other pairs of nodes in the affinity graph. 1.0 = the most structurally critical node on the mesh. High Bridge + low Traffic share = a quiet but irreplaceable chokepoint.";
+            return `<tr id="row-bridge-score" data-bridge-score="${b.toFixed(4)}"><td title="${btooltip}">Bridge score <span style="color:var(--text-muted);cursor:help" aria-label="help">ⓘ</span></td><td><span style="display:inline-block;vertical-align:middle;width:80px;height:8px;background:var(--bg-secondary,#333);border-radius:4px;overflow:hidden;margin-right:6px"><span style="display:block;width:${bbarWidth}%;height:100%;background:${bcolor}"></span></span><span style="color:${bcolor};font-weight:600">${bpct}%</span> <span style="color:var(--text-muted);font-size:11px;margin-left:4px">${blabel}</span></td></tr>`;
           })() : ''}
           <tr><td>First Seen</td><td>${renderNodeTimestampHtml(n.first_seen)}</td></tr>
           <tr><td>Total Packets</td><td>${stats.totalTransmissions || stats.totalPackets || n.advert_count || 0}${stats.totalObservations && stats.totalObservations !== (stats.totalTransmissions || stats.totalPackets) ? ' <span class="text-muted" style="font-size:0.85em">(seen ' + stats.totalObservations + '×)</span>' : ''}</td></tr>
@@ -553,7 +631,7 @@
           ${stats.avgSnr != null ? `<tr><td>Avg SNR</td><td>${Number(stats.avgSnr).toFixed(1)} dB</td></tr>` : ''}
           ${stats.avgHops ? `<tr><td>Avg Hops</td><td>${stats.avgHops}</td></tr>` : ''}
           ${hasLoc ? `<tr><td>Location</td><td>${Number(n.lat).toFixed(5)}, ${Number(n.lon).toFixed(5)}</td></tr>` : ''}
-          <tr><td>Hash Prefix</td><td>${n.hash_size ? '<code style="font-family:var(--mono);font-weight:700">' + n.public_key.slice(0, n.hash_size * 2).toUpperCase() + '</code> (' + n.hash_size + '-byte)' : 'Unknown'}${n.hash_size_inconsistent ? ' <span style="color:var(--status-yellow);cursor:help" title="Seen: ' + (Array.isArray(n.hash_sizes_seen) ? n.hash_sizes_seen : []).join(', ') + '-byte">⚠️ varies</span>' : ''}</td></tr>
+          <tr><td>Hash Prefix</td><td>${n.hash_size ? '<code style="font-family:var(--mono);font-weight:700">' + n.public_key.slice(0, n.hash_size * 2).toUpperCase() + '</code> (' + n.hash_size + '-byte)' : 'Unknown'}${n.hash_size_inconsistent ? ' <span style="color:var(--status-yellow);cursor:help" title="Seen: ' + (Array.isArray(n.hash_sizes_seen) ? n.hash_sizes_seen : []).join(', ') + '-byte"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> varies</span>' : ''}</td></tr>
         </table>
 
         <div class="node-full-card" id="node-packets">
@@ -562,12 +640,12 @@
           <div class="node-activity-list">
             ${validPackets.length ? validPackets.map(p => {
               let decoded; try { decoded = JSON.parse(p.decoded_json); } catch {}
-              const typeLabel = p.payload_type === 4 ? '📡 Advert' : p.payload_type === 5 ? '💬 Channel' : p.payload_type === 2 ? '✉️ DM' : '📦 Packet';
+              const typeLabel = p.payload_type === 4 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Advert' : p.payload_type === 5 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chat-circle"/></svg> Channel' : p.payload_type === 2 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-envelope"/></svg> DM' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg> Packet';
               const detail = decoded?.text ? ': ' + escapeHtml(truncate(decoded.text, 50)) : decoded?.name ? ' — ' + escapeHtml(decoded.name) : '';
               const obs = p.observer_name || p.observer_id;
               const snr = p.snr != null ? ` · SNR ${p.snr}dB` : '';
               const rssi = p.rssi != null ? ` · RSSI ${p.rssi}dBm` : '';
-              const obsBadge = p.observation_count > 1 ? ` <span class="badge badge-obs" title="Seen ${p.observation_count} times">👁 ${p.observation_count}</span>` : '';
+              const obsBadge = p.observation_count > 1 ? ` <span class="badge badge-obs" title="Seen ${p.observation_count} times"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ${p.observation_count}</span>` : '';
               // Show hash size per advert if inconsistent
               let hashSizeBadge = '';
               if (n.hash_size_inconsistent && p.payload_type === 4 && p.raw_hex) {
@@ -602,7 +680,7 @@
             </tr></thead>
             <tbody>
               ${observers.map(o => `<tr>
-                <td data-value="${escapeHtml((o.observer_name || o.observer_id || '').toLowerCase())}" style="font-weight:600">${escapeHtml(o.observer_name || o.observer_id)}</td>
+                <td data-value="${escapeHtml((o.observer_name || o.observer_id || '').toLowerCase())}" style="font-weight:600">${escapeHtml(o.observer_name || o.observer_id)}${o.can_relay === false ? ' <span class="badge-listener" title="Firmware reported repeat:off — excluded from path-hop disambiguator (#1290)">listener</span>' : (o.can_relay === true ? ' <span class="badge-repeater" title="Firmware reported repeat:on — eligible as a path hop">repeater</span>' : '')}</td>
                 <td data-value="${escapeHtml((o.iata || '').toLowerCase())}">${o.iata ? escapeHtml(o.iata) : '—'}</td>
                 <td data-value="${o.packetCount || 0}">${o.packetCount}</td>
                 <td data-value="${o.avgSnr != null ? Number(o.avgSnr) : ''}">${o.avgSnr != null ? Number(o.avgSnr).toFixed(1) + ' dB' : '—'}</td>
@@ -618,7 +696,7 @@
         </div>
 
         <div class="node-full-card" id="node-affinity-debug" style="display:none">
-          <h4 style="cursor:pointer" onclick="this.parentElement.querySelector('.affinity-debug-body').style.display=this.parentElement.querySelector('.affinity-debug-body').style.display==='none'?'block':'none'; this.querySelector('.toggle-icon').textContent=this.parentElement.querySelector('.affinity-debug-body').style.display==='none'?'▶':'▼'"><span class="toggle-icon">▶</span> 🔍 Affinity Debug</h4>
+          <h4 style="cursor:pointer" onclick="var body=this.parentElement.querySelector('.affinity-debug-body'); var hidden=body.style.display==='none'; body.style.display=hidden?'block':'none'; this.querySelector('.toggle-icon').innerHTML=body.style.display==='none'?'<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-down"/></svg>':'<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-up"/></svg>'"><span class="toggle-icon"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-down"/></svg></span> <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Affinity Debug</h4>
           <div class="affinity-debug-body" style="display:none">
             <div id="affinityDebugContent"><div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading debug data…</div></div>
           </div>
@@ -626,6 +704,7 @@
 
         <div class="node-full-card" id="fullPathsSection">
           <h4>Paths Through This Node</h4>
+          <div class="path-symbols-legend-wrapper">${(window.HopDisplay && HopDisplay.renderPathSymbolsLegend) ? HopDisplay.renderPathSymbolsLegend() : ''}</div>
           <div id="fullPathsContent"><div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading paths…</div></div>
         </div>
 
@@ -636,8 +715,8 @@
         try {
           if (detailMap) { detailMap.remove(); detailMap = null; }
           detailMap = L.map('nodeFullMap', { zoomControl: true, attributionControl: false }).setView([n.lat, n.lon], 13);
-          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18 }).addTo(detailMap);
-          L.marker([n.lat, n.lon]).addTo(detailMap).bindPopup(n.name || n.public_key.slice(0, 12));
+          _applyTilesToNodeMap(detailMap);
+          L.marker([n.lat, n.lon]).addTo(detailMap).bindPopup(escapeHtml(n.name || n.public_key.slice(0, 12)));
           setTimeout(() => detailMap.invalidateSize(), 100);
         } catch {}
       }
@@ -647,8 +726,8 @@
       document.getElementById('copyUrlBtn')?.addEventListener('click', () => {
         const btn = document.getElementById('copyUrlBtn');
         window.copyToClipboard(nodeUrl, () => {
-          btn.textContent = '✅ Copied!';
-          setTimeout(() => btn.textContent = '📋 Copy URL', 2000);
+          btn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> Copied!';
+          setTimeout(() => btn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-clipboard-text"/></svg> Copy URL', 2000);
         });
       });
 
@@ -658,8 +737,8 @@
       document.getElementById('copyShortUrlBtn')?.addEventListener('click', () => {
         const btn = document.getElementById('copyShortUrlBtn');
         window.copyToClipboard(shortUrl, () => {
-          btn.textContent = '✅ Copied!';
-          setTimeout(() => btn.textContent = '📡 Copy short URL', 2000);
+          btn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> Copied!';
+          setTimeout(() => btn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Copy short URL', 2000);
         });
       });
 
@@ -731,7 +810,7 @@
                 } else {
                   neighbor = e.nodeAName || (e.nodeA || '').substring(0, 8);
                 }
-                var status = e.ambiguous ? (e.unresolved ? '❓ Unresolved' : '⚠️ Ambiguous') : (e.resolved ? '✅ Auto-resolved' : '✅ Resolved');
+                var status = e.ambiguous ? (e.unresolved ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-question"/></svg> Unresolved' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Ambiguous') : (e.resolved ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> Auto-resolved' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> Resolved');
                 html += '<tr><td>' + escapeHtml(neighbor) + '</td><td>' + (e.score || 0).toFixed(3) + '</td><td>' + e.weight + '</td><td>' + (e.lastSeen || '').substring(0, 10) + '</td><td>' + (e.observers || []).length + '</td><td>' + status + '</td></tr>';
               });
               html += '</tbody></table>';
@@ -746,20 +825,20 @@
                 html += '<div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;font-size:12px">';
                 html += '<b>Prefix: ' + escapeHtml(r.prefix) + '</b> → ';
                 if (r.method === 'auto-resolved') {
-                  html += '<span style="color:var(--status-green)">✅ ' + escapeHtml(r.chosenName || r.chosen || '?') + '</span>';
+                  html += '<span style="color:var(--status-green)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> ' + escapeHtml(r.chosenName || r.chosen || '?') + '</span>';
                   html += ' (Jaccard=' + r.chosenJaccard.toFixed(2) + ', ratio=' + ((isFinite(r.ratio) && r.ratio < 100) ? r.ratio.toFixed(1) + '×' : '∞') + ')';
                 } else {
-                  html += '<span style="color:var(--status-yellow)">⚠️ Ambiguous</span>';
+                  html += '<span style="color:var(--status-yellow)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Ambiguous</span>';
                   if (r.ratio) html += ' (ratio=' + r.ratio.toFixed(1) + '×, threshold=' + r.thresholdApplied + '×)';
                 }
                 // Show disambiguation tier used (M4 resolveWithContext)
                 if (r.tier) {
                   var tierLabels = {
-                    'neighbor_affinity': '🏘️ Affinity',
-                    'geo_proximity': '🌍 Geo',
-                    'gps_preference': '📍 GPS',
-                    'first_match': '🎲 Naive',
-                    'unique_prefix': '✓ Unique',
+                    'neighbor_affinity': '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-buildings"/></svg> Affinity',
+                    'geo_proximity': '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-globe"/></svg> Geo',
+                    'gps_preference': '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-pin"/></svg> GPS',
+                    'first_match': '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-dice-five"/></svg> Naive',
+                    'unique_prefix': '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check"/></svg> Unique',
                     'no_match': '∅ None'
                   };
                   html += ' <span style="font-size:11px;opacity:0.8">[tier: ' + (tierLabels[r.tier] || escapeHtml(r.tier)) + ']</span>';
@@ -918,7 +997,25 @@
     var hashBlocks = evidence.map(function(ev) {
       var shortHash = (ev.hash || '').substring(0, 8) + '…';
       var obsCount = ev.observers ? ev.observers.length : 0;
-      var header = '<div style="font-weight:600;font-size:12px;margin-top:6px">Hash ' + shortHash + '  ·  ' + obsCount + ' observer' + (obsCount !== 1 ? 's' : '') + '  ·  median corrected: ' + formatSkew(ev.medianCorrectedSkewSec) + '</div>';
+      // #1285: per-hash median is server-side filtered to exclude RTC-reset
+      // outliers (|corrected skew| > 24h). Compute the same on the client so
+      // we can label hashes whose observers ALL saw a reset-shaped advert as
+      // "insufficient data — N outliers excluded" instead of rendering 0 or
+      // a misleading post-filter value.
+      var OUTLIER_SEC = 86400;
+      var outlierObs = 0;
+      (ev.observers || []).forEach(function(o) {
+        if (Math.abs(o.correctedSkewSec || 0) > OUTLIER_SEC) outlierObs++;
+      });
+      var medianLabel;
+      if (outlierObs > 0 && outlierObs === obsCount) {
+        medianLabel = 'insufficient data (' + outlierObs + ' RTC-reset outlier' + (outlierObs !== 1 ? 's' : '') + ' excluded)';
+      } else if (outlierObs > 0) {
+        medianLabel = formatSkew(ev.medianCorrectedSkewSec) + ' (' + outlierObs + ' RTC-reset outlier' + (outlierObs !== 1 ? 's' : '') + ' excluded)';
+      } else {
+        medianLabel = formatSkew(ev.medianCorrectedSkewSec);
+      }
+      var header = '<div style="font-weight:600;font-size:12px;margin-top:6px">Hash ' + shortHash + '  ·  ' + obsCount + ' observer' + (obsCount !== 1 ? 's' : '') + '  ·  median corrected: ' + medianLabel + '</div>';
       var lines = (ev.observers || []).map(function(o) {
         var name = o.observerName || o.observerID;
         return '<div style="font-size:11px;padding-left:16px;font-family:var(--mono)">' +
@@ -949,14 +1046,28 @@
       var bimodalWarning = '';
       if (cs.severity === 'bimodal_clock') {
         var totalRecent = cs.recentSampleCount || 0;
-        bimodalWarning = '<div style="font-size:12px;color:var(--status-amber-text);margin-top:4px">⚠️ ' + (cs.recentBadSampleCount || '?') + ' of last ' + (totalRecent || '?') + ' adverts had nonsense timestamps (likely RTC reset)</div>';
+        var summary = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> ' + (cs.recentBadSampleCount || '?') + ' of last ' + (totalRecent || '?') + ' adverts had nonsense timestamps (likely RTC reset)';
+        var badList = '';
+        if (Array.isArray(cs.recentBadSamples) && cs.recentBadSamples.length) {
+          var items = cs.recentBadSamples.map(function(bs) {
+            var hash = String(bs.hash || '');
+            if (!hash) return '';
+            var iso = bs.advertTS ? new Date(bs.advertTS * 1000).toISOString() : '';
+            var label = iso ? formatTimestamp(iso) : '—';
+            return '<li><a href="#/packets/' + encodeURIComponent(hash) + '">' + escapeHtml(hash.slice(0, 8)) + '</a> → <span title="' + escapeHtml(iso) + '">' + escapeHtml(label) + '</span></li>';
+          }).filter(Boolean).join('');
+          if (items) {
+            badList = '<ul style="margin:4px 0 0 18px;padding:0;font-size:11px;color:var(--text-muted)">' + items + '</ul>';
+          }
+        }
+        bimodalWarning = '<div style="font-size:12px;color:var(--status-amber-text);margin-top:4px">' + summary + badList + '</div>';
       }
       container.innerHTML =
-        '<h4 style="margin:0 0 6px">⏰ Clock Skew</h4>' +
+        '<h4 style="margin:0 0 6px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-clock"/></svg> Clock Skew</h4>' +
         '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">' +
           skewDisplay +
           renderSkewBadge(cs.severity, skewVal, cs) +
-          (cs.calibrated ? ' <span style="font-size:10px;color:var(--text-muted)" title="Observer-calibrated">✓ calibrated</span>' : '') +
+          (cs.calibrated ? ' <span style="font-size:10px;color:var(--text-muted)" title="Observer-calibrated"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check"/></svg> calibrated</span>' : '') +
         '</div>' +
         driftHtml +
         (sparkHtml ? '<div class="skew-sparkline-wrap" style="margin-top:8px">' + sparkHtml + '<div style="font-size:10px;color:var(--text-muted)">Skew over time (' + (cs.samples || []).length + ' samples)</div></div>' : '') +
@@ -1005,17 +1116,53 @@
 
   async function loadNodes(refreshOnly) {
     try {
-      // Fetch all nodes once, filter client-side
+      // Fetch all nodes via pagination loop — server clamps /api/nodes ?limit
+      // to 500 (PR #1540 / v3.8.3 DoS guard), so a single fetch silently
+      // truncates large deployments. Loop exit uses data.nodes.length < PAGE_SIZE
+      // as canonical stop — server total is unreliable under area filters
+      // (routes.go:1357 overwrites total = len(filtered)). See #1606.
       if (!_allNodes) {
-        const params = new URLSearchParams({ limit: '5000' });
+        const PAGE_SIZE = 500;
+        const SAFETY_CAP = 10000; // hard ceiling to bound runaway loops
+        const baseParams = new URLSearchParams({ limit: String(PAGE_SIZE) });
         const rp = RegionFilter.getRegionParam();
-        if (rp) params.set('region', rp);
-        const [data] = await Promise.all([
-          api('/nodes?' + params, { ttl: CLIENT_TTL.nodeList }),
-          getFleetSkew() // pre-fetch clock skew in parallel
-        ]);
-        _allNodes = data.nodes || [];
-        counts = data.counts || {};
+        if (rp) baseParams.set('region', rp);
+        const ap = AreaFilter.getAreaParam();
+        if (ap) baseParams.set('area', ap);
+
+        // B1 fix: use local accumulator; only assign _allNodes on full success.
+        const accumulated = [];
+        let offset = 0;
+        let firstTotal = null; // informational only (M1: not used as loop bound)
+        // Kick off fleet skew in parallel with the first page only.
+        const skewPromise = getFleetSkew();
+        const nodesBody = document.getElementById('nodesBody');
+        while (offset < SAFETY_CAP) {
+          baseParams.set('offset', String(offset));
+          const data = await api('/nodes?' + baseParams, { ttl: CLIENT_TTL.nodeList });
+          if (!data || !Array.isArray(data.nodes)) break;
+          accumulated.push.apply(accumulated, data.nodes);
+          counts = data.counts || counts || {};
+          if (firstTotal === null && typeof data.total === 'number') firstTotal = data.total;
+          // M2: progress feedback between pages
+          if (nodesBody && offset > 0) {
+            const estTotal = firstTotal || '?';
+            nodesBody.innerHTML = '<tr><td colspan="99" style="text-align:center;padding:2em">Loading nodes\u2026 ' + accumulated.length + '/' + estTotal + '</td></tr>';
+          }
+          // M1 fix: exit when page is short (canonical stop), not based on total
+          if (data.nodes.length < PAGE_SIZE) break;
+          offset += PAGE_SIZE;
+        }
+        // TODO(m2): per-page cache invalidation — currently each page uses
+        // the same CLIENT_TTL.nodeList; fine for now but could be smarter.
+        // Dedup by public_key (m1: handles overlapping pages)
+        const seen = new Map();
+        for (let i = 0; i < accumulated.length; i++) {
+          seen.set(accumulated[i].public_key, accumulated[i]);
+        }
+        _allNodes = Array.from(seen.values());
+        // m3: counts from first response only (subsequent pages may differ)
+        await skewPromise;
       }
 
       // Client-side filtering
@@ -1128,7 +1275,9 @@
           <th scope="col" data-sort-key="name" data-priority="1">Name</th>
           <th scope="col" class="col-pubkey" data-sort-key="public_key" data-priority="3">Public Key</th>
           <th scope="col" data-sort-key="role" data-priority="2">Role</th>
+          <th scope="col" data-sort-key="default_scope" data-priority="3">Scope</th>
           <th scope="col" data-sort-key="last_seen" data-sort-default="desc" data-priority="1">Last Seen</th>
+          <th scope="col" data-sort-key="first_seen" data-sort-default="desc" data-priority="3">First Seen</th>
           <th scope="col" data-sort-key="advert_count" data-sort-default="desc" data-priority="2">Adverts</th>
         </tr></thead>
         <tbody id="nodesBody"></tbody>
@@ -1203,8 +1352,8 @@
       if (link) {
         e.preventDefault();
         var href = link.getAttribute('href');
-        if (href.indexOf('/analytics') !== -1) {
-          // Analytics link — different page, force hashchange via replaceState + assign
+        if (href.indexOf('/analytics') !== -1 || href.indexOf('/reach') !== -1) {
+          // Analytics/Reach link — different page, force hashchange via replaceState + assign
           history.replaceState(null, '', '#/');
           location.hash = href.substring(1);
         }
@@ -1228,7 +1377,7 @@
     if (!tbody) return;
 
     if (!nodes.length) {
-      tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted" style="padding:24px">No nodes found</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted" style="padding:24px">No nodes found</td></tr>';
       return;
     }
 
@@ -1248,6 +1397,16 @@
     });
 
     const dupMap = buildDupNameMap(_allNodes);
+    // #1616 followup: capture the focused row's data-key BEFORE we replace
+    // the tbody — async events (`theme-refresh`, ws node updates, etc.)
+    // can fire renderRows() while the user is keyboard-navigating. Without
+    // restoration, focus drops to <body> on every re-render and the
+    // slide-over close-path focus-restore loses the race.
+    const tbodyHadFocus = tbody.contains(document.activeElement);
+    const focusedKey = tbodyHadFocus
+      ? (document.activeElement.closest('tr[data-key]') || {}).getAttribute &&
+        document.activeElement.closest('tr[data-key]').getAttribute('data-key')
+      : null;
     tbody.innerHTML = sorted.map(n => {
       const roleColor = ROLE_COLORS[n.role] || '#6b7280';
       const isClaimed = myKeys.has(n.public_key);
@@ -1257,10 +1416,12 @@
       const cs = _fleetSkew && _fleetSkew[n.public_key];
       const skewBadgeHtml = cs && cs.severity && cs.severity !== 'ok' ? renderSkewBadge(cs.severity, window.currentSkewValue(cs), cs) : '';
       return `<tr data-key="${n.public_key}" data-action="select" data-value="${n.public_key}" tabindex="0" role="row" class="${selectedKey === n.public_key ? 'selected' : ''}${isClaimed ? ' claimed-row' : ''}">
-        <td>${favStar(n.public_key, 'node-fav')}${isClaimed ? '<span class="claimed-badge" title="My Mesh">★</span> ' : ''}<strong>${n.name || '(unnamed)'}</strong>${dupNameBadge(n.name, n.public_key, dupMap)}${skewBadgeHtml}</td>
+        <td>${favStar(n.public_key, 'node-fav')}${isClaimed ? '<span class="claimed-badge" title="My Mesh"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg></span> ' : ''}<strong>${escapeHtml(n.name || '(unnamed)')}</strong>${dupNameBadge(n.name, n.public_key, dupMap)}${skewBadgeHtml}</td>
         <td class="mono col-pubkey">${truncate(n.public_key, 16)}</td>
         <td><span class="badge" style="background:${roleColor}20;color:${roleColor}">${n.role}</span></td>
+        <td style="font-family:var(--mono);font-size:12px">${n.default_scope ? escapeHtml(n.default_scope) : ''}</td>
         <td class="${lastSeenClass}">${renderNodeTimestampHtml(n.last_heard || n.last_seen)}</td>
+        <td>${n.first_seen ? renderNodeTimestampHtml(n.first_seen) : '<span class="text-muted">—</span>'}</td>
         <td>${n.advert_count || 0}</td>
       </tr>`;
     }).join('');
@@ -1270,6 +1431,17 @@
     if (window.TableResponsive) {
       var _ndTbl = document.getElementById('nodesTable');
       if (_ndTbl) window.TableResponsive.register(_ndTbl);
+    }
+    // #1616 followup: re-land focus on the replacement <tr> with the
+    // same data-key, if the prior tbody had focus. Without this, an
+    // async re-render (theme-refresh, ws node update) blurs the row
+    // the user just keyboard-navigated to.
+    if (focusedKey) {
+      try {
+        const sel = (window.CSS && CSS.escape) ? CSS.escape(focusedKey) : focusedKey;
+        const fresh = tbody.querySelector('tr[data-key="' + sel + '"]');
+        if (fresh) fresh.focus({ preventScroll: true });
+      } catch (_) {}
     }
   }
 
@@ -1371,12 +1543,13 @@
     const dupBadge = dupNameBadge(n.name, n.public_key, dupMap);
 
     panel.innerHTML = `
-      <button class="panel-close-btn" title="Close detail pane (Esc)">✕</button>
+      <button class="panel-close-btn" title="Close detail pane (Esc)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button>
       <div class="node-detail">
         <div class="node-detail-name">${escapeHtml(n.name || '(unnamed)')}${dupBadge}</div>
         <div class="node-detail-role">${renderNodeBadges(n, roleColor)}
-          <button class="btn-primary node-detail-btn" data-pubkey="${encodeURIComponent(n.public_key)}" aria-label="View details for ${escapeHtml(n.name || n.public_key)}" style="font-size:11px;padding:2px 8px;margin-left:8px;cursor:pointer">🔍 Details</button>
-          <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="display:inline-block;margin-left:4px;text-decoration:none;font-size:11px;padding:2px 8px">📊 Analytics</a>
+          <button class="btn-primary node-detail-btn" data-pubkey="${encodeURIComponent(n.public_key)}" aria-label="View details for ${escapeHtml(n.name || n.public_key)}" style="font-size:11px;padding:2px 8px;margin-left:8px;cursor:pointer"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Details</button>
+          <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="display:inline-block;margin-left:4px;text-decoration:none;font-size:11px;padding:2px 8px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg> Analytics</a>
+          <a href="#/nodes/${encodeURIComponent(n.public_key)}/reach" class="btn-primary" style="display:inline-block;margin-left:4px;text-decoration:none;font-size:11px;padding:2px 8px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Reach</a>
         </div>
         ${renderStatusExplanation(n)}
 
@@ -1410,14 +1583,14 @@
               let decoded;
               try { decoded = JSON.parse(a.decoded_json); } catch {}
               const pType = PAYLOAD_TYPES[a.payload_type] || 'Packet';
-              const icon = a.payload_type === 4 ? '📡' : a.payload_type === 5 ? '💬' : a.payload_type === 2 ? '✉️' : '📦';
+              const icon = a.payload_type === 4 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg>' : a.payload_type === 5 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chat-circle"/></svg>' : a.payload_type === 2 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-envelope"/></svg>' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg>';
               const detail = decoded?.text ? ': ' + escapeHtml(truncate(decoded.text, 50)) : decoded?.name ? ' — ' + escapeHtml(decoded.name) : '';
               const obs = a.observer_name || a.observer_id;
               return `<div class="advert-entry">
                 <span class="advert-dot" style="background:${roleColor}"></span>
                 <div class="advert-info">
                   <strong>${renderNodeTimestampHtml(a.timestamp)}</strong> ${icon} ${pType}${detail}
-                  ${a.observation_count > 1 ? ' <span class="badge badge-obs">👁 ' + a.observation_count + '</span>' : ''}
+                  ${a.observation_count > 1 ? ' <span class="badge badge-obs"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ' + a.observation_count + '</span>' : ''}
                   ${obs ? ' via ' + escapeHtml(obs) : ''}
                   ${a.snr != null ? ` · SNR ${a.snr}dB` : ''}${a.rssi != null ? ` · RSSI ${a.rssi}dBm` : ''}
                   <br><a href="#/packets/${a.hash}" class="ch-analyze-link">Analyze →</a>
@@ -1462,8 +1635,8 @@
       try {
         if (detailMap) { detailMap.remove(); detailMap = null; }
         detailMap = L.map('nodeMap', { zoomControl: false, attributionControl: false }).setView([n.lat, n.lon], 13);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18 }).addTo(detailMap);
-        L.marker([n.lat, n.lon]).addTo(detailMap).bindPopup(n.name || n.public_key.slice(0, 12));
+        _applyTilesToNodeMap(detailMap);
+        L.marker([n.lat, n.lon]).addTo(detailMap).bindPopup(escapeHtml(n.name || n.public_key.slice(0, 12)));
         setTimeout(() => detailMap.invalidateSize(), 100);
       } catch {}
     }
@@ -1602,7 +1775,7 @@
   window._nodesSortArrow = function(col) {
     var st = _getSortState();
     if (st.column !== col) return '';
-    return '<span class="sort-arrow">' + (st.direction === 'asc' ? '▲' : '▼') + '</span>';
+    return '<span class="sort-arrow">' + (st.direction === 'asc' ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-up"/></svg>' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-down"/></svg>') + '</span>';
   };
   window._nodesGetSortState = _getSortState;
   window._nodesSetSortState = function(s) {

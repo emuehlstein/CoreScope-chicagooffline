@@ -9,7 +9,8 @@
  * - prefers-reduced-motion: animation-name: none (style.css handles via media query).
  * - Singleton + cleanup: module-scoped guard; SPA re-mount must not re-show dismissed.
  * - Pull-to-refresh hint only when .pull-to-reconnect element exists in DOM.
- * - Edge-drawer hint only at viewport > 768px (where edge-swipe drawer applies).
+ * - Edge-drawer hint only at viewport <= 768px (mobile layout, where the
+ *   edge-swipe drawer is the nav UI; nav-drawer.js NARROW_MAX=768, inclusive).
  * - Row-swipe hint only on table pages: /#/packets, /#/nodes, etc.
  */
 (function () {
@@ -21,13 +22,37 @@
   window.__gestureHints1065Init = 1;
 
   var NS = 'meshcore-gesture-hints-';
+  // #1244: gesture hints are bottom-anchored pills. On /live they get
+  // buried below the absolute-positioned VCR bar (+ safe-area inset),
+  // appearing as orphan "Got it" litter visible only after scrolling.
+  // Option (a) from #1244 — disable hints on /live entirely. Swipe-nav
+  // discoverability doesn't apply on Live anyway (map drag, VCR
+  // controls, and feed all own touch).
+  function onLiveRoute() {
+    var h = location.hash || '';
+    return /^#\/live(\/|$|\?)/.test(h);
+  }
+  // #1065 follow-up: hints must only appear on touch-capable viewports.
+  // Mouse-only desktops (e.g. analyzer.00id.net opened in Chrome on a
+  // workstation) were getting "swipe a row left" tips that make no sense.
+  // Three independent probes — any positive answer counts.
+  function hasTouchCapability() {
+    try {
+      if ('ontouchstart' in window) return true;
+      if (navigator.maxTouchPoints && navigator.maxTouchPoints > 0) return true;
+      if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) return true;
+    } catch (_e) {}
+    return false;
+  }
   var HINTS = {
     'row-swipe': {
       key: NS + 'row-swipe',
       text: 'Tip: swipe a row left for quick actions.',
       relevant: function () {
+        if (!hasTouchCapability()) return false;
+        if (onLiveRoute()) return false; // #1244
         var h = location.hash || '';
-        return /^#\/(packets|nodes|live)/.test(h);
+        return /^#\/(packets|nodes|channels|observers)/.test(h);
       },
       position: 'bottom',
     },
@@ -35,6 +60,8 @@
       key: NS + 'tab-swipe',
       text: 'Tip: swipe left or right to switch tabs.',
       relevant: function () {
+        if (!hasTouchCapability()) return false;
+        if (onLiveRoute()) return false; // #1244
         return !!document.querySelector('[data-bottom-nav]');
       },
       position: 'bottom',
@@ -43,7 +70,14 @@
       key: NS + 'edge-drawer',
       text: 'Tip: swipe in from the left edge to open navigation.',
       relevant: function () {
-        return window.innerWidth > 768 && !!document.querySelector('.nav-drawer, [data-nav-drawer]');
+        if (!hasTouchCapability()) return false;
+        if (onLiveRoute()) return false; // #1244
+        // nav-drawer.js: NARROW_MAX=768; "narrow" is inclusive — narrow when
+        // width <= NARROW_MAX (nav-drawer treats width > NARROW_MAX as the
+        // non-narrow / sidebar layout). The edge-swipe drawer is the MOBILE
+        // (≤768) layout's nav UI per #1064/#1184. Above 768, the persistent
+        // sidebar is visible and no edge-swipe is needed.
+        return window.innerWidth <= 768 && !!document.querySelector('.nav-drawer, [data-nav-drawer]');
       },
       position: 'top-left',
     },
@@ -51,6 +85,8 @@
       key: NS + 'pull-refresh',
       text: 'Tip: pull down to refresh the connection.',
       relevant: function () {
+        if (!hasTouchCapability()) return false;
+        if (onLiveRoute()) return false; // #1244
         return !!document.querySelector('.pull-to-reconnect');
       },
       position: 'top',
@@ -187,6 +223,16 @@
   } else {
     init();
   }
+
+  // #1402 test hook: expose hint definitions for E2E predicate probes.
+  // Read-only by convention; tests call .relevant() to verify routing/viewport gates.
+  window.__gestureHintsDefs = HINTS;
+  // M3: freeze the hint defs to prevent tests / page scripts from mutating
+  // production state via the test hook. Shallow-freeze HINTS + each def.
+  try {
+    Object.keys(HINTS).forEach(function (id) { Object.freeze(HINTS[id]); });
+    Object.freeze(HINTS);
+  } catch (_e) {}
 
   window.GestureHints = {
     show: show,

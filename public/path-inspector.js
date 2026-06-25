@@ -119,7 +119,7 @@
       html += '<td>' + (i + 1) + '</td>';
       html += '<td class="' + (c.speculative ? 'speculative-warning' : '') + '">' +
         c.score.toFixed(3) +
-        (c.speculative ? ' <span class="speculative-badge" title="Low evidence; may be wrong">⚠</span>' : '') +
+        (c.speculative ? ' <span class="speculative-badge status-warn" title="Low evidence; may be wrong"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>' : '') +
         '</td>';
       html += '<td>' + escapeHtml(c.names.join(' → ')) + '</td>';
       html += '<td><button class="btn btn-sm" data-idx="' + i + '">Show on Map</button></td>';
@@ -197,7 +197,7 @@
   }
 
   function escapeHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   window.PathInspector = { init: init, destroy: destroy, parsePrefixes: parsePrefixes, validatePrefixes: validatePrefixes };

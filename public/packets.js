@@ -257,12 +257,34 @@
   // (multiple SlideOver opens reuse the same token; only paired with a
   // matching release on close).
   let scrollLockToken = null;
+  // #1616: open state is now tracked by a flag instead of panel.hidden.
+  // The architectural close path DETACHES panel + backdrop from the DOM
+  // (removeChild) — there is no "focused-but-hidden" intermediate state
+  // for Chromium-headless to race against. See close() below.
+  let panelOpen = false;
+  // #1616: list of pending one-shot MutationObservers (per-close-invocation)
+  // waiting for a row to re-attach so we can land focus on the new instance.
+  // Tracked so a follow-up close()/open() can disconnect any stragglers.
+  let pendingFocusObservers = [];
+
+  function disconnectFocusObservers() {
+    for (var i = 0; i < pendingFocusObservers.length; i++) {
+      try { pendingFocusObservers[i].disconnect(); } catch (_) {}
+    }
+    pendingFocusObservers = [];
+  }
 
   function ensureNodes() {
     if (panel && backdrop) return;
     backdrop = document.createElement('div');
     backdrop.className = 'slide-over-backdrop';
+    // #1616: state is data-state="open|closed"; closed nodes are DETACHED
+    // from the DOM in close() so panel.hidden never has to be true while
+    // anything inside (or the panel itself) holds focus. We keep
+    // backdrop.hidden as a defensive fallback for the brief window after
+    // ensureNodes() runs before the first open() attaches them.
     backdrop.hidden = true;
+    backdrop.setAttribute('data-state', 'closed');
     // Backdrop is decorative — assistive tech should not announce it.
     backdrop.setAttribute('aria-hidden', 'true');
     backdrop.addEventListener('click', function () { close(); });
@@ -277,11 +299,12 @@
     // is the actual title rendered into the panel.
     panel.setAttribute('aria-labelledby', 'slideOverTitle');
     panel.hidden = true;
+    panel.setAttribute('data-state', 'closed');
     panel.tabIndex = -1;
     panel.innerHTML =
       '<div class="slide-over-header">' +
         '<h3 class="slide-over-title" id="slideOverTitle"></h3>' +
-        '<button type="button" class="slide-over-close" aria-label="Close detail (Esc)" title="Close">✕</button>' +
+        '<button type="button" class="slide-over-close" aria-label="Close detail (Esc)" title="Close"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button>' +
       '</div>' +
       '<div class="slide-over-content"></div>';
     panel.querySelector('.slide-over-close').addEventListener('mousedown', function (e) {
@@ -315,8 +338,10 @@
         try { first.focus(); } catch {}
       }
     });
-    document.body.appendChild(backdrop);
-    document.body.appendChild(panel);
+    // #1616: do NOT attach panel + backdrop to <body> on ensureNodes().
+    // They are appended in open() and removed in close() so the closed
+    // state is "not in the DOM" — Chromium-headless cannot land focus on
+    // something that isn't there.
 
     // Single Escape handler shared across all uses.
     document.addEventListener('keydown', function (e) {
@@ -352,7 +377,10 @@
   }
 
   function isOpen() {
-    return !!(panel && !panel.hidden);
+    // #1616: open state is the panelOpen flag, NOT (!panel.hidden).
+    // When closed the panel is DETACHED from <body>, so a `.hidden`
+    // check on a node nothing roots to <body> is meaningless.
+    return panelOpen;
   }
 
   function open(opts) {
@@ -365,6 +393,10 @@
     // prior close() can detect that a newer open has happened and skip
     // its stale focus-restore.
     openSeq++;
+    // #1616: a fresh open() invalidates any pending focus-observers
+    // from a recent close() — disconnect them so they can't land a
+    // stale focus on row A after row B has opened.
+    disconnectFocusObservers();
     closeCb = typeof opts.onClose === 'function' ? opts.onClose : null;
     // If the caller passes restoreFocus(), it owns lookup at close-time —
     // useful when the caller re-renders the row table (which would detach
@@ -382,8 +414,16 @@
     title.textContent = opts.title || 'Detail';
     content = panel.querySelector('.slide-over-content');
     content.innerHTML = '';
+    // #1616: ATTACH panel + backdrop now. They were removed (or never
+    // appended) by the prior close(). Order matters — backdrop first so
+    // it sits beneath the panel in source/paint order.
+    if (backdrop.parentNode !== document.body) document.body.appendChild(backdrop);
+    if (panel.parentNode !== document.body) document.body.appendChild(panel);
     backdrop.hidden = false;
     panel.hidden = false;
+    backdrop.setAttribute('data-state', 'open');
+    panel.setAttribute('data-state', 'open');
+    panelOpen = true;
     // Focus the close button so Esc/Enter works without an extra tab.
     const x = panel.querySelector('.slide-over-close');
     if (x) try { x.focus(); } catch {}
@@ -391,9 +431,7 @@
   }
 
   function close() {
-    if (!panel || panel.hidden) return;
-    panel.hidden = true;
-    if (backdrop) backdrop.hidden = true;
+    if (!panel || !panelOpen) return;
     // #1168 Munger #3: release the ref-counted scroll-lock token.
     if (scrollLockToken != null) {
       window.__scrollLock.release(scrollLockToken);
@@ -401,42 +439,140 @@
     }
     const cb = closeCb;
     closeCb = null;
-    if (content) content.innerHTML = '';
-    // Restore focus to whatever opened us (typically the table row), so
-    // keyboard users don't get dumped at the top of the document.
-    let toFocus = prevFocus;
     const resolver = prevFocusResolver;
+    let toFocus = prevFocus;
     prevFocus = null;
     prevFocusResolver = null;
-    // #1168 Munger #1: capture the open-sequence at close-time. If a NEW
-    // open() happens before our deferred rAF fires, openSeq will have
-    // advanced past this value and the stale rAF must no-op (otherwise
-    // it would steal focus back to row A's originating row AFTER row B
-    // is open — clobbering B's focus).
     const seqAtClose = openSeq;
+
+    // Fire the user's onClose BEFORE we touch focus. Callers typically
+    // re-render the originating table inside cb() (e.g. clearing the
+    // selected row state), which detaches the originating <tr>; we
+    // intentionally re-look-up via the resolver below.
     if (cb) try { cb(); } catch {}
-    // Resolver runs AFTER cb (cb may re-render the table and reattach the row).
+
+    // Resolve the focus target by DATA-VALUE LOOKUP AT RESTORE TIME.
+    // #1616: no captured-element-ref path — if cb() re-rendered the
+    // tbody, the captured prevFocus is now an orphaned node detached
+    // from the document, and Chromium-headless will silently swallow
+    // a .focus() call on it (activeElement falls back to <body>).
     if (resolver) {
       try {
         const resolved = resolver();
         if (resolved) toFocus = resolved;
-      } catch {}
+      } catch (_) {}
     }
+
+    // #1616 (architectural): SYNCHRONOUSLY focus the target row BEFORE
+    // the panel/backdrop are detached. This eliminates the
+    // focused-but-hidden intermediate state Chromium-headless reasons
+    // about non-deterministically. If activeElement is inside the panel
+    // when the panel detaches, focus drops to <body>; landing focus on
+    // the row first means the detach is a no-op for the active element.
+    // The deferred microtask + rAF + observer chain below handles the
+    // case where cb() queued an async re-render that detaches this row.
     if (toFocus && typeof toFocus.focus === 'function' && document.body.contains(toFocus)) {
-      // Defer to next microtask + rAF so the focus call lands AFTER any
-      // event-handler bookkeeping (e.g. an Escape keydown chain that would
-      // otherwise see focus snap back to <body> as the key event unwinds).
-      const target = toFocus;
-      const tryFocus = function () {
-        // Munger #1: bail if a newer open() has happened since close-time.
-        if (openSeq !== seqAtClose) return;
-        if (document.body.contains(target)) {
-          try { target.focus(); } catch {}
-        }
-      };
-      tryFocus();
-      requestAnimationFrame(tryFocus);
+      try { toFocus.focus({ preventScroll: true }); } catch (_) {}
     }
+
+    // DETACH panel + backdrop. After this point, there is no "panel
+    // node sitting hidden in the document tree" for Chromium to race
+    // a stale blur against.
+    panelOpen = false;
+    panel.setAttribute('data-state', 'closed');
+    backdrop.setAttribute('data-state', 'closed');
+    if (content) content.innerHTML = '';
+    panel.hidden = true;
+    backdrop.hidden = true;
+    if (panel.parentNode) panel.parentNode.removeChild(panel);
+    if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+
+    // If sync focus landed: schedule a microtask re-check. The
+    // caller's cb() may have queued an ASYNC re-render (microtask
+    // or rAF) that detaches the row AFTER our sync focus() — in that
+    // case activeElement falls to <body> AFTER this function returns,
+    // and we need a second-pass focus restore. queueMicrotask() runs
+    // AFTER any Promise.resolve().then(...) the caller queued from
+    // inside cb() (FIFO microtask queue), so re-resolving here picks
+    // up the NEW row instance.
+    if (!resolver) {
+      // No resolver = no second-pass capability; best-effort done.
+      return;
+    }
+
+    // Always run the deferred re-check pass, even if sync focus
+    // appeared to land — it may be on a soon-to-be-detached orphan.
+    function deferredRecheck() {
+      // Stale guard — newer open() bumped openSeq; bail.
+      if (openSeq !== seqAtClose) return;
+      // If focus already landed on something non-body that matches
+      // the resolver, we're done.
+      let fresh = null;
+      try { fresh = resolver(); } catch (_) {}
+      if (fresh && document.body.contains(fresh)) {
+        if (document.activeElement === fresh) return;
+        try { fresh.focus({ preventScroll: true }); } catch (_) {}
+        if (document.activeElement === fresh) return;
+      }
+      // Still not landed. Attach a one-shot MutationObserver rooted
+      // at document.body — broader than the prior tbody-rooted
+      // observer (which fails when the tbody itself is innerHTML-
+      // swapped), still bounded by a short timeout below.
+      attachBodyObserver();
+    }
+
+    function attachBodyObserver() {
+      const obs = new MutationObserver(function () {
+        if (openSeq !== seqAtClose) {
+          obs.disconnect();
+          const idx = pendingFocusObservers.indexOf(obs);
+          if (idx >= 0) pendingFocusObservers.splice(idx, 1);
+          return;
+        }
+        let target = null;
+        try { target = resolver(); } catch (_) {}
+        if (!target || !document.body.contains(target)) return;
+        try { target.focus({ preventScroll: true }); } catch (_) {}
+        if (document.activeElement === target) {
+          obs.disconnect();
+          const idx = pendingFocusObservers.indexOf(obs);
+          if (idx >= 0) pendingFocusObservers.splice(idx, 1);
+        }
+      });
+      // #1616 followup: root = document.body. The prior 'smart' tbody
+      // root logic broke when cb() replaced the entire tbody via
+      // innerHTML — the observer was watching a node that no longer
+      // received the mutation we cared about. document.body is broader
+      // but correctly catches the re-attachment in all known callsites
+      // (nodes/packets/observers all swap rows under tbody under body).
+      obs.observe(document.body, { childList: true, subtree: true });
+      pendingFocusObservers.push(obs);
+      // Tight timeout — 200ms is enough for any sync or microtask/rAF
+      // re-render to commit. Longer (e.g. the prior 2s) creates new
+      // races where the observer fires AFTER a subsequent open() and
+      // steals focus from row B back to row A.
+      setTimeout(function () {
+        obs.disconnect();
+        const idx = pendingFocusObservers.indexOf(obs);
+        if (idx >= 0) pendingFocusObservers.splice(idx, 1);
+      }, 200);
+    }
+
+    // Step 1: microtask — runs AFTER cb's Promise.resolve().then(...)
+    // re-renders, BEFORE next animation frame. Catches the common
+    // async-render path.
+    queueMicrotask(function () {
+      if (openSeq !== seqAtClose) return;
+      let fresh = null;
+      try { fresh = resolver(); } catch (_) {}
+      if (fresh && document.body.contains(fresh)
+          && document.activeElement !== fresh) {
+        try { fresh.focus({ preventScroll: true }); } catch (_) {}
+      }
+      // Step 2: rAF — runs after layout commits. Catches re-renders
+      // that wait on rAF or that resolve only after style/layout work.
+      requestAnimationFrame(deferredRecheck);
+    });
   }
 
   // If the viewport grows past the breakpoint while open, close the slide-over
@@ -464,6 +600,75 @@
     const o = observerMap.get(id);
     if (!o) return id;
     return o.iata ? `${o.name} (${o.iata})` : o.name;
+  }
+  // Compact IATA pill (#1188) — renders next to observer name. Prefers
+  // packet.observer_iata (now joined on the server) and falls back to the
+  // observer lookup map for callers that haven't been updated yet.
+  function obsIataBadge(packet) {
+    if (!packet) return '';
+    let iata = packet.observer_iata;
+    if (!iata) {
+      const o = packet.observer_id ? observerMap.get(packet.observer_id) : null;
+      iata = o && o.iata;
+    }
+    return iata ? `<span class="badge-iata">${escapeHtml(iata)}</span>` : '';
+  }
+  // Plain observer name without the trailing IATA — used when the IATA is
+  // rendered separately as a badge (so the cell doesn't show "Name (SJC) SJC").
+  function obsNameOnly(id) {
+    if (!id) return '—';
+    const o = observerMap.get(id);
+    if (!o) return id;
+    return o.name;
+  }
+  // #1189 R1 mesh-operator feedback: in a grouped row the old cell showed ONE
+  // observer's IATA + `+N` — operators couldn't tell whether the N additional
+  // observers were SAME-region (redundant copies) or CROSS-region (interesting
+  // multi-site reception). This helper returns the cell's badge HTML showing
+  // the DISTINCT IATA set: `<badge>SJC</badge>` or `<badge>SJC</badge><badge>SFO</badge>+1`
+  // (capped at 2 visible, remainder rolled into +N of distinct-region count).
+  // Returns '' when no observer in the group carries any IATA.
+  //
+  // #1189 R2: source of truth is `p.distinct_iatas` from the server
+  // (added to /api/packets?groupByHash=true so the default collapsed view
+  // works without needing to expand a row). Falls back to walking
+  // p._children + observerMap for legacy callers and for client-side groups
+  // synthesised by the websocket appender.
+  function groupedObserverIataBadgesHtml(p) {
+    if (!p) return '';
+    const seen = new Set();
+    // R2 happy path: server-provided distinct_iatas.
+    if (Array.isArray(p.distinct_iatas)) {
+      for (const code of p.distinct_iatas) {
+        if (code) seen.add(String(code).toUpperCase());
+      }
+    }
+    // Fallback / supplement: walk header + children (covers in-memory groups
+    // built client-side from websocket events before any server round-trip).
+    if (!seen.size) {
+      const pushIata = (rec) => {
+        if (!rec) return;
+        let iata = rec.observer_iata;
+        if (!iata && rec.observer_id) {
+          const o = observerMap.get(rec.observer_id);
+          iata = o && o.iata;
+        }
+        if (iata) seen.add(String(iata).toUpperCase());
+      };
+      pushIata(p);
+      if (p._children && p._children.length) {
+        for (const c of p._children) pushIata(c);
+      }
+    }
+    if (!seen.size) return '';
+    const list = Array.from(seen).sort();
+    const visible = list.slice(0, 2);
+    const extra = list.length - visible.length;
+    let html = visible
+      .map(code => `<span class="badge-iata">${escapeHtml(code)}</span>`)
+      .join('');
+    if (extra > 0) html += ` +${extra}`;
+    return html;
   }
   let selectedId = null;
   function _isColorByHash() { return localStorage.getItem('meshcore-color-packets-by-hash') !== 'false'; }
@@ -497,11 +702,11 @@
 
   var DEFAULT_TIME_WINDOW = 15;
 
-  function buildPacketsQuery(timeWindowMin, regionParam) {
+  function buildPacketsQuery(timeWindowMin, regionParam, skipHash) {
     var parts = [];
     if (timeWindowMin && timeWindowMin !== DEFAULT_TIME_WINDOW) parts.push('timeWindow=' + timeWindowMin);
     if (regionParam) parts.push('region=' + encodeURIComponent(regionParam));
-    if (filters.hash) parts.push('hash=' + encodeURIComponent(filters.hash));
+    if (!skipHash && filters.hash) parts.push('hash=' + encodeURIComponent(filters.hash));
     if (filters.node) parts.push('node=' + encodeURIComponent(filters.node));
     if (filters.observer) parts.push('observer=' + encodeURIComponent(filters.observer));
     if (filters.channel) parts.push('channel=' + encodeURIComponent(filters.channel));
@@ -524,7 +729,9 @@
     var subpath = '';
     var m = cur.match(/^#\/packets(\/[^?]*)?/);
     if (m && m[1]) subpath = m[1];
-    history.replaceState(null, '', '#/packets' + subpath + buildPacketsQuery(savedTimeWindowMin, RegionFilter.getRegionParam()));
+    // Don't double-encode filters.hash when it's already the path segment.
+    var skipHash = !!(filters.hash && subpath === '/' + filters.hash);
+    history.replaceState(null, '', '#/packets' + subpath + buildPacketsQuery(savedTimeWindowMin, RegionFilter.getRegionParam(), skipHash));
     // Update clear-filters button visibility
     var cb = document.getElementById('clearFiltersBtn');
     if (cb) {
@@ -555,7 +762,7 @@
     });
   }
   const PANEL_WIDTH_KEY = 'meshcore-panel-width';
-  const PANEL_CLOSE_HTML = '<button class="panel-close-btn" title="Close detail pane (Esc)">✕</button>';
+  const PANEL_CLOSE_HTML = '<button class="panel-close-btn" title="Close detail pane (Esc)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button>';
 
   // getParsedPath / getParsedDecoded are in shared packet-helpers.js (loaded before this file)
   const getParsedPath = window.getParsedPath;
@@ -696,7 +903,7 @@
     if (!HopResolver.ready()) {
       try {
         const [nodeData, obsData, coordData] = await Promise.all([
-          api('/nodes?limit=2000', { ttl: 60000 }),
+          fetchAllNodes('', { ttl: 60000 }),
           api('/observers', { ttl: 60000 }),
           api('/iata-coords', { ttl: 300000 }).catch(() => ({ coords: {} })),
         ]);
@@ -704,7 +911,11 @@
           observers: obsData.observers || obsData || [],
           iataCoords: coordData.coords || {},
         });
-      } catch {}
+      } catch (e) {
+        // Non-fatal: hops will render as unresolved hex prefixes until a later
+        // call succeeds. Log so a paginated /api/nodes failure isn't silent.
+        console.warn('[packets] HopResolver init failed:', e);
+      }
     }
   }
 
@@ -787,7 +998,7 @@
     }
     const f = formatTimestampWithTooltip(isoString, getTimestampMode());
     const warn = f.isFuture
-      ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed">⚠️</span>'
+      ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>'
       : '';
     return `<span class="timestamp-text" title="${escapeHtml(f.tooltip)}">${escapeHtml(f.text)}</span>${warn}`;
   }
@@ -896,7 +1107,9 @@
         packetsPaused = !packetsPaused;
         const pauseBtn = document.getElementById('pktPauseBtn');
         if (pauseBtn) {
-          pauseBtn.textContent = packetsPaused ? '▶' : '⏸';
+          // #1648 M4: Phosphor sprite glyph for play/pause (was ▶/⏸). // EMOJI-OK: comment
+          pauseBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#' +
+            (packetsPaused ? 'ph-play' : 'ph-pause') + '"/></svg>';
           pauseBtn.title = packetsPaused ? 'Resume live updates' : 'Pause live updates';
           pauseBtn.classList.toggle('active', packetsPaused);
         }
@@ -944,7 +1157,7 @@
         pauseBuffer.push(...msgs);
         if (pauseBuffer.length > 2000) pauseBuffer = pauseBuffer.slice(-2000);
         const btn = document.getElementById('pktPauseBtn');
-        if (btn) btn.textContent = '▶ ' + pauseBuffer.length;
+        if (btn) btn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-play"/></svg> ' + pauseBuffer.length;
         return;
       }
       const newPkts = msgs
@@ -1104,7 +1317,7 @@
   // suppresses ALL other filters (region, time window, observer, node,
   // channel). The user is asking for THAT packet regardless of saved
   // selections.
-  function buildPacketsParams({ filters, regionParam, windowMin, groupByHash, limit }) {
+  function buildPacketsParams({ filters, regionParam, areaParam, windowMin, groupByHash, limit }) {
     const params = new URLSearchParams();
     if (filters.hash) {
       params.set('hash', filters.hash);
@@ -1122,6 +1335,7 @@
     }
     params.set('limit', String(limit));
     if (regionParam) params.set('region', regionParam);
+    if (areaParam) params.set('area', areaParam);
     if (filters.node) params.set('node', filters.node);
     if (filters.observer) params.set('observer', filters.observer);
     if (filters.channel) params.set('channel', filters.channel);
@@ -1140,6 +1354,7 @@
       const params = buildPacketsParams({
         filters,
         regionParam: RegionFilter.getRegionParam(),
+        areaParam: AreaFilter.getAreaParam(),
         windowMin,
         groupByHash,
         limit: PACKET_LIMIT,
@@ -1253,12 +1468,12 @@
       <div class="page-header">
         <h2>Latest Packets <span class="count">(${totalCount})</span></h2>
         <div>
-          <button class="btn-icon" data-action="pkt-refresh" title="Refresh">🔄</button>
-          <button class="btn-icon" id="pktPauseBtn" data-action="pkt-pause" title="Pause live updates">⏸</button>
-          <button class="btn-icon" data-action="pkt-byop" title="Bring Your Own Packet" aria-label="Bring Your Own Packet - paste raw packet hex for analysis" aria-haspopup="dialog">📦 BYOP</button>
+          <button class="btn-icon" data-action="pkt-refresh" title="Refresh" aria-label="Refresh"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-arrow-clockwise"/></svg></button>
+          <button class="btn-icon" id="pktPauseBtn" data-action="pkt-pause" title="Pause live updates" aria-label="Pause live updates"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-pause"/></svg></button>
+          <button class="btn-icon" data-action="pkt-byop" title="Bring Your Own Packet" aria-label="Bring Your Own Packet - paste raw packet hex for analysis" aria-haspopup="dialog"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg> BYOP</button>
         </div>
       </div>
-      <div class="filter-group" style="flex:1;margin-bottom:8px;position:relative">
+      <div class="filter-group pkt-filter-expr" style="flex:1;margin-bottom:8px;position:relative">
         <input type="text" id="packetFilterInput" class="packet-filter-input"
           placeholder='Filter: type == Advert && snr > 5 · payload.name contains "Gilroy"'
           aria-label="Packet filter expression"
@@ -1270,7 +1485,7 @@
         <button class="btn filter-toggle-btn" id="filterToggleBtn">Filters ▾</button>
         <!-- #1124 (MAJOR-3) Group 1: Filter input + Clear -->
         <div class="filter-group filter-group-clear">
-          <button class="btn btn-clear-filters" id="clearFiltersBtn" title="Clear all filters" style="display:none;font-size:12px;padding:2px 8px;color:var(--text-muted);border:1px solid var(--border);border-radius:4px;background:transparent;cursor:pointer">✕ Clear</button>
+          <button class="btn btn-clear-filters" id="clearFiltersBtn" title="Clear all filters" style="display:none;font-size:12px;padding:2px 8px;color:var(--text-muted);border:1px solid var(--border);border-radius:4px;background:transparent;cursor:pointer"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg> Clear</button>
         </div>
         <!-- Group 2: Quick filters (hash, node name) -->
         <div class="filter-group filter-group-quick">
@@ -1280,13 +1495,13 @@
             <div class="node-filter-dropdown hidden" id="fNodeDropdown" role="listbox"></div>
           </div>
         </div>
-        <!-- Group 3: Quick toggles (time range, Group by Hash, ★ My Nodes)
+        <!-- Group 3: Quick toggles (time range, Group by Hash, My Nodes)
              — #1128 Bug 5: placed BEFORE the Observer/Region/Type/Channel
              dropdowns so the most-frequently-used controls sit next to
              the search input where the eye lands first. -->
         <div class="filter-group filter-group-toggles">
           <button class="btn ${groupByHash ? 'active' : ''}" id="fGroup" title="Collapse duplicate observations of the same packet into expandable groups">Group by Hash</button>
-          <button class="btn" id="fMyNodes" title="Show only packets from your favorited/claimed nodes">★ My Nodes</button>
+          <button class="btn" id="fMyNodes" title="Show only packets from your favorited/claimed nodes"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg> My Nodes</button>
           <select id="fTimeWindow" class="filter-select" aria-label="Time window filter">
             <option value="15">Last 15 min</option>
             <option value="30">Last 30 min</option>
@@ -1305,6 +1520,7 @@
             <div class="multi-select-menu" id="observerMenu"></div>
           </div>
           <div id="packetsRegionFilter" class="region-filter-container" style="display:inline-block;vertical-align:middle"></div>
+          <div id="packetsAreaFilter" style="display:none;vertical-align:middle"></div>
           <div class="multi-select-wrap" id="typeFilterWrap">
             <button class="multi-select-trigger" id="typeTrigger" title="Filter by packet type">All Types ▾</button>
             <div class="multi-select-menu" id="typeMenu"></div>
@@ -1330,11 +1546,12 @@
           <button class="btn btn-icon${showHexHashes ? ' active' : ''}" id="hexHashToggle" title="Show raw hex hash prefixes instead of resolved node names in the path column">Hex Paths</button>
         </div>
       </div>
+      <div class="path-symbols-legend-wrapper">${(window.HopDisplay && HopDisplay.renderPathSymbolsLegend) ? HopDisplay.renderPathSymbolsLegend() : ''}</div>
       <div class="table-fluid-wrap"><table class="data-table" id="pktTable">
         <thead><tr>
-          <th scope="col" data-priority="1"></th><th scope="col" class="col-region" data-sort-key="region" data-priority="3">Region</th><th scope="col" class="col-time" data-sort-key="time" data-type="date" data-priority="1">Time</th><th scope="col" class="col-hash" data-sort-key="hash" data-priority="1">Hash</th><th scope="col" class="col-size" data-sort-key="size" data-type="numeric" data-priority="4">Size</th>
+          <th scope="col" class="col-expand" data-priority="1"></th><th scope="col" class="col-region" data-sort-key="region" data-priority="3">Region</th><th scope="col" class="col-time" data-sort-key="time" data-type="date" data-priority="1">Time</th><th scope="col" class="col-hash" data-sort-key="hash" data-priority="3">Hash</th><th scope="col" class="col-size" data-sort-key="size" data-type="numeric" data-priority="4">Size</th>
           <th scope="col" class="col-hashsize" data-sort-key="hb" data-type="numeric" data-priority="5">HB</th>
-          <th scope="col" class="col-type" data-sort-key="type" data-priority="1">Type</th><th scope="col" class="col-observer" data-sort-key="observer" data-priority="3">Observer</th><th scope="col" class="col-path" data-sort-key="path" data-priority="2">Path</th><th scope="col" class="col-rpt" data-sort-key="rpt" data-type="numeric" data-priority="4">Rpt</th><th scope="col" class="col-details" data-priority="2">Details</th>
+          <th scope="col" class="col-type" data-sort-key="type" data-priority="1">Type</th><th scope="col" class="col-observer" data-sort-key="observer" data-priority="3">Observer</th><th scope="col" class="col-path" data-sort-key="path" data-priority="5">Path</th><th scope="col" class="col-rpt" data-sort-key="rpt" data-type="numeric" data-priority="3">Rpt</th><th scope="col" class="col-details" data-priority="1">Details</th>
         </tr></thead>
         <tbody id="pktBody"></tbody>
       </table></div>
@@ -1342,11 +1559,13 @@
 
     // Init shared RegionFilter component
     RegionFilter.init(document.getElementById('packetsRegionFilter'), { dropdown: true });
+    AreaFilter.init(document.getElementById('packetsAreaFilter'));
     if (_pendingUrlRegion) {
       RegionFilter.setSelected(_pendingUrlRegion.split(',').filter(Boolean));
       _pendingUrlRegion = null;
     }
     RegionFilter.onChange(function() { updatePacketsUrl(); loadPackets(); });
+    AreaFilter.onChange(function() { updatePacketsUrl(); loadPackets(); });
 
     // --- Packet Filter Language ---
     (function() {
@@ -1416,7 +1635,7 @@
       let html = `<label class="multi-select-item"><input type="checkbox" data-obs-id="__all__" ${allChecked ? 'checked' : ''}> All Observers</label>`;
       for (const o of observers) {
         const checked = selectedObservers.has(String(o.id)) ? 'checked' : '';
-        html += `<label class="multi-select-item"><input type="checkbox" data-obs-id="${o.id}" ${checked}> ${o.name || o.id}</label>`;
+        html += `<label class="multi-select-item"><input type="checkbox" data-obs-id="${o.id}" ${checked}> ${escapeHtml(o.name || o.id)}</label>`;
       }
       obsMenu.innerHTML = html;
     }
@@ -1713,7 +1932,10 @@
       { key: 'details', label: 'Details' },
     ];
     const isNarrow = window.innerWidth <= 640;
-    const defaultHidden = isNarrow ? ['region', 'hash', 'observer', 'path', 'rpt', 'size'] : ['region'];
+    // #1249: observer column must stay visible at narrow widths so the IATA
+    // badge (#1188) renders on mobile. Without observer in scope the user
+    // can't see who heard the packet at all.
+    const defaultHidden = isNarrow ? ['region', 'hash', 'path', 'rpt', 'size'] : ['region'];
     let visibleCols;
     try {
       visibleCols = JSON.parse(localStorage.getItem('packets-visible-cols'));
@@ -1860,7 +2082,14 @@
           }
         }
         else if (action === 'select-hash') pktSelectHash(value);
-        else if (action === 'toggle-select') { pktToggleGroup(value); pktSelectHash(value); }
+        else if (action === 'toggle-select') {
+          // #1486: pktToggleGroup() already opens the detail panel on EXPAND
+          // (via selectPacket()), and must NOT open it on COLLAPSE. The
+          // previously-unconditional pktSelectHash() trailing call was both
+          // redundant on expand AND reopened the panel the operator had just
+          // closed when they clicked the chevron to collapse — drop it.
+          pktToggleGroup(value);
+        }
       };
       pktBody.addEventListener('click', handler);
       pktBody.addEventListener('keydown', handler);
@@ -1930,7 +2159,8 @@
     const groupTypeName = payloadTypeName(p.payload_type);
     const groupTypeClass = payloadTypeColor(p.payload_type);
     const groupSize = p.raw_hex ? Math.floor(p.raw_hex.length / 2) : 0;
-    const groupHashBytes = ((parseInt(p.raw_hex?.slice(2, 4), 16) || 0) >> 6) + 1;
+    const _grpPlOff = getPathLenOffset(p.route_type);
+    const groupHashBytes = ((parseInt(p.raw_hex?.slice(_grpPlOff * 2, _grpPlOff * 2 + 2), 16) || 0) >> 6) + 1;
     const isSingle = p.count <= 1;
     // Channel color highlighting (#271)
     const _grpDecoded = getParsedDecoded(p) || {};
@@ -1938,16 +2168,16 @@
     const _grpHashStripe = _hashStripeStyle(p.hash);
     const _grpStyle = _grpHashStripe + _grpChanStyle;
     let html = `<tr class="${isSingle ? '' : 'group-header'} ${isExpanded ? 'expanded' : ''}" data-hash="${p.hash}" data-action="${isSingle ? 'select-hash' : 'toggle-select'}" data-value="${p.hash}" data-entry-idx="${entryIdx}" tabindex="0" role="row"${_grpStyle ? ' style="' + _grpStyle + '"' : ''}>
-          <td style="width:28px;text-align:center;cursor:pointer">${isSingle ? '' : (isExpanded ? '▼' : '▶')}</td>
+          <td class="col-expand" style="text-align:center;cursor:pointer">${isSingle ? '' : (isExpanded ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-down"/></svg>' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-up"/></svg>')}</td>
           <td class="col-region">${groupRegion ? `<span class="badge-region">${groupRegion}</span>` : '—'}</td>
           <td class="col-time">${renderTimestampCell(p.latest)}</td>
           <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(p.hash || '')}">${truncate(p.hash || '—', 8)}</td>
           <td class="col-size" data-filter-field="size" data-filter-value="${groupSize || ''}">${groupSize ? groupSize + 'B' : '—'}</td>
           <td class="col-hashsize mono">${groupHashBytes}</td>
           <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(groupTypeName || '')}">${p.payload_type != null ? `<span class="badge badge-${groupTypeClass}">${groupTypeName}</span>${transportBadge(p.route_type)}` : '—'}</td>
-          <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsName(headerObserverId) || '')}">${isSingle ? truncate(obsName(headerObserverId), 16) : truncate(obsName(headerObserverId), 10) + (p.observer_count > 1 ? ' +' + (p.observer_count - 1) : '')}</td>
+          <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsNameOnly(headerObserverId) || '')}">${isSingle ? escapeHtml(truncate(obsNameOnly(headerObserverId), 16)) + obsIataBadge(p) : escapeHtml(truncate(obsNameOnly(headerObserverId), 10)) + groupedObserverIataBadgesHtml(p)}</td>
           <td class="col-path"><span class="path-hops">${groupPathStr}</span></td>
-          <td class="col-rpt">${p.observation_count > 1 ? '<span class="badge badge-obs" title="Seen ' + p.observation_count + ' times">👁 ' + p.observation_count + '</span>' : (isSingle ? '' : p.count)}</td>
+          <td class="col-rpt">${p.observation_count > 1 ? '<span class="badge badge-obs" title="Seen ' + p.observation_count + ' times"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> ' + p.observation_count + '</span>' : (isSingle ? '' : p.count)}</td>
           <td class="col-details">${getDetailPreview(getParsedDecoded(p))}</td>
         </tr>`;
     if (isExpanded && p._children) {
@@ -1959,19 +2189,22 @@
         const typeName = payloadTypeName(c.payload_type);
         const typeClass = payloadTypeColor(c.payload_type);
         const size = c.raw_hex ? Math.floor(c.raw_hex.length / 2) : 0;
-        const childHashBytes = ((parseInt(c.raw_hex?.slice(2, 4), 16) || 0) >> 6) + 1;
-        const childRegion = c.observer_id ? (observerMap.get(c.observer_id)?.iata || '') : '';
         const childPath = getParsedPath(c);
+        const _cPlOff = getPathLenOffset(p.route_type);
+        const childHashBytes = c.raw_hex
+          ? (((parseInt(c.raw_hex.slice(_cPlOff * 2, _cPlOff * 2 + 2), 16) || 0) >> 6) + 1)
+          : (childPath.length > 0 ? childPath[0].length / 2 : 0);
+        const childRegion = c.observer_id ? (observerMap.get(c.observer_id)?.iata || '') : '';
         const childPathStr = renderPath(childPath, c.observer_id);
         const _childHashStripe = _hashStripeStyle(c.hash || p.hash);
         html += `<tr class="group-child" data-id="${c.id}" data-hash="${c.hash || ''}" data-action="select-observation" data-value="${c.id}" data-parent-hash="${p.hash}" data-entry-idx="${entryIdx}" tabindex="0" role="row"${_childHashStripe ? ' style="' + _childHashStripe + '"' : ''}>
-              <td></td><td class="col-region">${childRegion ? `<span class="badge-region">${childRegion}</span>` : '—'}</td>
+              <td class="col-expand"></td><td class="col-region">${childRegion ? `<span class="badge-region">${childRegion}</span>` : '—'}</td>
               <td class="col-time">${renderTimestampCell(c.timestamp)}</td>
               <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(c.hash || '')}">${truncate(c.hash || '', 8)}</td>
               <td class="col-size" data-filter-field="size" data-filter-value="${size || ''}">${size}B</td>
               <td class="col-hashsize mono">${childHashBytes}</td>
               <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(typeName || '')}"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(c.route_type)}</td>
-              <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsName(c.observer_id) || '')}">${truncate(obsName(c.observer_id), 16)}</td>
+              <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsNameOnly(c.observer_id) || '')}">${escapeHtml(truncate(obsNameOnly(c.observer_id), 16))}${obsIataBadge(c)}</td>
               <td class="col-path"><span class="path-hops">${childPathStr}</span></td>
               <td class="col-rpt"></td>
               <td class="col-details">${getDetailPreview(getParsedDecoded(c))}</td>
@@ -1991,19 +2224,20 @@
     // Channel color highlighting (#271)
     const _chanStyle = window.ChannelColors ? window.ChannelColors.getRowStyle(decoded.type || typeName, decoded.channel) : '';
     const size = p.raw_hex ? Math.floor(p.raw_hex.length / 2) : 0;
-    const hashBytes = ((parseInt(p.raw_hex?.slice(2, 4), 16) || 0) >> 6) + 1;
+    const _flatPlOff = getPathLenOffset(p.route_type);
+    const hashBytes = ((parseInt(p.raw_hex?.slice(_flatPlOff * 2, _flatPlOff * 2 + 2), 16) || 0) >> 6) + 1;
     const pathStr = renderPath(pathHops, p.observer_id);
     const detail = getDetailPreview(decoded);
     const _flatHashStripe = _hashStripeStyle(p.hash);
     const _flatStyle = _flatHashStripe + _chanStyle;
     return `<tr data-id="${p.id}" data-hash="${p.hash || ''}" data-action="select-hash" data-value="${p.hash || p.id}" data-entry-idx="${entryIdx}" tabindex="0" role="row" class="${selectedId === p.id ? 'selected' : ''}"${_flatStyle ? ' style="' + _flatStyle + '"' : ''}>
-        <td></td><td class="col-region">${region ? `<span class="badge-region">${region}</span>` : '—'}</td>
+        <td class="col-expand"></td><td class="col-region">${region ? `<span class="badge-region">${region}</span>` : '—'}</td>
         <td class="col-time">${renderTimestampCell(p.timestamp)}</td>
         <td class="mono col-hash" data-filter-field="hash" data-filter-value="${escapeHtml(p.hash || '')}">${truncate(p.hash || String(p.id), 8)}</td>
         <td class="col-size" data-filter-field="size" data-filter-value="${size || ''}">${size}B</td>
         <td class="col-hashsize mono">${hashBytes}</td>
         <td class="col-type" data-filter-field="type" data-filter-value="${escapeHtml(typeName || '')}"><span class="badge badge-${typeClass}">${typeName}</span>${transportBadge(p.route_type)}</td>
-        <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsName(p.observer_id) || '')}">${truncate(obsName(p.observer_id), 16)}</td>
+        <td class="col-observer" data-filter-field="observer" data-filter-value="${escapeHtml(obsNameOnly(p.observer_id) || '')}">${escapeHtml(truncate(obsNameOnly(p.observer_id), 16))}${obsIataBadge(p)}</td>
         <td class="col-path"><span class="path-hops">${pathStr}</span></td>
         <td class="col-rpt"></td>
         <td class="col-details">${detail}</td>
@@ -2508,31 +2742,31 @@
     if (decoded.type === 'CHAN' && decoded.text) {
       const ch = decoded.channel ? `<span class="chan-tag">${escapeHtml(decoded.channel)}</span> ` : '';
       const t = decoded.text.length > 80 ? decoded.text.slice(0, 80) + '…' : decoded.text;
-      return `${ch}💬 ${escapeHtml(t)}`;
+      return `${ch}<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chat-circle"/></svg> ${escapeHtml(t)}`;
     }
     // Advertisements — show node name and role
     if (decoded.type === 'ADVERT' && decoded.name) {
-      const role = decoded.flags?.repeater ? '📡' : decoded.flags?.room ? '🏠' : decoded.flags?.sensor ? '🌡' : '📻';
+      const role = decoded.flags?.repeater ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg>' : decoded.flags?.room ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-house-line"/></svg>' : decoded.flags?.sensor ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-thermometer"/></svg>' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-radio"/></svg>';
       return `${role} <a href="#/nodes/${encodeURIComponent(decoded.pubKey)}" class="hop-link hop-named" data-hop-link="true">${escapeHtml(decoded.name)}</a>`;
     }
     // Undecrypted channel messages — show channel hash and decryption status
     if (decoded.type === 'GRP_TXT' && decoded.channelHash != null) {
       const hashHex = decoded.channelHashHex || decoded.channelHash.toString(16).padStart(2, '0').toUpperCase();
       const statusLabel = decoded.decryptionStatus === 'no_key' ? 'no key' : 'decryption failed';
-      return `🔒 Ch 0x${hashHex} <span class="muted">(${statusLabel})</span>`;
+      return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> Ch 0x${hashHex} <span class="muted">(${statusLabel})</span>`;
     }
     // Direct messages
-    if (decoded.type === 'TXT_MSG') return `✉️ ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
+    if (decoded.type === 'TXT_MSG') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-envelope"/></svg> ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
     // Path updates
-    if (decoded.type === 'PATH') return `🔀 ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
+    if (decoded.type === 'PATH') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-shuffle"/></svg> ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
     // Requests/responses (encrypted)
-    if (decoded.type === 'REQ' || decoded.type === 'RESPONSE') return `🔒 ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
+    if (decoded.type === 'REQ' || decoded.type === 'RESPONSE') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> ${decoded.srcHash?.slice(0,8) || '?'} → ${decoded.destHash?.slice(0,8) || '?'}`;
     // Anonymous requests
-    if (decoded.type === 'ANON_REQ') return `🔒 anon → ${decoded.destHash?.slice(0,8) || '?'}`;
+    if (decoded.type === 'ANON_REQ') return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> anon → ${decoded.destHash?.slice(0,8) || '?'}`;
     // Companion bridge text
     if (decoded.text) return escapeHtml(decoded.text.length > 80 ? decoded.text.slice(0, 80) + '…' : decoded.text);
     // Bare adverts with just pubkey
-    if (decoded.public_key) return `📡 ${decoded.public_key.slice(0, 16)}…`;
+    if (decoded.public_key) return `<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> ${decoded.public_key.slice(0, 16)}…`;
     return '';
   }
 
@@ -2591,7 +2825,7 @@
         sheet = document.createElement('div');
         sheet.id = 'mobileDetailSheet';
         sheet.className = 'mobile-detail-sheet';
-        sheet.innerHTML = '<div class="mobile-sheet-handle"></div><button class="mobile-sheet-close" id="mobileSheetClose">✕</button><div class="mobile-sheet-content"></div>';
+        sheet.innerHTML = '<div class="mobile-sheet-handle"></div><button class="mobile-sheet-close" id="mobileSheetClose" aria-label="Close"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button><div class="mobile-sheet-content"></div>';
         document.body.appendChild(sheet);
         sheet.querySelector('#mobileSheetClose').addEventListener('click', () => {
           sheet.classList.remove('open');
@@ -2743,7 +2977,7 @@
       const hashHex = decoded.channelHashHex || decoded.channelHash.toString(16).padStart(2, '0').toUpperCase();
       const statusLabel = decoded.decryptionStatus === 'no_key' ? 'no key' : 'decryption failed';
       messageHtml = `<div class="detail-message" style="padding:12px;margin:8px 0;background:var(--card-bg);border-radius:8px;border-left:3px solid var(--warning, #f0ad4e)">
-        <div style="font-size:1.1em">🔒 Channel Hash: 0x${hashHex} <span style="color:var(--text-muted)">(${statusLabel})</span></div>
+        <div style="font-size:1.1em"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-lock"/></svg> Channel Hash: 0x${hashHex} <span style="color:var(--text-muted)">(${statusLabel})</span></div>
       </div>`;
     }
 
@@ -2769,15 +3003,18 @@
       }
     }
 
-    // Location: from ADVERT lat/lon, or from known node via pubkey/sender name
-    let locationHtml = '—';
+    // Location: from ADVERT lat/lon, or from known node via pubkey/sender name.
+    // Issue #1281: only render the row when we actually have transmitter GPS.
+    // Non-ADVERT packets don't carry GPS in the unencrypted payload, so the row
+    // would otherwise render as "—" and waste a slot on ~90% of packet types.
+    let locationHtml = '';
     let locationNodeKey = null;
     if (decoded.lat != null && decoded.lon != null && !(decoded.lat === 0 && decoded.lon === 0)) {
       locationNodeKey = decoded.pubKey || decoded.srcPubKey || '';
       const nodeName = decoded.name || '';
       locationHtml = `${decoded.lat.toFixed(5)}, ${decoded.lon.toFixed(5)}`;
       if (nodeName) locationHtml = `${escapeHtml(nodeName)} — ${locationHtml}`;
-      if (locationNodeKey) locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" style="font-size:0.85em">📍map</a>`;
+      if (locationNodeKey) locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-pin"/></svg>map</a>`;
     } else {
       // Try to resolve sender node location from nodes list
       const senderKey = decoded.pubKey || decoded.srcPubKey;
@@ -2789,7 +3026,7 @@
             locationNodeKey = nodeData.node.public_key;
             locationHtml = `${nodeData.node.lat.toFixed(5)}, ${nodeData.node.lon.toFixed(5)}`;
             if (nodeData.node.name) locationHtml = `${escapeHtml(nodeData.node.name)} — ${locationHtml}`;
-            locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" style="font-size:0.85em">📍map</a>`;
+            locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-pin"/></svg>map</a>`;
           } else if (senderName && !senderKey) {
             // Search by name
             const searchData = await api(`/nodes/search?q=${encodeURIComponent(senderName)}`, { ttl: 30000 }).catch(() => null);
@@ -2798,7 +3035,7 @@
               locationNodeKey = match.public_key;
               locationHtml = `${match.lat.toFixed(5)}, ${match.lon.toFixed(5)}`;
               locationHtml = `${escapeHtml(match.name)} — ${locationHtml}`;
-              locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" style="font-size:0.85em">📍map</a>`;
+              locationHtml += ` <a href="#/map?node=${encodeURIComponent(locationNodeKey)}" class="loc-map-link"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-pin"/></svg>map</a>`;
             }
           }
         } catch {}
@@ -2806,7 +3043,7 @@
     }
 
     const anomalyBanner = decoded.anomaly
-      ? `<div class="anomaly-banner" style="background:var(--warning, #f0ad4e); color:#000; padding:8px 12px; border-radius:4px; margin-bottom:8px; font-weight:600;">⚠️ Anomaly: ${escapeHtml(decoded.anomaly)}</div>`
+      ? `<div class="anomaly-banner" style="background:var(--warning, #f0ad4e); color:#000; padding:8px 12px; border-radius:4px; margin-bottom:8px; font-weight:600;"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Anomaly: ${escapeHtml(decoded.anomaly)}</div>`
       : '';
 
     // Hop count display: use pathHops length (= effective observation's path_json).
@@ -2817,34 +3054,76 @@
       ? `<span style="font-size:0.8em;color:var(--text-muted);margin-left:6px">(observation ${observations.indexOf(currentObs) + 1} of ${observations.length})</span>`
       : '';
 
+    // #1279 P2 #3 — Transport codes detail row (firmware/src/Packet.h:46,
+    // parsed at cmd/server/decoder.go:492-498). Present on TRANSPORT_FLOOD/
+    // TRANSPORT_DIRECT routes only.
+    var tcCode1 = '—', tcCode2 = '—', tcShow = false;
+    if (decoded.transportCodes) {
+      tcShow = true;
+      if (decoded.transportCodes.code1) tcCode1 = String(decoded.transportCodes.code1).toUpperCase();
+      if (decoded.transportCodes.code2) tcCode2 = String(decoded.transportCodes.code2).toUpperCase();
+    }
+    var transportCodesRow = tcShow
+      ? `<dt>Transport Codes</dt><dd class="transport-codes">Code1: <code>${escapeHtml(tcCode1)}</code> · Code2: <code>${escapeHtml(tcCode2)}</code></dd>`
+      : '';
+
+    // #1279 P2 #5 — RAW_CUSTOM detail row (firmware/src/Mesh.cpp:577).
+    var rawCustomRow = '';
+    if (pkt.payload_type === 15 && decoded.type === 'RAW_CUSTOM') {
+      var rl = decoded.rawLength != null ? decoded.rawLength + ' byte' + (decoded.rawLength === 1 ? '' : 's') : '—';
+      var ft = decoded.firstByteTag ? String(decoded.firstByteTag).toUpperCase() : '—';
+      rawCustomRow = `<dt>Raw Custom</dt><dd class="raw-custom-detail">Length: <code>${escapeHtml(rl)}</code> · First byte tag: <code>${escapeHtml(ft)}</code></dd>`;
+    }
+
+    // #1458 P0-A — semantic identity header (type badge + decoded summary +
+    // src→dst). Replaces the prior byte-count title that buried packet
+    // identity behind a byte counter (#1458 P0-A).
+    const semanticSummary = getDetailPreview(decoded);
+    const srcLabel = decoded.sender || decoded.name || (decoded.srcHash ? decoded.srcHash.slice(0,8) : null) || (decoded.pubKey ? decoded.pubKey.slice(0,8) + '…' : null);
+    const dstLabel = decoded.recipient || (decoded.destHash ? decoded.destHash.slice(0,8) : null);
+    const srcDstHtml = (srcLabel || dstLabel)
+      ? `<div class="detail-srcdst">${escapeHtml(srcLabel || '?')} <span class="arrow">→</span> ${escapeHtml(dstLabel || (decoded.channel ? '#' + decoded.channel : '?'))}</div>`
+      : '';
+
     panel.innerHTML = `
       ${anomalyBanner}
-      <div class="detail-title">${hasRawHex ? `Packet Byte Breakdown (${size} bytes)` : typeName + ' Packet'}</div>
+      <div class="detail-title">
+        <span class="badge badge-${payloadTypeColor(pkt.payload_type)}">${typeName}</span>
+        ${semanticSummary ? `<span class="detail-summary">${semanticSummary}</span>` : ''}
+        ${displayHopCount > 0 ? `<span class="badge badge-info">${displayHopCount} hop${displayHopCount !== 1 ? 's' : ''}</span>` : ''}
+      </div>
+      ${srcDstHtml}
       <div class="detail-hash">${pkt.hash || 'Packet #' + pkt.id}${obsIndicator}</div>
       ${messageHtml}
       <dl class="detail-meta">
-        <dt>Observer</dt><dd>${obsName(effectivePkt.observer_id)}</dd>
-        <dt>Location</dt><dd>${locationHtml}</dd>
+        <dt>Payload Type</dt><dd><span class="badge badge-${payloadTypeColor(pkt.payload_type)}">${typeName}</span></dd>
+        <dt>Path</dt><dd>${displayHopCount > 0 ? `<span class="badge badge-info">${displayHopCount} hop${displayHopCount !== 1 ? 's' : ''}</span> ` + renderPath(pathHops, effectivePkt.observer_id) : '— (direct)'}</dd>
+        <dt>Timestamp</dt><dd>${renderTimestampCell(effectivePkt.timestamp)}</dd>
+        <dt>Observer</dt><dd>${escapeHtml(obsNameOnly(effectivePkt.observer_id))}${obsIataBadge(effectivePkt)}</dd>
+        ${locationHtml ? `<dt>Location</dt><dd>${locationHtml}</dd>` : ''}
         <dt>SNR / RSSI</dt><dd>${snr != null ? snr + ' dB' : '—'} / ${rssi != null ? rssi + ' dBm' : '—'}</dd>
         <dt>Route Type</dt><dd>${routeTypeName(pkt.route_type)}</dd>
-        <dt>Payload Type</dt><dd><span class="badge badge-${payloadTypeColor(pkt.payload_type)}">${typeName}</span></dd>
+        ${pkt.scope_name != null ? `<dt>Scope</dt><dd>${pkt.scope_name !== '' ? escapeHtml(pkt.scope_name) : '<span style="color:var(--text-muted)">unknown scope</span>'}</dd>` : ''}
         ${hashSize ? `<dt>Hash Size</dt><dd>${hashSize} byte${hashSize !== 1 ? 's' : ''}</dd>` : ''}
-        <dt>Timestamp</dt><dd>${renderTimestampCell(effectivePkt.timestamp)}</dd>
         <dt>Propagation</dt><dd>${propagationHtml}</dd>
-        <dt>Path</dt><dd>${displayHopCount > 0 ? `<span class="badge badge-info">${displayHopCount} hop${displayHopCount !== 1 ? 's' : ''}</span> ` + renderPath(pathHops, effectivePkt.observer_id) : '— (direct)'}</dd>
+        ${transportCodesRow}
+        ${rawCustomRow}
         ${effectivePkt.direction ? `<dt>Direction</dt><dd>${escapeHtml(effectivePkt.direction)}</dd>` : ''}
       </dl>
       <div class="detail-actions">
-        <button class="copy-link-btn" data-packet-hash="${pkt.hash || ''}" data-packet-id="${pkt.id}" title="Copy link to this packet">🔗 Copy Link</button>
-        ${pathHops.length ? `<button class="detail-map-link" id="viewRouteBtn">🗺️ View route on map</button>` : ''}
-        ${pkt.hash ? `<a href="#/traces/${pkt.hash}" class="detail-map-link" style="text-decoration:none">🔍 Trace</a>` : ''}
-        <button class="replay-live-btn" title="Replay this packet on the live map">▶ Replay</button>
+        <button class="copy-link-btn" data-packet-hash="${pkt.hash || ''}" data-packet-id="${pkt.id}" title="Copy link to this packet"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-link"/></svg> Copy Link</button>
+        ${pathHops.length ? `<button class="detail-map-link" id="viewRouteBtn"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> View route on map</button>` : ''}
+        ${pkt.hash ? `<a href="#/traces/${pkt.hash}" class="detail-map-link" style="text-decoration:none"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Trace</a>` : ''}
+        <button class="replay-live-btn" title="Replay this packet on the live map"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-play"/></svg> Replay</button>
       </div>
 
-      ${hasRawHex ? `<div class="hex-legend">${buildHexLegend(ranges)}</div>
-      <div class="hex-dump">${createColoredHexDump(effectivePkt.raw_hex || pkt.raw_hex, ranges)}</div>` : ''}
+      ${(hasRawHex || Object.keys(decoded).length) ? `<details class="detail-technical"${(typeof window !== 'undefined' && window.innerWidth > 480) ? ' open' : ''}>
+        <summary>Show raw bytes</summary>
+        ${hasRawHex ? `<div class="hex-legend">${buildHexLegend(ranges)}</div>
+        <div class="hex-dump">${createColoredHexDump(effectivePkt.raw_hex || pkt.raw_hex, ranges)}</div>` : ''}
 
-      ${hasRawHex ? buildFieldTable(effectivePkt.raw_hex ? effectivePkt : pkt, decoded, pathHops, ranges) : buildDecodedTable(decoded)}
+        ${hasRawHex ? buildFieldTable(effectivePkt.raw_hex ? effectivePkt : pkt, decoded, pathHops, ranges) : buildDecodedTable(decoded)}
+      </details>` : ''}
 
       ${observations.length > 1 ? `
       <div class="detail-observations" style="margin-top:16px">
@@ -2861,7 +3140,7 @@
             const oPath = getParsedPath(o);
             const isCurrent = currentObs && String(o.id) === String(currentObs.id);
             return `<tr class="detail-obs-row${isCurrent ? ' observation-current' : ''}" data-obs-id="${o.id}" style="cursor:pointer;${isCurrent ? 'background:var(--accent-bg, rgba(0,122,255,0.1))' : ''}" title="Click to view this observation">
-              <td style="padding:4px 6px">${obsName(o.observer_id)}</td>
+              <td style="padding:4px 6px">${escapeHtml(obsNameOnly(o.observer_id))}${obsIataBadge(o)}</td>
               <td style="padding:4px 6px">${oPath.length}</td>
               <td style="padding:4px 6px">${o.snr != null ? o.snr + ' dB' : '—'}</td>
               <td style="padding:4px 6px">${o.rssi != null ? o.rssi + ' dBm' : '—'}</td>
@@ -2903,8 +3182,8 @@
         const obsParam = selectedObservationId ? `?obs=${selectedObservationId}` : '';
         const url = pktHash ? `${location.origin}/#/packets/${pktHash}${obsParam}` : `${location.origin}/#/packets/${copyLinkBtn.dataset.packetId}${obsParam}`;
         window.copyToClipboard(url, () => {
-          copyLinkBtn.textContent = '✅ Copied!';
-          setTimeout(() => { copyLinkBtn.textContent = '🔗 Copy Link'; }, 1500);
+          copyLinkBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> Copied!';
+          setTimeout(() => { copyLinkBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-link"/></svg> Copy Link'; }, 1500);
         });
       });
     }
@@ -2970,11 +3249,44 @@
           else if (decoded.srcHash) origin.pubkey = decoded.srcHash;
           if (decoded.adName || decoded.name) origin.name = decoded.adName || decoded.name;
           if (senderLat != null && senderLon != null) { origin.lat = senderLat; origin.lon = senderLon; }
-          sessionStorage.setItem('map-route-hops', JSON.stringify({
-            origin: origin,
-            hops: resolvedKeys
-          }));
-          window.location.hash = '#/map?route=1';
+          // #1418 Phase D: also include the recipient (destHash) so the route
+          // displays as: sender → [intermediate hops] → recipient. Without
+          // this the destination node is invisible — operator only sees the
+          // last intermediate repeater.
+          const destination = {};
+          if (decoded.destHash) destination.pubkey = decoded.destHash;
+          // #1418 Phase C: include ALL observations as alternate paths so the
+          // route view can render union-of-edges with stroke-width weighting.
+          // Each observation contributes its own path_json array.
+          const allPaths = (observations || []).map(o => {
+            let path = [];
+            try { path = JSON.parse(o.path_json || '[]'); } catch (_) {}
+            return { path: path, observer: o.observer_name, observer_id: o.observer_id, snr: o.snr, rssi: o.rssi };
+          }).filter(p => p.path && p.path.length > 0);
+          // #1418/#1419: navigate via deep-link URL only. The map page's
+          // loadRouteFromDeepLink() re-fetches the packet from the API and
+          // builds the full payload (incl. packetContext) consistently.
+          // SessionStorage was unreliable — the deep-link path includes
+          // packetContext but the sessionStorage payload didn't, leading
+          // to missing chip + facts when entered from the packets page.
+          const obsId = currentObs ? currentObs.id : (observations[0] && observations[0].id);
+          const pkHash = pkt.hash || pkt.packet_hash;
+          const obsPart = obsId ? '&obs=' + encodeURIComponent(obsId) : '';
+          // Tufte audit fix: close ALL mobile packet panels so operator lands
+          // on the route view, not behind a still-visible detail sheet.
+          // Three different panels exist depending on viewport + flow:
+          //   - #pktRight (desktop split-pane)
+          //   - .slide-over-panel (mid-width SlideOver)
+          //   - #mobileDetailSheet (small-mobile bottom sheet)
+          if (window.innerWidth <= 767) {
+            try { closeDetailPanel(); } catch (_) {}
+            try { if (window.SlideOver && window.SlideOver.close) window.SlideOver.close(); } catch (_) {}
+            try {
+              const sheet = document.getElementById('mobileDetailSheet');
+              if (sheet) sheet.classList.remove('open');
+            } catch (_) {}
+          }
+          window.location.hash = '#/map?packet=' + encodeURIComponent(pkHash) + obsPart;
         } catch {
           window.location.hash = '#/map';
         }
@@ -3073,9 +3385,9 @@
       rows += fieldRow(off + 1, 'MAC (2B)', decoded.mac || '', '');
       rows += fieldRow(off + 3, 'Encrypted Data', truncate(decoded.encryptedData || '', 30), '');
     } else if (decoded.type === 'CHAN') {
-      rows += fieldRow(off, 'Channel', decoded.channel || `0x${(decoded.channelHash || 0).toString(16)}`, '');
-      rows += fieldRow(off + 1, 'Sender', decoded.sender || '—', '');
-      if (decoded.sender_timestamp) rows += fieldRow(off + 2, 'Sender Time', decoded.sender_timestamp, '');
+      rows += fieldRow(off, 'Channel', escapeHtml(decoded.channel || `0x${(decoded.channelHash || 0).toString(16)}`), '');
+      rows += fieldRow(off + 1, 'Sender', escapeHtml(decoded.sender || '—'), '');
+      if (decoded.sender_timestamp) rows += fieldRow(off + 2, 'Sender Time', escapeHtml(String(decoded.sender_timestamp)), '');
     } else if (decoded.type === 'ACK') {
       rows += fieldRow(off, 'Checksum (4B)', decoded.ackChecksum || '', '');
     } else if (decoded.type === 'TRACE') {
@@ -3095,7 +3407,7 @@
     }
 
     if (decoded.anomaly) {
-      rows += `<tr class="anomaly-row" style="background:var(--warning, #f0ad4e); color:#000; font-weight:600;"><td colspan="2">⚠️ Anomaly</td><td colspan="2">${escapeHtml(decoded.anomaly)}</td></tr>`;
+      rows += `<tr class="anomaly-row" style="background:var(--warning, #f0ad4e); color:#000; font-weight:600;"><td colspan="2"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Anomaly</td><td colspan="2">${escapeHtml(decoded.anomaly)}</td></tr>`;
     }
 
     return `<table class="field-table">
@@ -3118,7 +3430,7 @@
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay byop-overlay';
     overlay.innerHTML = '<div class="modal byop-modal" role="dialog" aria-label="Decode a Packet" aria-modal="true">'
-      + '<div class="byop-header"><h3>📦 Decode a Packet</h3><button class="btn-icon byop-x" title="Close" aria-label="Close dialog">✕</button></div>'
+      + '<div class="byop-header"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg> Decode a Packet</h3><button class="btn-icon byop-x" title="Close" aria-label="Close dialog"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button></div>'
       + '<p class="text-muted" style="margin:0 0 12px;font-size:.85rem">Paste raw hex bytes from your radio or MQTT feed:</p>'
       + '<textarea id="byopHex" class="byop-input" aria-label="Packet hex data" placeholder="e.g. 15C31A8D4674FEAE37..." spellcheck="false"></textarea>'
       + '<button class="btn-primary byop-go" id="byopDecode" style="width:100%;margin:8px 0">Decode</button>'
@@ -3176,7 +3488,7 @@
         if (data.error) throw new Error(data.error);
         result.innerHTML = renderDecodedPacket(data.decoded, hex);
       } catch (e) {
-        result.innerHTML = '<p class="byop-err" role="alert">❌ ' + e.message + '</p>';
+        result.innerHTML = '<p class="byop-err" role="alert"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x-circle"/></svg> ' + e.message + '</p>';
       }
     }
   }
@@ -3191,7 +3503,7 @@
 
     // Anomaly banner
     if (d.anomaly) {
-      html += '<div class="anomaly-banner" style="background:var(--warning, #f0ad4e); color:#000; padding:8px 12px; border-radius:4px; margin-bottom:8px; font-weight:600;">⚠️ Anomaly: ' + escapeHtml(d.anomaly) + '</div>';
+      html += '<div class="anomaly-banner" style="background:var(--warning, #f0ad4e); color:#000; padding:8px 12px; border-radius:4px; margin-bottom:8px; font-weight:600;"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Anomaly: ' + escapeHtml(d.anomaly) + '</div>';
     }
 
     // Header section

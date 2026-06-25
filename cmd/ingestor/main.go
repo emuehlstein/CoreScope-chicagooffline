@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -50,6 +51,25 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
+	// Apply Go runtime soft memory limit (GOMEMLIMIT). See #1010.
+	// Precedence: GOMEMLIMIT env > runtime.maxMemoryMB > unset (default).
+	{
+		_, envSet := os.LookupEnv("GOMEMLIMIT")
+		runtimeMaxMB := 0
+		if cfg.Runtime != nil {
+			runtimeMaxMB = cfg.Runtime.MaxMemoryMB
+		}
+		limit, source := applyMemoryLimit(runtimeMaxMB, envSet)
+		switch source {
+		case "env":
+			log.Printf("[memlimit] using GOMEMLIMIT from environment (%s)", os.Getenv("GOMEMLIMIT"))
+		case "config":
+			log.Printf("[memlimit] runtime.maxMemoryMB=%d → SetMemoryLimit(%d MiB)", runtimeMaxMB, limit/(1024*1024))
+		default:
+			log.Printf("[memlimit] unset → default (no soft memory limit; recommend setting GOMEMLIMIT or runtime.maxMemoryMB to ≥1.5× working set to avoid OOM-kill)")
+		}
+	}
+
 	sources := cfg.ResolvedSources()
 
 	store, err := OpenStoreWithInterval(cfg.DBPath, cfg.MetricsSampleInterval())
@@ -62,66 +82,17 @@ func main() {
 	// Async backfill: path_json from raw_hex (#888) — must not block MQTT startup
 	store.BackfillPathJSONAsync()
 
+	// Soft-delete blacklisted observers (#1287 — moved from cmd/server).
+	if len(cfg.ObserverBlacklist) > 0 {
+		store.SoftDeleteBlacklistedObservers(cfg.ObserverBlacklist)
+	}
+
+	// Async backfill: from_pubkey for legacy ADVERT rows (#1143).
+	// Moved from cmd/server in #1287. Best-effort; must not block MQTT.
+	go store.BackfillFromPubkey(5000, 100*time.Millisecond, nil)
+
 	// Check auto_vacuum mode and optionally migrate (#919)
 	store.CheckAutoVacuum(cfg)
-
-	// Node retention: move stale nodes to inactive_nodes on startup
-	nodeDays := cfg.NodeDaysOrDefault()
-	store.MoveStaleNodes(nodeDays)
-
-	// Observer retention: remove stale observers on startup
-	observerDays := cfg.ObserverDaysOrDefault()
-	store.RemoveStaleObservers(observerDays)
-
-	// Metrics retention: prune old metrics on startup
-	metricsDays := cfg.MetricsRetentionDays()
-	store.PruneOldMetrics(metricsDays)
-	store.PruneDroppedPackets(metricsDays)
-	vacuumPages := cfg.IncrementalVacuumPages()
-	store.RunIncrementalVacuum(vacuumPages)
-
-	// Daily ticker for node retention
-	retentionTicker := time.NewTicker(1 * time.Hour)
-	go func() {
-		for range retentionTicker.C {
-			store.MoveStaleNodes(nodeDays)
-			store.RunIncrementalVacuum(vacuumPages)
-		}
-	}()
-
-	// Daily ticker for observer retention (every 24h, staggered 90s after startup)
-	observerRetentionTicker := time.NewTicker(24 * time.Hour)
-	go func() {
-		time.Sleep(90 * time.Second) // stagger after metrics prune
-		store.RemoveStaleObservers(observerDays)
-		store.RunIncrementalVacuum(vacuumPages)
-		for range observerRetentionTicker.C {
-			store.RemoveStaleObservers(observerDays)
-			store.RunIncrementalVacuum(vacuumPages)
-		}
-	}()
-
-	// Daily ticker for metrics retention (every 24h)
-	metricsRetentionTicker := time.NewTicker(24 * time.Hour)
-	go func() {
-		for range metricsRetentionTicker.C {
-			store.PruneOldMetrics(metricsDays)
-			store.PruneDroppedPackets(metricsDays)
-			store.RunIncrementalVacuum(vacuumPages)
-		}
-	}()
-
-	// Periodic stats logging (every 5 minutes)
-	statsTicker := time.NewTicker(5 * time.Minute)
-	go func() {
-		for range statsTicker.C {
-			store.LogStats()
-		}
-	}()
-
-	// Per-second stats file writer for the server's /api/perf/write-sources
-	// endpoint (#1120). Best-effort; never fatal.
-	StartStatsFileWriter(store, time.Second)
 
 	channelKeys := loadChannelKeys(cfg, *configPath)
 	if len(channelKeys) > 0 {
@@ -129,6 +100,16 @@ func main() {
 	} else {
 		log.Printf("No channel keys loaded — GRP_TXT packets will not be decrypted")
 	}
+
+	regionKeys := loadRegionKeys(cfg)
+	store.BackfillDefaultScopeAsync(regionKeys)
+
+	// Subscribe-early + buffer (#1608): the MQTT subscription is brought up
+	// before startup maintenance so no packets are missed while the single
+	// SQLite writer is blocked (e.g. a large CREATE INDEX migration). Received
+	// messages are buffered here and drained once Ready() is called below.
+	ingestBuffer := NewIngestBuffer(cfg.IngestBufferSizeOrDefault())
+	ingestBuffer.Start()
 
 	// Connect to each MQTT source
 	var clients []mqtt.Client
@@ -184,7 +165,15 @@ func main() {
 		// Capture source for closure
 		src := source
 		opts.SetDefaultPublishHandler(func(c mqtt.Client, m mqtt.Message) {
-			handleMessage(store, tag, src, m, channelKeys, cfg)
+			// PR #1609 M1: stamp the RECEIPT clock here (broker liveness)
+			// independently of the post-write clock that handleMessage
+			// stamps. Without separation the watchdog/healthz could
+			// report "fresh" while the writer was stalled and the
+			// buffer was filling.
+			markReceiptForTag(tag, time.Now())
+			ingestBuffer.Submit(func() {
+				handleMessage(store, tag, src, m, channelKeys, regionKeys, cfg)
+			})
 		})
 
 		client := mqtt.NewClient(opts)
@@ -192,6 +181,18 @@ func main() {
 		// Registration BEFORE Connect so the attempt counter is available
 		// to OnConnectAttempt on the very first dial.
 		liveness.IsConnectedFn = client.IsConnected
+		// #1335: wire force-reconnect so the watchdog can drop a
+		// half-open TCP socket and re-dial when paho.IsConnected==true
+		// but no messages have flowed past the stall threshold. Throttled
+		// per source by the watchdog itself (forceReconnectThrottle).
+		// Disconnect(250) gives in-flight publishes 250ms to drain;
+		// Connect() returns immediately and paho's reconnect machinery
+		// takes over from there. Captured-by-value `client` is the same
+		// pointer used everywhere else for this source.
+		liveness.ForceReconnectFn = func() {
+			client.Disconnect(250)
+			client.Connect()
+		}
 		// PR #1216 r2 item 3: tag collisions used to log.Fatalf, which
 		// killed the entire ingestor over one config typo and recreated
 		// the #1212 total-ingest-stop class this PR exists to prevent.
@@ -239,6 +240,184 @@ func main() {
 		log.Printf("Running — %d MQTT source(s) connected", connectedCount)
 	}
 
+	// Node retention: move stale nodes to inactive_nodes on startup
+	nodeDays := cfg.NodeDaysOrDefault()
+	store.MoveStaleNodes(nodeDays)
+
+	// Observer retention: remove stale observers on startup
+	observerDays := cfg.ObserverDaysOrDefault()
+	store.RemoveStaleObservers(observerDays)
+
+	// Metrics retention: prune old metrics on startup
+	metricsDays := cfg.MetricsRetentionDays()
+	store.PruneOldMetrics(metricsDays)
+	store.PruneDroppedPackets(metricsDays)
+
+	// Packet (transmissions) retention: previously lived in cmd/server,
+	// moved to ingestor in #1283 to eliminate cross-process write
+	// contention (SQLITE_BUSY). 0 = disabled.
+	packetDays := cfg.PacketDaysOrZero()
+	if packetDays > 0 {
+		if n, err := store.PruneOldPackets(packetDays); err != nil {
+			log.Printf("[prune] error: %v", err)
+		} else if n > 0 {
+			log.Printf("[prune] startup pruned %d transmissions older than %d days", n, packetDays)
+		}
+	}
+
+	vacuumPages := cfg.IncrementalVacuumPages()
+	store.RunIncrementalVacuum(vacuumPages)
+
+	// Gate open: the synchronous startup writes above cannot return until the
+	// single SQLite writer is free, which means any blocking async migration
+	// (e.g. the CREATE INDEX) has finished. WaitForAsyncMigrations() makes that
+	// explicit. Now drain everything the subscription buffered during startup.
+	store.WaitForAsyncMigrations()
+	ingestBuffer.Ready()
+	if d := ingestBuffer.Dropped(); d > 0 {
+		log.Printf("[ingest-buffer] write path ready; draining backlog (dropped %d during startup — consider raising ingestBufferSize)", d)
+	} else {
+		log.Printf("[ingest-buffer] write path ready; draining backlog (0 dropped)")
+	}
+
+	// Daily ticker for node retention
+	retentionTicker := time.NewTicker(1 * time.Hour)
+	go func() {
+		for range retentionTicker.C {
+			store.MoveStaleNodes(nodeDays)
+			store.RunIncrementalVacuum(vacuumPages)
+		}
+	}()
+
+	// Daily ticker for observer retention (every 24h, staggered 90s after startup)
+	observerRetentionTicker := time.NewTicker(24 * time.Hour)
+	go func() {
+		time.Sleep(90 * time.Second) // stagger after metrics prune
+		store.RemoveStaleObservers(observerDays)
+		store.RunIncrementalVacuum(vacuumPages)
+		for range observerRetentionTicker.C {
+			store.RemoveStaleObservers(observerDays)
+			store.RunIncrementalVacuum(vacuumPages)
+		}
+	}()
+
+	// Daily ticker for metrics retention (every 24h)
+	metricsRetentionTicker := time.NewTicker(24 * time.Hour)
+	go func() {
+		for range metricsRetentionTicker.C {
+			store.PruneOldMetrics(metricsDays)
+			store.PruneDroppedPackets(metricsDays)
+			store.RunIncrementalVacuum(vacuumPages)
+		}
+	}()
+
+	// Daily ticker for transmission retention (#1283).
+	var packetRetentionTicker *time.Ticker
+	if packetDays > 0 {
+		packetRetentionTicker = time.NewTicker(24 * time.Hour)
+		go func() {
+			for range packetRetentionTicker.C {
+				if n, err := store.PruneOldPackets(packetDays); err != nil {
+					log.Printf("[prune] error: %v", err)
+				} else if n > 0 {
+					store.RunIncrementalVacuum(vacuumPages)
+				}
+			}
+		}()
+		log.Printf("[prune] auto-prune enabled: packets older than %d days will be removed daily", packetDays)
+	}
+
+	// Hourly WAL checkpoint to prevent unbounded WAL growth.
+	// TRUNCATE resets the WAL file to zero bytes when all frames are flushed;
+	// if the server's read connection holds frames, remaining pages stay in the
+	// WAL until the next tick. Staggered 30s after startup to avoid competing
+	// with the initial burst of ingest writes.
+	walCheckpointTicker := time.NewTicker(1 * time.Hour)
+	go func() {
+		time.Sleep(30 * time.Second)
+		store.Checkpoint()
+		for range walCheckpointTicker.C {
+			store.Checkpoint()
+		}
+	}()
+	log.Printf("[db] WAL checkpoint scheduled every 1h")
+
+	// Daily neighbor_edges retention (#1287 — moved from cmd/server).
+	{
+		nDays := cfg.NeighborEdgesDaysOrDefault()
+		neighborPruneTicker := time.NewTicker(24 * time.Hour)
+		go func() {
+			time.Sleep(4 * time.Minute) // stagger
+			if n, err := store.PruneNeighborEdges(nDays); err != nil {
+				log.Printf("[neighbor-prune] error: %v", err)
+			} else if n > 0 {
+				log.Printf("[neighbor-prune] startup pruned %d edges older than %d days", n, nDays)
+			}
+			for range neighborPruneTicker.C {
+				if n, err := store.PruneNeighborEdges(nDays); err != nil {
+					log.Printf("[neighbor-prune] error: %v", err)
+				} else if n > 0 {
+					log.Printf("[neighbor-prune] pruned %d edges older than %d days", n, nDays)
+				}
+			}
+		}()
+		log.Printf("[neighbor-prune] auto-prune enabled: edges older than %d days", nDays)
+	}
+
+	// Periodic stats logging (every 5 minutes)
+	statsTicker := time.NewTicker(5 * time.Minute)
+	go func() {
+		for range statsTicker.C {
+			store.LogStats()
+			if d := ingestBuffer.Dropped(); d > 0 || ingestBuffer.Pending() > 0 {
+				log.Printf("[ingest-buffer] pending=%d dropped_total=%d", ingestBuffer.Pending(), d)
+			}
+		}
+	}()
+
+	// Prune-request queue (#669 M4 / #738): the read-only server enqueues
+	// geo-prune requests as marker files; the ingestor (which holds the
+	// write handle) executes the DELETEs. Process on startup, then every
+	// 15 seconds — short enough for a one-click UX, long enough to avoid
+	// useless wake-ups.
+	store.RunPendingPruneRequests()
+	pruneQueueTicker := time.NewTicker(15 * time.Second)
+	go func() {
+		for range pruneQueueTicker.C {
+			store.RunPendingPruneRequests()
+		}
+	}()
+
+	// Per-second stats file writer for the server's /api/perf/write-sources
+	// endpoint (#1120). Best-effort; never fatal.
+	StartStatsFileWriter(store, time.Second)
+
+	// Multi-byte capability persister (#1324 follow-up): the server's
+	// analytics cycle publishes a snapshot file via internal/mbcapqueue
+	// (it cannot UPDATE itself, mode=ro since #1289). The ingestor
+	// applies the snapshot here every 5 minutes — derived/cached
+	// columns, ingestor owns the write.
+	multibytePersistTicker := time.NewTicker(5 * time.Minute)
+	go func() {
+		time.Sleep(2 * time.Minute) // stagger after analytics warmup
+		if _, err := store.RunMultibyteCapPersist(); err != nil {
+			log.Printf("[multibyte-persist] error: %v", err)
+		}
+		for range multibytePersistTicker.C {
+			if _, err := store.RunMultibyteCapPersist(); err != nil {
+				log.Printf("[multibyte-persist] error: %v", err)
+			}
+		}
+	}()
+	log.Printf("[multibyte-persist] enabled (interval=5m)")
+
+	// Neighbor-edges builder (#1287 — Option 4): ingestor owns
+	// neighbor_edges writes. Runs every 60s. Server reads the snapshot
+	// via cmd/server/neighbor_recomputer.go on the same cadence.
+	stopNeighborBuilder := store.StartNeighborEdgesBuilder(NeighborEdgesBuilderInterval)
+	defer stopNeighborBuilder()
+	log.Printf("[neighbor-build] enabled (interval=%s)", NeighborEdgesBuilderInterval)
+
 	// #1212: per-source stall watchdog. Detects "silently dead" sources
 	// where the client reports connected but no messages have flowed. Logs
 	// a WARN line every minute for any source silent for >5m. Scan every
@@ -253,7 +432,12 @@ func main() {
 	log.Println("Shutting down...")
 	retentionTicker.Stop()
 	metricsRetentionTicker.Stop()
+	if packetRetentionTicker != nil {
+		packetRetentionTicker.Stop()
+	}
 	statsTicker.Stop()
+	pruneQueueTicker.Stop()
+	walCheckpointTicker.Stop()
 	stopWatchdog()
 	store.LogStats() // final stats on shutdown
 	for _, c := range clients {
@@ -283,7 +467,16 @@ func buildMQTTOpts(source MQTTSource) *mqtt.ClientOptions {
 		SetOrderMatters(true).
 		SetMaxReconnectInterval(30 * time.Second).
 		SetConnectTimeout(10 * time.Second).
-		SetWriteTimeout(10 * time.Second)
+		SetWriteTimeout(10 * time.Second).
+		// #1335: TCP-level keepalive surfaces a half-open socket within
+		// ~30-60s instead of waiting for the application-level watchdog
+		// (5m) to notice no messages. paho's MQTT PINGREQ uses this
+		// interval too — if the broker's PINGRESP doesn't arrive,
+		// ConnectionLost fires and auto-reconnect kicks in. Was unset
+		// (paho default 30s actually — making this explicit so it can't
+		// drift, and so operators reading the code know it's intentional
+		// per the #1335 RCA).
+		SetKeepAlive(30 * time.Second)
 
 	opts.SetConnectionAttemptHandler(func(broker *url.URL, tlsCfg *tls.Config) *tls.Config {
 		// Look up the per-source liveness state (registered in main) so we
@@ -308,13 +501,15 @@ func buildMQTTOpts(source MQTTSource) *mqtt.ClientOptions {
 	}
 	if source.RejectUnauthorized != nil && !*source.RejectUnauthorized {
 		opts.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
-	} else if strings.HasPrefix(source.Broker, "ssl://") {
+	} else if strings.HasPrefix(source.Broker, "ssl://") || strings.HasPrefix(source.Broker, "wss://") {
+		// TLS with system CA pool — valid for ssl:// MQTT brokers and
+		// wss:// WebSocket brokers behind a publicly-trusted certificate.
 		opts.SetTLSConfig(&tls.Config{})
 	}
 	return opts
 }
 
-func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, cfg *Config) {
+func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionKeys map[string][]byte, cfg *Config) {
 	// Liveness watchdog (#1212): record receipt before any processing so a
 	// slow handler still counts as "source is alive". Cheap atomic store.
 	markLivenessForTag(tag, time.Now())
@@ -359,7 +554,11 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		name, _ := msg["origin"].(string)
 		iata := parts[1]
 		meta := extractObserverMeta(msg)
-		if err := store.UpsertObserver(observerID, name, iata, meta); err != nil {
+		// observer.last_seen is "when did the analyzer last hear from this
+		// observer" — fundamentally an ingest-time question. Passing "" makes
+		// UpsertObserverAt use time.Now(), independent of the envelope timestamp
+		// (which can be stale/skewed even when well-formed). See #1465.
+		if err := store.UpsertObserverAt(observerID, name, iata, meta, ""); err != nil {
 			log.Printf("MQTT [%s] observer status error: %v", tag, err)
 		}
 		// Insert metrics sample from status message
@@ -378,7 +577,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 				log.Printf("MQTT [%s] metrics insert error: %v", tag, err)
 			}
 		}
-		log.Printf("MQTT [%s] status: %s (%s)", tag, firstNonEmpty(name, observerID), iata)
+		log.Print(formatStatusLog(tag, firstNonEmpty(name, observerID), iata))
 		return
 	}
 
@@ -443,6 +642,14 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		}
 
 		mqttMsg := &MQTTPacketMessage{Raw: rawHex}
+		var naiveSkewSec int64
+		mqttMsg.Timestamp, naiveSkewSec = resolveRxTime(msg, tag)
+		if naiveSkewSec != 0 && observerID != "" {
+			// Issue #1478: record so /api/observers can surface ⚠️ chip.
+			if err := store.RecordNaiveSkew(observerID, naiveSkewSec, time.Now()); err != nil {
+				log.Printf("MQTT [%s] RecordNaiveSkew(%s): %v", tag, observerID, err)
+			}
+		}
 		// Parse optional region from JSON payload (#788)
 		if v, ok := msg["region"].(string); ok && v != "" {
 			mqttMsg.Region = v
@@ -499,7 +706,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 					truncPK = truncPK[:16]
 				}
 				log.Printf("MQTT [%s] DROPPED invalid signature: hash=%s name=%s observer=%s pubkey=%s",
-					tag, hash, decoded.Payload.Name, firstNonEmpty(mqttMsg.Origin, observerID), truncPK)
+					tag, hash, sanitizeLogString(decoded.Payload.Name), sanitizeLogString(firstNonEmpty(mqttMsg.Origin, observerID)), truncPK)
 				store.InsertDroppedPacket(&DroppedPacket{
 					Hash:         hash,
 					RawHex:       rawHex,
@@ -529,9 +736,9 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 					truncPK = truncPK[:16]
 				}
 				log.Printf("MQTT [%s] foreign advert: node=%s name=%s lat=%.4f lon=%.4f observer=%s",
-					tag, truncPK, decoded.Payload.Name, lat, lon, firstNonEmpty(mqttMsg.Origin, observerID))
+					tag, truncPK, sanitizeLogString(decoded.Payload.Name), lat, lon, sanitizeLogString(firstNonEmpty(mqttMsg.Origin, observerID)))
 			}
-			pktData := BuildPacketData(mqttMsg, decoded, observerID, region)
+			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionKeys)
 			pktData.Foreign = foreign
 			isNew, err := store.InsertTransmission(pktData)
 			if err != nil {
@@ -557,10 +764,16 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 					log.Printf("MQTT [%s] node telemetry update error: %v", tag, err)
 				}
 			}
+			// Update default_scope when advert carries a matched transport scope (#899, #1534)
+			if shouldUpdateDefaultScope(pktData) {
+				if err := store.UpdateNodeDefaultScope(decoded.Payload.PubKey, pktData.ScopeName); err != nil {
+					log.Printf("MQTT [%s] node default_scope update error: %v", tag, err)
+				}
+			}
 		} else {
 			// Non-ADVERT packets: store normally (routing/channel messages from
 			// in-area observers are relevant regardless of relay hop origin).
-			pktData := BuildPacketData(mqttMsg, decoded, observerID, region)
+			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionKeys)
 			if _, err := store.InsertTransmission(pktData); err != nil {
 				log.Printf("MQTT [%s] db insert error: %v", tag, err)
 			}
@@ -574,7 +787,10 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			if mqttMsg.Region != "" {
 				effectiveRegion = mqttMsg.Region
 			}
-			if err := store.UpsertObserver(observerID, origin, effectiveRegion, nil); err != nil {
+			// Same as the status-path call above: observer.last_seen is ingest
+			// time, not envelope time. Per-packet rxTime (stored in observations
+			// via InsertTransmission) still uses envelope time. See #1465.
+			if err := store.UpsertObserverAt(observerID, origin, effectiveRegion, nil, ""); err != nil {
 				log.Printf("MQTT [%s] observer upsert error: %v", tag, err)
 			}
 		}
@@ -618,8 +834,8 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 
 		decodedJSON, _ := json.Marshal(channelMsg)
 
-		now := time.Now().UTC().Format(time.RFC3339)
-		hashInput := fmt.Sprintf("ch:%s:%s:%s", channelIdx, text, now)
+		ingestNow := time.Now().UTC().Format(time.RFC3339)
+		hashInput := fmt.Sprintf("ch:%s:%s:%s", channelIdx, text, ingestNow)
 		h := sha256.Sum256([]byte(hashInput))
 		hash := hex.EncodeToString(h[:])[:16]
 
@@ -659,7 +875,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		}
 
 		pktData := &PacketData{
-			Timestamp:    now,
+			Timestamp:    ingestNow, // #1370 (counters #1233): server ingest time, not envelope rxTime
 			ObserverID:   "companion",
 			ObserverName: "L1 Pro (BLE)",
 			SNR:          snr,
@@ -684,7 +900,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		// used for claiming/health lookups. The node will get a proper entry when it
 		// sends an advert. See issue #665.
 
-		log.Printf("MQTT [%s] channel message: ch%s from %s", tag, channelIdx, firstNonEmpty(sender, "unknown"))
+		log.Print(formatChannelMessageLog(tag, channelIdx, firstNonEmpty(sender, "unknown")))
 		return
 	}
 
@@ -711,8 +927,8 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 
 		decodedJSON, _ := json.Marshal(dm)
 
-		now := time.Now().UTC().Format(time.RFC3339)
-		hashInput := fmt.Sprintf("dm:%s:%s", text, now)
+		ingestNow := time.Now().UTC().Format(time.RFC3339)
+		hashInput := fmt.Sprintf("dm:%s:%s", text, ingestNow)
 		h := sha256.Sum256([]byte(hashInput))
 		hash := hex.EncodeToString(h[:])[:16]
 
@@ -752,7 +968,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		}
 
 		pktData := &PacketData{
-			Timestamp:    now,
+			Timestamp:    ingestNow, // #1370 (counters #1233): server ingest time, not envelope rxTime
 			ObserverID:   "companion",
 			ObserverName: "L1 Pro (BLE)",
 			SNR:          snr,
@@ -770,7 +986,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			log.Printf("MQTT [%s] DM insert error: %v", tag, err)
 		}
 
-		log.Printf("MQTT [%s] direct message from %s", tag, firstNonEmpty(sender, "unknown"))
+		log.Print(formatDirectMessageLog(tag, firstNonEmpty(sender, "unknown")))
 		return
 	}
 }
@@ -908,6 +1124,37 @@ func extractObserverMeta(msg map[string]interface{}) *ObserverMeta {
 		}
 	}
 
+	// Issue #1290: firmware 1.16 publishes a `repeat` flag at the top
+	// level of the /status JSON (MQTTMessageBuilder.cpp:58 — see
+	// agessaman/MeshCore mqtt-bridge-implementation-flex). Accept
+	// either a boolean or a case-insensitive `on|off|true|false|1|0`
+	// string. Missing field → leave CanRelay nil; the writer preserves
+	// the prior column value (default 1, back-compat).
+	if v, ok := msg["repeat"]; ok && v != nil {
+		switch t := v.(type) {
+		case bool:
+			b := t
+			meta.CanRelay = &b
+			hasData = true
+		case string:
+			s := strings.ToLower(strings.TrimSpace(t))
+			switch s {
+			case "on", "true", "1", "yes":
+				b := true
+				meta.CanRelay = &b
+				hasData = true
+			case "off", "false", "0", "no":
+				b := false
+				meta.CanRelay = &b
+				hasData = true
+			}
+		case float64:
+			b := t != 0
+			meta.CanRelay = &b
+			hasData = true
+		}
+	}
+
 	if !hasData {
 		return nil
 	}
@@ -936,6 +1183,101 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// resolveRxTime returns the observer receive-time for a packet, taken from
+// the MQTT envelope's "timestamp" field. Falls back to ingest time only when
+// the field is missing, unparseable, or implausibly in the future (a
+// clock-skewed observer). Result is always RFC3339 UTC.
+//
+// The envelope timestamp is stamped by the uploader when the radio receives
+// the frame, not when the MQTT message is published — so a buffered packet
+// uploaded hours late still carries its true receive time. Using ingest time
+// (time.Now()) here mis-dated such packets by the upload delay.
+//
+// The returned naiveSkewSec is 0 unless a naive (zone-less) timestamp had to
+// be clamped because it was off from server-now by >15min — in which case it
+// is the signed offset in seconds (negative = observer behind UTC, positive =
+// ahead). Caller records this via Store.RecordNaiveSkew so the UI can flag
+// the observer (#1478).
+func resolveRxTime(msg map[string]interface{}, tag string) (string, int64) {
+	now := time.Now().UTC()
+	raw, _ := msg["timestamp"].(string)
+	if raw == "" {
+		return now.Format(time.RFC3339), 0
+	}
+	t, naive, err := parseEnvelopeTime(raw)
+	if err != nil {
+		log.Printf("MQTT [%s] unparseable timestamp %q, using ingest time", tag, raw)
+		return now.Format(time.RFC3339), 0
+	}
+	// Hard reject: > 14h ahead is a genuine clock error (UTC+14 is the maximum
+	// standard offset, so nothing valid should be further ahead than that).
+	if t.After(now.Add(14 * time.Hour)) {
+		log.Printf("MQTT [%s] future timestamp %q, using ingest time", tag, raw)
+		return now.Format(time.RFC3339), 0
+	}
+	// Hard reject: > 30 days in the past is an RTC-reset node reporting a
+	// factory date (e.g. 2020-01-01). Such a value would permanently drag
+	// transmissions.first_seen backwards via stmtUpdateTxFirstSeen in
+	// InsertTransmission. No legitimate buffered upload is that stale.
+	if t.Before(now.Add(-30 * 24 * time.Hour)) {
+		log.Printf("MQTT [%s] stale timestamp %q (>30d old), using ingest time", tag, raw)
+		return now.Format(time.RFC3339), 0
+	}
+	// Symmetric naive-timestamp clamp (issue #1463). Naive (zone-less) ISO
+	// values from observers in non-UTC zones are parsed as-if UTC, leaving a
+	// residual offset equal to the observer's UTC offset:
+	//   - UTC+N observer → value appears N hours in the future
+	//   - UTC-N observer → value appears N hours in the past
+	// The past case was silently stored verbatim, poisoning last_seen and
+	// rendering UTC-N observers perpetually "Stale" in the UI. Collapse any
+	// naive value more than 15 min off server-now to now() — well-behaved
+	// observers (Z-suffixed or explicit offset) are untouched regardless of
+	// skew so legitimate buffered uploads remain accurate.
+	const naiveTolerance = 15 * time.Minute
+	if naive {
+		signed := t.Sub(now) // signed: positive = ahead, negative = behind
+		abs := signed
+		if abs < 0 {
+			abs = -abs
+		}
+		if abs > naiveTolerance {
+			// Issue #1478: surface to UI via RecordNaiveSkew (called by handler).
+			// Per-message log was silenced in #1479 — chip + banner in the UI
+			// replace it.
+			deltaSec := int64(signed / time.Second)
+			return now.Format(time.RFC3339), deltaSec
+		}
+	}
+	// Legacy soft clamp for zone-aware near-future values: any value ahead of
+	// now is from a slightly skewed observer clock — collapse to now so we
+	// don't render ⚠️ in the UI for live packets from those nodes.
+	if t.After(now) {
+		return now.Format(time.RFC3339), 0
+	}
+	return t.UTC().Format(time.RFC3339), 0
+}
+
+// parseEnvelopeTime parses the MQTT envelope timestamp. Two on-wire forms
+// occur: zone-aware ISO8601 (RFC3339), and a naive local-clock ISO string
+// with no zone (python datetime.isoformat()). Zone-aware layouts are tried
+// first; naive layouts are assumed UTC but the caller is informed via the
+// returned `naive` flag so it can apply a symmetric clamp (see issue #1463).
+func parseEnvelopeTime(s string) (time.Time, bool, error) {
+	// Zone-aware first — RFC3339 demands Z or ±HH:MM.
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, false, nil
+	}
+	for _, layout := range []string{
+		"2006-01-02T15:04:05.999999", // python isoformat w/ microseconds
+		"2006-01-02T15:04:05",        // naive ISO
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true, nil
+		}
+	}
+	return time.Time{}, false, fmt.Errorf("unrecognized timestamp layout: %q", s)
+}
+
 // deriveHashtagChannelKey derives an AES-128 key from a channel name.
 // Same algorithm as Node.js: SHA-256(channelName) → first 32 hex chars (16 bytes).
 func deriveHashtagChannelKey(channelName string) string {
@@ -943,12 +1285,29 @@ func deriveHashtagChannelKey(channelName string) string {
 	return hex.EncodeToString(h[:16])
 }
 
+// builtinChannelKeys returns channel keys that are part of the MeshCore firmware
+// defaults and should always be available, regardless of the rainbow file or config.
+// Adding new entries here is the right move when a key is part of the protocol spec
+// (not a community-named hashtag channel).
+func builtinChannelKeys() map[string]string {
+	return map[string]string{
+		// Default Public channel — well-known PSK from the MeshCore companion
+		// protocol spec. Channel-hash byte = 0x11.
+		"Public": "8b3387e9c5cdea6ac9e5edbaa115cd72",
+	}
+}
+
 // loadChannelKeys loads channel decryption keys from config and/or a JSON file.
-// Merge priority: rainbow (lowest) → derived from hashChannels → explicit config (highest).
+// Merge priority: builtin (lowest) → rainbow → derived from hashChannels → explicit config (highest).
 func loadChannelKeys(cfg *Config, configPath string) map[string]string {
 	keys := make(map[string]string)
 
-	// 1. Rainbow table keys (lowest priority)
+	// 0. Built-in firmware-default keys (lowest priority — overridable by everything else)
+	for k, v := range builtinChannelKeys() {
+		keys[k] = v
+	}
+
+	// 1. Rainbow table keys
 	keysPath := os.Getenv("CHANNEL_KEYS_PATH")
 	if keysPath == "" {
 		keysPath = cfg.ChannelKeysPath
@@ -995,10 +1354,77 @@ func loadChannelKeys(cfg *Config, configPath string) map[string]string {
 
 	// 3. Explicit config keys (highest priority — overrides rainbow + derived)
 	for k, v := range cfg.ChannelKeys {
-		keys[k] = v
+		normalized := normalizeChannelName(k)
+		if normalized != k {
+			log.Printf("[channels] Normalizing known channel key %q → %q for display", k, normalized)
+		}
+		// Detect config collision: if both "public" and "Public" are present,
+		// the normalized key collides. Resolve deterministically: prefer the
+		// canonical (already-normalized) form over the lowercase variant.
+		if _, dupe := keys[normalized]; dupe {
+			// If the incoming key IS the canonical form, it wins (overwrite).
+			// If the incoming key is a non-canonical form (e.g., "public"), keep existing.
+			if k == normalized {
+				log.Printf("[channels] Resolving duplicate %q: canonical form wins over non-canonical", normalized)
+				keys[normalized] = v
+			} else {
+				log.Printf("[channels] WARNING: duplicate channel key %q — config has %q normalizing to %q, keeping canonical value", normalized, k, normalized)
+			}
+		} else {
+			keys[normalized] = v
+		}
 	}
 
 	return keys
+}
+
+func loadRegionKeys(cfg *Config) map[string][]byte {
+	keys := make(map[string][]byte)
+	for _, raw := range cfg.HashRegions {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			log.Printf("[regions] skipping empty hashRegions entry")
+			continue
+		}
+		if !strings.HasPrefix(name, "#") {
+			name = "#" + name
+		}
+		if _, exists := keys[name]; exists {
+			log.Printf("[regions] duplicate region %q ignored", name)
+			continue
+		}
+		h := sha256.Sum256([]byte(name))
+		keys[name] = h[:16]
+	}
+	if len(keys) > 0 {
+		log.Printf("[regions] %d region key(s) loaded", len(keys))
+	}
+	return keys
+}
+
+// matchScope performs one HMAC-SHA256 per configured region. Expected
+// len(regionKeys) ≤ 50; beyond that, consider a pre-indexed lookup table.
+func matchScope(regionKeys map[string][]byte, payloadType byte, payloadRaw []byte, code1 string) string {
+	if code1 == "0000" || len(regionKeys) == 0 || len(payloadRaw) == 0 {
+		return ""
+	}
+	for name, key := range regionKeys {
+		mac := hmac.New(sha256.New, key)
+		mac.Write([]byte{payloadType})
+		mac.Write(payloadRaw)
+		hmacBytes := mac.Sum(nil)
+		code := uint16(hmacBytes[0]) | uint16(hmacBytes[1])<<8
+		if code == 0 {
+			code = 1
+		} else if code == 0xFFFF {
+			code = 0xFFFE
+		}
+		codeBytes := [2]byte{byte(code & 0xFF), byte(code >> 8)}
+		if strings.ToUpper(hex.EncodeToString(codeBytes[:])) == code1 {
+			return name
+		}
+	}
+	return ""
 }
 
 // Version info (set via ldflags)
@@ -1009,4 +1435,12 @@ func init() {
 		fmt.Println("corescope-ingestor", version)
 		os.Exit(0)
 	}
+}
+
+// shouldUpdateDefaultScope returns true when the packet carries a transport
+// scope whose region key matched (#1534). Without the ScopeName non-empty
+// guard, transport-scoped adverts from non-matching regions would overwrite
+// previously-correct default_scope values with the empty string.
+func shouldUpdateDefaultScope(pktData *PacketData) bool {
+	return pktData.IsTransportScoped && pktData.ScopeName != ""
 }

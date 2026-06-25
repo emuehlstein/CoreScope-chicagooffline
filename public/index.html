@@ -36,11 +36,27 @@
   <meta name="twitter:title" content="CoreScope">
   <meta name="twitter:description" content="Real-time MeshCore LoRa mesh network analyzer — live packet visualization, node tracking, channel decryption, and route analysis.">
   <meta name="twitter:image" content="https://raw.githubusercontent.com/Kpa-clawbot/corescope/master/public/og-image.png">
+  <!-- PR #893 follow-up: apply persisted theme before stylesheet/paint to prevent
+       FOUC (light flash for users who chose dark). Matches keys used by app.js. -->
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem('meshcore-theme');
+        var t = saved === 'dark' || saved === 'light'
+          ? saved
+          : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (_) { /* localStorage may be blocked; CSS handles default */ }
+    })();
+  </script>
   <link rel="stylesheet" href="style.css?v=__BUST__">
+  <link rel="stylesheet" href="route-view.css?v=__BUST__">
   <link rel="stylesheet" href="home.css?v=__BUST__">
   <link rel="stylesheet" href="live.css?v=__BUST__">
-  <link rel="stylesheet" href="globe.css?v=__BUST__">
+  <link rel="stylesheet" href="node-reach.css?v=__BUST__">
   <link rel="stylesheet" href="bottom-nav.css?v=__BUST__">
+  <link rel="stylesheet" href="nav-drawer.css?v=__BUST__">
+  <link rel="stylesheet" href="globe.css?v=__BUST__">
   <!-- Chicago Offline brand theme — overrides upstream palette vars -->
   <link rel="stylesheet" href="chicagooffline-theme.css?v=__BUST__">
   <!-- Chicago Offline map layer catalog — must load before map.js / live.js -->
@@ -58,6 +74,48 @@
   <script src="https://unpkg.com/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
 <body>
+  <!-- #1380 — Colorblind a11y stretch goal: Brettel/Vienot 1997 dichromatic
+       simulation overlay. Toggled by body[data-cb-sim="deut|prot|trit|achromat"].
+       Preview-only (not persisted). See public/customize-v2.js radio group. -->
+  <svg aria-hidden="true" focusable="false" width="0" height="0" style="position:absolute;width:0;height:0;overflow:hidden" data-cb-sim-defs>
+    <defs>
+      <filter id="cb-deut" color-interpolation-filters="sRGB">
+        <feColorMatrix type="matrix" values="
+           0.367  0.861 -0.228  0  0
+           0.280  0.673  0.047  0  0
+          -0.012  0.043  0.969  0  0
+           0      0      0      1  0"/>
+      </filter>
+      <filter id="cb-prot" color-interpolation-filters="sRGB">
+        <feColorMatrix type="matrix" values="
+           0.152  1.053 -0.205  0  0
+           0.115  0.786  0.099  0  0
+          -0.004 -0.048  1.052  0  0
+           0      0      0      1  0"/>
+      </filter>
+      <filter id="cb-trit" color-interpolation-filters="sRGB">
+        <feColorMatrix type="matrix" values="
+           1.256 -0.077 -0.179  0  0
+          -0.078  0.931  0.148  0  0
+           0.005  0.691  0.304  0  0
+           0      0      0      1  0"/>
+      </filter>
+      <filter id="cb-achromat" color-interpolation-filters="sRGB">
+        <feColorMatrix type="matrix" values="
+           0.299  0.587  0.114  0  0
+           0.299  0.587  0.114  0  0
+           0.299  0.587  0.114  0  0
+           0      0      0      1  0"/>
+      </filter>
+    </defs>
+  </svg>
+  <style>
+    /* #1380 — sim overlay activation (preview-only; cleared on reload). */
+    body[data-cb-sim="deut"]     { filter: url(#cb-deut); }
+    body[data-cb-sim="prot"]     { filter: url(#cb-prot); }
+    body[data-cb-sim="trit"]     { filter: url(#cb-trit); }
+    body[data-cb-sim="achromat"] { filter: url(#cb-achromat); }
+  </style>
   <a class="skip-link" href="#app">Skip to content</a>
   <nav class="top-nav" role="navigation" aria-label="Main navigation">
     <div class="nav-left">
@@ -80,16 +138,16 @@
       <div class="nav-links">
         <a href="#/home" class="nav-link" data-route="home" data-priority="high">Home</a>
         <a href="#/map" class="nav-link" data-route="map" data-priority="high">Map</a>
-        <a href="#/live" class="nav-link" data-route="live" data-priority="high">Live</a>
-        <a href="#/channels" class="nav-link" data-route="channels" data-priority="high">Channels</a>
+        <a href="#/live" class="nav-link" data-route="live" data-priority="high"><svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-broadcast"></use></svg> Live</a>
+        <a href="#/channels" class="nav-link" data-route="channels">Channels</a>
         <a href="#/nodes" class="nav-link" data-route="nodes" data-priority="high">Nodes</a>
         <a href="#/packets" class="nav-link" data-route="packets" data-priority="high">Packets</a>
         <a href="#/observers" class="nav-link" data-route="observers">Observers</a>
+        <a href="#/analytics" class="nav-link" data-route="analytics">Analytics</a>
+        <a href="#/perf" class="nav-link" data-route="perf"><svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-lightning"></use></svg> Perf</a>
+        <a href="#/audio-lab" class="nav-link" data-route="audio-lab"><svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-music-note"></use></svg> Lab</a>
         <a href="#/globe" class="nav-link" data-route="globe">Globe</a>
         <a href="#/traces" class="nav-link">Traces</a>
-        <a href="#/analytics" class="nav-link">Analytics</a>
-        <a href="#/perf" class="nav-link">Perf</a>
-        <a href="#/audio-lab" class="nav-link">Lab</a>
       </div>
       <div class="nav-more-wrap">
         <button class="nav-btn nav-more-btn" id="navMoreBtn" aria-haspopup="true" aria-expanded="false" aria-controls="navMoreMenu" title="More pages">More ▾</button>
@@ -99,20 +157,20 @@
     <div class="nav-right">
       <div class="nav-stats" id="navStats" title="Live stats"></div>
       <div class="nav-fav-wrap">
-        <button class="nav-btn" id="favToggle" title="Favorites">⭐</button>
+        <button class="nav-btn" id="favToggle" title="Favorites" aria-label="Favorites"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg></button>
         <div class="nav-fav-dropdown" id="favDropdown"></div>
       </div>
-      <button class="nav-btn" id="searchToggle" title="Search (Ctrl+K)">🔍</button>
-      <button class="nav-btn" id="customizeToggle" title="Customize theme & branding">🎨</button>
-      <label class="theme-toggle" id="darkModeToggle" title="Toggle dark mode" aria-label="Toggle dark mode">
-        <input type="checkbox" id="darkModeCheckbox" aria-hidden="true">
-        <span class="theme-toggle-track">
+      <button class="nav-btn" id="searchToggle" title="Search (Ctrl+K)" aria-label="Search"><svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"></use></svg></button>
+      <button class="nav-btn" id="customizeToggle" title="Customize theme &amp; branding" aria-label="Customize"><svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-palette"></use></svg></button>
+      <label class="theme-toggle" id="darkModeToggle" title="Toggle dark mode">
+        <input type="checkbox" id="darkModeCheckbox" role="switch" aria-label="Toggle dark mode">
+        <span class="theme-toggle-track" aria-hidden="true">
           <span class="theme-toggle-thumb"></span>
-          <span class="theme-toggle-icon theme-toggle-sun">☀️</span>
-          <span class="theme-toggle-icon theme-toggle-moon">🌙</span>
+          <span class="theme-toggle-icon theme-toggle-sun"><svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-sun"></use></svg></span>
+          <span class="theme-toggle-icon theme-toggle-moon"><svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-moon"></use></svg></span>
         </span>
       </label>
-      <button class="nav-btn hamburger" id="hamburger" title="Menu" aria-label="Toggle navigation menu">☰</button>
+      <button class="nav-btn hamburger" id="hamburger" title="Menu" aria-label="Toggle navigation menu"><svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-list"></use></svg></button>
     </div>
   </nav>
 
@@ -128,8 +186,11 @@
 
   <script src="vendor/qrcode.js"></script>
   <script src="roles.js?v=__BUST__"></script>
+  <script src="map-tile-providers.js?v=__BUST__"></script>
+  <script src="cb-presets.js?v=__BUST__"></script>
   <script src="customize-v2.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="region-filter.js?v=__BUST__"></script>
+  <script src="area-filter.js?v=__BUST__"></script>
   <script src="hop-resolver.js?v=__BUST__"></script>
   <script src="hop-display.js?v=__BUST__"></script>
   <script src="app.js?v=__BUST__"></script>
@@ -143,6 +204,7 @@
   <script src="packet-filter.js?v=__BUST__"></script>
   <script src="filter-ux.js?v=__BUST__"></script>
   <script src="hash-color.js?v=__BUST__"></script>
+  <script src="prefix-reserved.js?v=__BUST__"></script>
   <script src="packet-helpers.js?v=__BUST__"></script>
   <script src="vendor/aes-ecb.js?v=__BUST__"></script>
   <script src="vendor/sha256-hmac.js?v=__BUST__"></script>
@@ -154,6 +216,9 @@
   <script src="packets.js?v=__BUST__"></script>
   <script src="geo-filter-overlay.js?v=__BUST__"></script>
   <script src="map.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
+  <script src="route-render.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
+  <script src="route-view-utils.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
+  <script src="route-view.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="channels.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="table-sort.js?v=__BUST__"></script>
   <script src="nodes.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
@@ -177,6 +242,9 @@
   <script src="observer-detail.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="compare.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="node-analytics.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
+  <script src="node-reach-map.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
+  <script src="node-reach.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
   <script src="perf.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
+  <script src="mobile-page-actions.js?v=__BUST__" onerror="console.error('Failed to load:', this.src)"></script>
 </body>
 </html>

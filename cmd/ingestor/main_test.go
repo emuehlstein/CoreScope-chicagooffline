@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -133,7 +137,7 @@ func TestHandleMessageRawPacket(t *testing.T) {
 	payload := []byte(`{"raw":"` + rawHex + `","SNR":5.5,"RSSI":-100.0,"origin":"myobs"}`)
 	msg := &mockMessage{topic: "meshcore/SJC/obs1/packets", payload: payload}
 
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
@@ -150,7 +154,7 @@ func TestHandleMessageRawPacketAdvert(t *testing.T) {
 	payload := []byte(`{"raw":"` + rawHex + `"}`)
 	msg := &mockMessage{topic: "meshcore/SJC/obs1/packets", payload: payload}
 
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	// Should create a node from the ADVERT
 	var count int
@@ -172,7 +176,7 @@ func TestHandleMessageInvalidJSON(t *testing.T) {
 	msg := &mockMessage{topic: "meshcore/SJC/obs1/packets", payload: []byte(`not json`)}
 
 	// Should not panic
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
@@ -189,7 +193,7 @@ func TestHandleMessageStatusTopic(t *testing.T) {
 		payload: []byte(`{"origin":"MyObserver"}`),
 	}
 
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var name, iata string
 	err := store.db.QueryRow("SELECT name, iata FROM observers WHERE id = 'obs1'").Scan(&name, &iata)
@@ -210,11 +214,11 @@ func TestHandleMessageSkipStatusTopics(t *testing.T) {
 
 	// meshcore/status should be skipped
 	msg1 := &mockMessage{topic: "meshcore/status", payload: []byte(`{"raw":"0A00"}`)}
-	handleMessage(store, "test", source, msg1, nil, &Config{})
+	handleMessage(store, "test", source, msg1, nil, nil, &Config{})
 
 	// meshcore/events/connection should be skipped
 	msg2 := &mockMessage{topic: "meshcore/events/connection", payload: []byte(`{"raw":"0A00"}`)}
-	handleMessage(store, "test", source, msg2, nil, &Config{})
+	handleMessage(store, "test", source, msg2, nil, nil, &Config{})
 
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
@@ -233,7 +237,7 @@ func TestHandleMessageIATAFilter(t *testing.T) {
 		topic:   "meshcore/SJC/obs1/packets",
 		payload: []byte(`{"raw":"` + rawHex + `"}`),
 	}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
@@ -246,7 +250,7 @@ func TestHandleMessageIATAFilter(t *testing.T) {
 		topic:   "meshcore/LAX/obs2/packets",
 		payload: []byte(`{"raw":"` + rawHex + `"}`),
 	}
-	handleMessage(store, "test", source, msg2, nil, &Config{})
+	handleMessage(store, "test", source, msg2, nil, nil, &Config{})
 
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
 	if count != 1 {
@@ -264,7 +268,7 @@ func TestHandleMessageIATAFilterNoRegion(t *testing.T) {
 		topic:   "meshcore",
 		payload: []byte(`{"raw":"` + rawHex + `"}`),
 	}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	// No region part → filter doesn't apply, message goes through
 	// Actually the code checks len(parts) > 1 for IATA filter
@@ -280,7 +284,7 @@ func TestHandleMessageNoRawHex(t *testing.T) {
 		topic:   "meshcore/SJC/obs1/packets",
 		payload: []byte(`{"type":"companion","data":"something"}`),
 	}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
@@ -298,7 +302,7 @@ func TestHandleMessageBadRawHex(t *testing.T) {
 		topic:   "meshcore/SJC/obs1/packets",
 		payload: []byte(`{"raw":"ZZZZ"}`),
 	}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
@@ -315,7 +319,7 @@ func TestHandleMessageWithSNRRSSIAsNumbers(t *testing.T) {
 	payload := []byte(`{"raw":"` + rawHex + `","SNR":7.2,"RSSI":-95}`)
 	msg := &mockMessage{topic: "meshcore/SJC/obs1/packets", payload: payload}
 
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var snr, rssi *float64
 	store.db.QueryRow("SELECT snr, rssi FROM observations LIMIT 1").Scan(&snr, &rssi)
@@ -334,7 +338,7 @@ func TestHandleMessageMinimalTopic(t *testing.T) {
 		topic:   "meshcore/SJC",
 		payload: []byte(`{"raw":"` + rawHex + `"}`),
 	}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
@@ -355,7 +359,7 @@ func TestHandleMessageCorruptedAdvert(t *testing.T) {
 		topic:   "meshcore/SJC/obs1/packets",
 		payload: []byte(`{"raw":"` + rawHex + `"}`),
 	}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	// Transmission should be inserted (even if advert is invalid)
 	var count int
@@ -381,7 +385,7 @@ func TestHandleMessageNoObserverID(t *testing.T) {
 		topic:   "packets",
 		payload: []byte(`{"raw":"` + rawHex + `","origin":"obs1"}`),
 	}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
@@ -403,7 +407,7 @@ func TestHandleMessageSNRNotFloat(t *testing.T) {
 	// SNR as a string value — should not parse as float
 	payload := []byte(`{"raw":"` + rawHex + `","SNR":"bad","RSSI":"bad"}`)
 	msg := &mockMessage{topic: "meshcore/SJC/obs1/packets", payload: payload}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
@@ -419,7 +423,7 @@ func TestHandleMessageOriginExtraction(t *testing.T) {
 	rawHex := "0A00D69FD7A5A7475DB07337749AE61FA53A4788E976"
 	payload := []byte(`{"raw":"` + rawHex + `","origin":"MyOrigin"}`)
 	msg := &mockMessage{topic: "meshcore/SJC/obs1/packets", payload: payload}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	// Verify origin was extracted to observer name
 	var name string
@@ -442,7 +446,7 @@ func TestHandleMessagePanicRecovery(t *testing.T) {
 	}
 
 	// Should not panic — the defer/recover should catch it
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 }
 
 func TestHandleMessageStatusOriginFallback(t *testing.T) {
@@ -454,7 +458,7 @@ func TestHandleMessageStatusOriginFallback(t *testing.T) {
 		topic:   "meshcore/SJC/obs1/status",
 		payload: []byte(`{"type":"status"}`),
 	}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var name string
 	err := store.db.QueryRow("SELECT name FROM observers WHERE id = 'obs1'").Scan(&name)
@@ -480,18 +484,20 @@ func TestEpochToISO(t *testing.T) {
 }
 
 func TestAdvertRole(t *testing.T) {
+	// advertRole now keys off AdvertFlags.Type (firmware ADV_TYPE_*) — see
+	// firmware/src/helpers/AdvertDataHelpers.h:7-12 and issue #1279 P1 #3.
 	tests := []struct {
 		name  string
 		flags *AdvertFlags
 		want  string
 	}{
-		{"repeater", &AdvertFlags{Repeater: true}, "repeater"},
-		{"room", &AdvertFlags{Room: true}, "room"},
-		{"sensor", &AdvertFlags{Sensor: true}, "sensor"},
-		{"companion (default)", &AdvertFlags{Chat: true}, "companion"},
-		{"companion (no flags)", &AdvertFlags{}, "companion"},
-		{"repeater takes priority", &AdvertFlags{Repeater: true, Room: true}, "repeater"},
-		{"room before sensor", &AdvertFlags{Room: true, Sensor: true}, "room"},
+		{"none (type 0)", &AdvertFlags{Type: 0}, "none"},
+		{"companion (type 1)", &AdvertFlags{Type: 1, Chat: true}, "companion"},
+		{"repeater (type 2)", &AdvertFlags{Type: 2, Repeater: true}, "repeater"},
+		{"room (type 3)", &AdvertFlags{Type: 3, Room: true}, "room"},
+		{"sensor (type 4)", &AdvertFlags{Type: 4, Sensor: true}, "sensor"},
+		{"future type-5", &AdvertFlags{Type: 5}, "type-5"},
+		{"nil flags falls back to companion", nil, "companion"},
 	}
 
 	for _, tt := range tests {
@@ -610,8 +616,41 @@ func TestLoadChannelKeysHashChannelsNormalization(t *testing.T) {
 	if _, ok := keys["#Spaced"]; !ok {
 		t.Error("should derive key for #Spaced (trimmed)")
 	}
-	if len(keys) != 3 {
-		t.Errorf("expected 3 keys, got %d", len(keys))
+	// 3 derived + builtins (Public)
+	expected := 3 + len(builtinChannelKeys())
+	if len(keys) != expected {
+		t.Errorf("expected %d keys, got %d", expected, len(keys))
+	}
+}
+
+// Default Public channel must always be present from the built-in floor,
+// regardless of whether a rainbow file is provided.
+func TestLoadChannelKeysBuiltinPublic(t *testing.T) {
+	t.Setenv("CHANNEL_KEYS_PATH", "")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfg := &Config{}
+
+	keys := loadChannelKeys(cfg, cfgPath)
+
+	if got := keys["Public"]; got != "8b3387e9c5cdea6ac9e5edbaa115cd72" {
+		t.Errorf("Public key = %q, want firmware-default 8b3387e9c5cdea6ac9e5edbaa115cd72", got)
+	}
+}
+
+// Explicit config and rainbow entries must still override the built-in floor.
+func TestLoadChannelKeysBuiltinOverridable(t *testing.T) {
+	t.Setenv("CHANNEL_KEYS_PATH", "")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfg := &Config{
+		ChannelKeys: map[string]string{"Public": "deadbeefdeadbeefdeadbeefdeadbeef"},
+	}
+
+	keys := loadChannelKeys(cfg, cfgPath)
+
+	if got := keys["Public"]; got != "deadbeefdeadbeefdeadbeefdeadbeef" {
+		t.Errorf("Public key = %q, want explicit override deadbeef...", got)
 	}
 }
 
@@ -643,7 +682,7 @@ func TestHandleMessageWithLowercaseSNRRSSI(t *testing.T) {
 	payload := []byte(`{"raw":"` + rawHex + `","snr":5.5,"rssi":-102}`)
 	msg := &mockMessage{topic: "meshcore/SJC/obs1/packets", payload: payload}
 
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var snr, rssi *float64
 	store.db.QueryRow("SELECT snr, rssi FROM observations LIMIT 1").Scan(&snr, &rssi)
@@ -664,7 +703,7 @@ func TestHandleMessageSNRRSSIUppercaseWins(t *testing.T) {
 	payload := []byte(`{"raw":"` + rawHex + `","SNR":7.2,"snr":1.0,"RSSI":-95,"rssi":-50}`)
 	msg := &mockMessage{topic: "meshcore/SJC/obs1/packets", payload: payload}
 
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var snr, rssi *float64
 	store.db.QueryRow("SELECT snr, rssi FROM observations LIMIT 1").Scan(&snr, &rssi)
@@ -684,7 +723,7 @@ func TestHandleMessageNoSNRRSSI(t *testing.T) {
 	payload := []byte(`{"raw":"` + rawHex + `"}`)
 	msg := &mockMessage{topic: "meshcore/SJC/obs1/packets", payload: payload}
 
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var snr, rssi *float64
 	store.db.QueryRow("SELECT snr, rssi FROM observations LIMIT 1").Scan(&snr, &rssi)
@@ -755,7 +794,7 @@ func TestIATAFilterDoesNotDropStatusMessages(t *testing.T) {
 		topic:   "meshcore/BFL/bfl-obs1/status",
 		payload: []byte(`{"origin":"BFLObserver","stats":{"noise_floor":-105.0}}`),
 	}
-	handleMessage(store, "test", source, msg, nil, &Config{})
+	handleMessage(store, "test", source, msg, nil, nil, &Config{})
 
 	var name string
 	var noiseFloor *float64
@@ -776,11 +815,92 @@ func TestIATAFilterDoesNotDropStatusMessages(t *testing.T) {
 		topic:   "meshcore/BFL/bfl-obs1/packets",
 		payload: []byte(`{"raw":"` + rawHex + `"}`),
 	}
-	handleMessage(store, "test", source, pktMsg, nil, &Config{})
+	handleMessage(store, "test", source, pktMsg, nil, nil, &Config{})
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&count)
 	if count != 0 {
 		t.Error("packet from out-of-region BFL should still be filtered by IATA")
+	}
+}
+
+func TestLoadRegionKeys(t *testing.T) {
+	cfg := &Config{HashRegions: []string{"#belgium", "eu", "  #Test  ", "", "#belgium"}}
+	keys := loadRegionKeys(cfg)
+
+	// Deduplication + normalization
+	if len(keys) != 3 {
+		t.Fatalf("len(keys) = %d, want 3", len(keys))
+	}
+	// Pre-computed: SHA256("#belgium")[:16]. Hardcoded so a change to the key
+	// derivation algorithm (hash function, truncation length) breaks this test
+	// even if both sides were updated together.
+	wantBelgium, _ := hex.DecodeString("7085b78ed010599094f8c8e7d1aa0e27")
+	if got := keys["#belgium"]; !bytes.Equal(got, wantBelgium) {
+		t.Errorf("#belgium key mismatch: got %x, want %x", got, wantBelgium)
+	}
+	// "eu" should be normalized to "#eu"
+	if _, ok := keys["#eu"]; !ok {
+		t.Error("expected #eu key")
+	}
+	// "  #Test  " should be normalized to "#Test"
+	if _, ok := keys["#Test"]; !ok {
+		t.Error("expected #Test key")
+	}
+}
+
+func TestMatchScope(t *testing.T) {
+	// Fixed known-answer vectors only — no in-test HMAC computation.
+	// Keys and Code1 values are pre-computed externally so a wrong algorithm
+	// that produces consistent wrong results on both sides would still fail.
+
+	// Vector 1: "#test"/payloadType=5/"hello" → Code1=2AB5
+	// Key = SHA256("#test")[:16] = 9cd8fcf22a47333b591d96a2b848b73f
+	testKey, _ := hex.DecodeString("9cd8fcf22a47333b591d96a2b848b73f")
+	testKeys := map[string][]byte{"#test": testKey}
+	if got := matchScope(testKeys, 5, []byte("hello"), "2AB5"); got != "#test" {
+		t.Errorf("#test vector: matchScope = %q, want #test", got)
+	}
+
+	// Vector 2: "#belgium"/payloadType=5/"hello" → Code1=4A75
+	// Key = SHA256("#belgium")[:16] = 7085b78ed010599094f8c8e7d1aa0e27
+	belgiumKey, _ := hex.DecodeString("7085b78ed010599094f8c8e7d1aa0e27")
+	belgiumKeys := map[string][]byte{"#belgium": belgiumKey}
+	if got := matchScope(belgiumKeys, 5, []byte("hello"), "4A75"); got != "#belgium" {
+		t.Errorf("#belgium vector: matchScope = %q, want #belgium", got)
+	}
+
+	// Code1=0000 (unscoped transport) → no region matched
+	if got := matchScope(belgiumKeys, 5, []byte("hello"), "0000"); got != "" {
+		t.Errorf("unscoped: matchScope = %q, want empty", got)
+	}
+
+	// Code1 present but matches no configured region → empty string
+	if got := matchScope(belgiumKeys, 5, []byte("hello"), "BEEF"); got != "" {
+		t.Errorf("no match: matchScope = %q, want empty", got)
+	}
+}
+
+func TestBuildPacketDataScopeMatching(t *testing.T) {
+	// Fixed known-answer packet: TRANSPORT_FLOOD, payloadType=5, payload="hello",
+	// Code1=2AB5 (pre-computed for region "#test").
+	// header=0x14 (route_type=0 FLOOD, payloadType=5 → 5<<2), Code1=[0x2A,0xB5],
+	// Code2=[0,0], path_len=0, payload="hello" (68 65 6C 6C 6F).
+	const rawHex = "142AB500000068656C6C6F"
+	key, _ := hex.DecodeString("9cd8fcf22a47333b591d96a2b848b73f") // SHA256("#test")[:16]
+	regionKeys := map[string][]byte{"#test": key}
+
+	decoded, err := DecodePacket(rawHex, nil, false)
+	if err != nil {
+		t.Fatalf("DecodePacket: %v", err)
+	}
+
+	msg := &MQTTPacketMessage{Raw: rawHex}
+	pktData := BuildPacketData(msg, decoded, "obs1", "region1", regionKeys)
+	if pktData.ScopeName != "#test" {
+		t.Errorf("ScopeName = %q, want #test", pktData.ScopeName)
+	}
+	if !pktData.IsTransportScoped {
+		t.Error("IsTransportScoped should be true")
 	}
 }
 
@@ -916,7 +1036,7 @@ func TestHandleMessageObserverIATAWhitelist(t *testing.T) {
 	handleMessage(store, "test", source, &mockMessage{
 		topic:   "meshcore/GOT/obs1/status",
 		payload: []byte(`{"origin":"node1","noise_floor":-110}`),
-	}, nil, cfg)
+	}, nil, nil, cfg)
 
 	var count int
 	store.db.QueryRow("SELECT COUNT(*) FROM observers WHERE id='obs1'").Scan(&count)
@@ -928,10 +1048,140 @@ func TestHandleMessageObserverIATAWhitelist(t *testing.T) {
 	handleMessage(store, "test", source, &mockMessage{
 		topic:   "meshcore/ARN/obs2/status",
 		payload: []byte(`{"origin":"node2","noise_floor":-105}`),
-	}, nil, cfg)
+	}, nil, nil, cfg)
 
 	store.db.QueryRow("SELECT COUNT(*) FROM observers WHERE id='obs2'").Scan(&count)
 	if count != 1 {
 		t.Errorf("observer from whitelisted IATA ARN should be accepted, got count=%d", count)
+	}
+}
+
+// TestBuildPacketDataScopeMatchingNoMatch covers the #1534 regression: a
+// transport-scoped advert from a non-matching region carries
+// IsTransportScoped=true and ScopeName="". The default_scope update guard
+// must skip these packets so previously-correct scopes aren't overwritten
+// with the empty string.
+func TestBuildPacketDataScopeMatchingNoMatch(t *testing.T) {
+	// Code1=2AB5 is the precomputed code for region "#test" (payload="hello",
+	// payloadType=5). Build a region-key map for a DIFFERENT region so
+	// matchScope() finds no match and returns "".
+	const rawHex = "142AB500000068656C6C6F"
+	otherKey, _ := hex.DecodeString("aabbccddeeff00112233445566778899")
+	regionKeys := map[string][]byte{"#other": otherKey}
+
+	decoded, err := DecodePacket(rawHex, nil, false)
+	if err != nil {
+		t.Fatalf("DecodePacket: %v", err)
+	}
+	msg := &MQTTPacketMessage{Raw: rawHex}
+	pktData := BuildPacketData(msg, decoded, "obs1", "region1", regionKeys)
+
+	if !pktData.IsTransportScoped {
+		t.Fatalf("precondition: IsTransportScoped should be true (Code1 != 0000)")
+	}
+	if pktData.ScopeName != "" {
+		t.Fatalf("precondition: ScopeName should be empty (no region match), got %q", pktData.ScopeName)
+	}
+
+	// Regression assertion: when ScopeName is empty, the guard must skip the
+	// UpdateNodeDefaultScope call so an empty value never overwrites a
+	// previously-correct default_scope (#1534).
+	if shouldUpdateDefaultScope(pktData) {
+		t.Errorf("shouldUpdateDefaultScope = true for empty ScopeName; want false (would overwrite default_scope with \"\")")
+	}
+}
+
+// TestHandleMessageAdvert_EmptyScopeSkipsDefaultScopeUpdate is the call-site
+// regression test for #1534. It drives a transport-scoped ADVERT whose
+// region key does NOT match any configured region (so ScopeName=="") through
+// handleMessage end-to-end and asserts that a pre-existing default_scope on
+// the node is NOT overwritten with the empty string. This anchors the
+// call-site guard at main.go:720 — a future refactor that drops the
+// `if shouldUpdateDefaultScope(...)` wrapper and calls
+// `store.UpdateNodeDefaultScope(pubkey, pktData.ScopeName)` unconditionally
+// would re-introduce the #1534 bug and fail this test.
+func TestHandleMessageAdvert_EmptyScopeSkipsDefaultScopeUpdate(t *testing.T) {
+	store := newTestStore(t)
+	source := MQTTSource{Name: "test"}
+
+	// A transport-scoped ADVERT: header byte 0x10 = route_type 0
+	// (TRANSPORT_FLOOD) + payload_type 4 (ADVERT). Code1=AABB (non-zero, so
+	// IsTransportScoped becomes true), Code2=0000, path_byte=00, then a
+	// 100-byte ADVERT payload (32-byte pubkey starting 46D62D… + 4-byte ts
+	// + 64-byte signature) reused from TestHandleMessageAdvertWithTelemetry.
+	const rawHex = "10AABB00000046D62DE27D4C5194D7821FC5A34A45565DCC2537B300B9AB6275255CEFB65D840CE5C169C94C9AED39E8BCB6CB6EB0335497A198B33A1A610CD3B03D8DCFC160900E5244280323EE0B44CACAB8F02B5B38B91CFA18BD067B0B5E63E94CFC85F758A8530B9240933402E0E6B8F84D5252322D52"
+	const pubkey = "46d62de27d4c5194d7821fc5a34a45565dcc2537b300b9ab6275255cefb65d84"
+
+	// Pre-seed the node with a non-empty default_scope so we can detect an
+	// erroneous overwrite with "".
+	if _, err := store.db.Exec(`INSERT INTO nodes (public_key, name, default_scope) VALUES (?, 'Node1', '#belgium')`, pubkey); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	// Empty regionKeys → matchScope() returns "" for any Code1 → ScopeName "".
+	msg := &mockMessage{
+		topic:   "meshcore/SJC/obs1/packets",
+		payload: []byte(`{"raw":"` + rawHex + `"}`),
+	}
+	handleMessage(store, "test", source, msg, nil, map[string][]byte{}, &Config{})
+
+	var got sql.NullString
+	if err := store.db.QueryRow(`SELECT default_scope FROM nodes WHERE public_key = ?`, pubkey).Scan(&got); err != nil {
+		t.Fatalf("read default_scope: %v", err)
+	}
+	if !got.Valid || got.String != "#belgium" {
+		t.Errorf("default_scope after empty-scope advert = %q (valid=%v), want #belgium — call-site guard at main.go:720 is missing or broken (#1534)", got.String, got.Valid)
+	}
+}
+
+// TestHandleMessageAdvert_MatchedScopeUpdatesDefaultScope is the positive
+// counterpart: a transport-scoped ADVERT whose Code1 matches a configured
+// region key MUST cause default_scope to be updated to the matched region
+// name. Together with the empty-scope test above this proves the call-site
+// branch routes correctly for both ScopeName states.
+func TestHandleMessageAdvert_MatchedScopeUpdatesDefaultScope(t *testing.T) {
+	store := newTestStore(t)
+	source := MQTTSource{Name: "test"}
+
+	// Same ADVERT bytes; this time we compute the matching region key for
+	// the (payloadType=4, payload=<advert bytes>) tuple so matchScope() will
+	// return "#de".
+	const advertBytes = "46D62DE27D4C5194D7821FC5A34A45565DCC2537B300B9AB6275255CEFB65D840CE5C169C94C9AED39E8BCB6CB6EB0335497A198B33A1A610CD3B03D8DCFC160900E5244280323EE0B44CACAB8F02B5B38B91CFA18BD067B0B5E63E94CFC85F758A8530B9240933402E0E6B8F84D5252322D52"
+	const pubkey = "46d62de27d4c5194d7821fc5a34a45565dcc2537b300b9ab6275255cefb65d84"
+
+	advertRaw, _ := hex.DecodeString(advertBytes)
+	// Derive the region key whose HMAC produces Code1 we can plant in the
+	// header. Choose key = first 16 bytes of HMAC-SHA256(zeros, advertBytes)
+	// is non-deterministic to find; instead pick an arbitrary key and
+	// compute Code1 from it, then build the packet around that Code1.
+	regionKey, _ := hex.DecodeString("0123456789abcdef0123456789abcdef")
+	mac := hmacSHA256(regionKey, append([]byte{4}, advertRaw...))
+	// Per firmware (#1534 helper logic): Code1 is the first 2 bytes of the
+	// HMAC, sentinel-shifted so 0x0000 → 0x0001 and 0xFFFF → 0xFFFE.
+	code := uint16(mac[0]) | (uint16(mac[1]) << 8)
+	if code == 0x0000 {
+		code = 0x0001
+	} else if code == 0xFFFF {
+		code = 0xFFFE
+	}
+	code1 := fmt.Sprintf("%02X%02X", byte(code&0xFF), byte(code>>8))
+	rawHex := "10" + code1 + "000000" + advertBytes
+
+	if _, err := store.db.Exec(`INSERT INTO nodes (public_key, name, default_scope) VALUES (?, 'Node1', '#old')`, pubkey); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	msg := &mockMessage{
+		topic:   "meshcore/SJC/obs1/packets",
+		payload: []byte(`{"raw":"` + rawHex + `"}`),
+	}
+	handleMessage(store, "test", source, msg, nil, map[string][]byte{"#de": regionKey}, &Config{})
+
+	var got sql.NullString
+	if err := store.db.QueryRow(`SELECT default_scope FROM nodes WHERE public_key = ?`, pubkey).Scan(&got); err != nil {
+		t.Fatalf("read default_scope: %v", err)
+	}
+	if !got.Valid || got.String != "#de" {
+		t.Errorf("default_scope after matched-scope advert = %q (valid=%v), want #de", got.String, got.Valid)
 	}
 }

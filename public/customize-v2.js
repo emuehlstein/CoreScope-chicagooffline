@@ -9,15 +9,18 @@
   var DEFAULT_HOME = {
     heroTitle: 'CoreScope',
     heroSubtitle: 'Real-time MeshCore LoRa mesh network analyzer',
+    // #1648 M5: defaults use 'ph:<name>' sprite tokens. Back-compat: the
+    // render path (renderConfigGlyph) ALSO accepts legacy emoji strings
+    // for operators with stored config values.
     steps: [
-      { emoji: '🔵', title: 'Connect via Bluetooth', description: 'Flash **BLE companion** firmware from [MeshCore Flasher](https://flasher.meshcore.co.uk/).\n- Screenless devices: default PIN `123456`\n- Screen devices: random PIN shown on display\n- If pairing fails: forget device, reboot, re-pair' },
-      { emoji: '📻', title: 'Set the right frequency preset', description: '**US Recommended:**\n`910.525 MHz · BW 62.5 kHz · SF 7 · CR 5`\nSelect **"US Recommended"** in the app or flasher.' },
-      { emoji: '📡', title: 'Advertise yourself', description: 'Tap the signal icon → **Flood** to broadcast your node to the mesh. Companions only advert when you trigger it manually.' },
-      { emoji: '🔁', title: 'Check "Heard N repeats"', description: '- **"Sent"** = transmitted, no confirmation\n- **"Heard 0 repeats"** = no repeater picked it up\n- **"Heard 1+ repeats"** = you\'re on the mesh!' }
+      { emoji: 'ph:bluetooth', title: 'Connect via Bluetooth', description: 'Flash **BLE companion** firmware from [MeshCore Flasher](https://flasher.meshcore.io/).\n- Screenless devices: default PIN `123456`\n- Screen devices: random PIN shown on display\n- If pairing fails: forget device, reboot, re-pair' },
+      { emoji: 'ph:radio', title: 'Set the right frequency preset', description: '**US Recommended:**\n`910.525 MHz · BW 62.5 kHz · SF 7 · CR 5`\nSelect **"US Recommended"** in the app or flasher.' },
+      { emoji: 'ph:broadcast', title: 'Advertise yourself', description: 'Tap the signal icon → **Flood** to broadcast your node to the mesh. Companions only advert when you trigger it manually.' },
+      { emoji: 'ph:repeat', title: 'Check "Heard N repeats"', description: '- **"Sent"** = transmitted, no confirmation\n- **"Heard 0 repeats"** = no repeater picked it up\n- **"Heard 1+ repeats"** = you\'re on the mesh!' }
     ],
     footerLinks: [
-      { label: '📦 Packets', url: '#/packets' },
-      { label: '🗺️ Network Map', url: '#/map' }
+      { label: 'ph:package Packets', url: '#/packets' },
+      { label: 'ph:map-trifold Network Map', url: '#/map' }
     ]
   };
 
@@ -33,8 +36,8 @@
     'meshcore-live-heatmap-opacity'
   ];
 
-  var VALID_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps', 'heatmapOpacity', 'liveHeatmapOpacity', 'distanceUnit', 'favorites', 'myNodes'];
-  var OBJECT_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps'];
+  var VALID_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps', 'heatmapOpacity', 'liveHeatmapOpacity', 'distanceUnit', 'favorites', 'myNodes', 'markerStroke'];
+  var OBJECT_SECTIONS = ['branding', 'theme', 'themeDark', 'nodeColors', 'typeColors', 'home', 'timestamps', 'markerStroke'];
   var SCALAR_SECTIONS = ['heatmapOpacity', 'liveHeatmapOpacity'];
   var DISTANCE_UNIT_VALUES = ['km', 'mi', 'auto'];
 
@@ -42,6 +45,7 @@
   var THEME_CSS_MAP = {
     accent: '--accent', accentHover: '--accent-hover',
     navBg: '--nav-bg', navBg2: '--nav-bg2', navText: '--nav-text', navTextMuted: '--nav-text-muted',
+    navActiveBg: '--nav-active-bg',
     background: '--surface-0', text: '--text', textMuted: '--text-muted', border: '--border',
     statusGreen: '--status-green', statusYellow: '--status-yellow', statusRed: '--status-red',
     surface1: '--surface-1', surface2: '--surface-2', surface3: '--surface-3',
@@ -74,8 +78,10 @@
       img.className = 'brand-logo';
       img.setAttribute('src', url);
       img.setAttribute('alt', alt || node.getAttribute('aria-label') || 'Brand');
-      img.setAttribute('width', '125');
-      img.setAttribute('height', '36');
+      // #1450 — DO NOT set width/height attrs. CSS img.brand-logo handles
+      // sizing (height:36px, width:auto, max-width cap) so the operator's
+      // natural image aspect ratio is preserved instead of being squished
+      // into the default SVG's 125x36 pill box.
       node.parentNode.replaceChild(img, node);
     } else {
       if (node.tagName.toLowerCase() !== 'img') {
@@ -99,6 +105,22 @@
     if (brandLink) brandLink.setAttribute('aria-label', alt + ' home');
   }
 
+  // ── Brand home-link href swap (#1518) ──
+  // Apply a validated branding.homeUrl to <a class="nav-brand">[href]. When
+  // url is empty / invalid, restore the in-app default '#/' so operators can
+  // clear the override and immediately see the SPA route restored.
+  // Bottom-nav house glyph stays in-app — do NOT touch public/bottom-nav.js here, that
+  // preserves the SPA back-stack on mobile (per #1518 triage).
+  function _setBrandHomeUrl(url) {
+    var brandLink = document.querySelector('a.nav-brand');
+    if (!brandLink) return;
+    if (url && isValidHomeUrl(url)) {
+      brandLink.setAttribute('href', url);
+    } else {
+      brandLink.setAttribute('href', '#/');
+    }
+  }
+
   // ── Presets (copied from v1 customize.js) ──
   var PRESETS = {
     default: {
@@ -107,7 +129,7 @@
       theme: {
         accent: '#4a9eff', navBg: '#0f0f23', navText: '#ffffff', background: '#f4f5f7', text: '#1a1a2e',
         statusGreen: '#22c55e', statusYellow: '#eab308', statusRed: '#ef4444',
-        accentHover: '#6db3ff', navBg2: '#1a1a2e', navTextMuted: '#cbd5e1', textMuted: '#5b6370', border: '#e2e5ea',
+        accentHover: '#6db3ff', navBg2: '#1a1a2e', navTextMuted: '#cbd5e1', navActiveBg: 'rgba(74,158,255,0.15)', textMuted: '#5b6370', border: '#e2e5ea',
         surface1: '#ffffff', surface2: '#ffffff', cardBg: '#ffffff', contentBg: '#f4f5f7',
         detailBg: '#ffffff', inputBg: '#ffffff', rowStripe: '#f9fafb', rowHover: '#eef2ff', selectedBg: '#dbeafe',
         surface3: '#ffffff', sectionBg: '#eef2ff'
@@ -115,7 +137,7 @@
       themeDark: {
         accent: '#4a9eff', navBg: '#0f0f23', navText: '#ffffff', background: '#0f0f23', text: '#e2e8f0',
         statusGreen: '#22c55e', statusYellow: '#eab308', statusRed: '#ef4444',
-        accentHover: '#6db3ff', navBg2: '#1a1a2e', navTextMuted: '#cbd5e1', textMuted: '#a8b8cc', border: '#334155',
+        accentHover: '#6db3ff', navBg2: '#1a1a2e', navTextMuted: '#cbd5e1', navActiveBg: 'rgba(74,158,255,0.18)', textMuted: '#a8b8cc', border: '#334155',
         surface1: '#1a1a2e', surface2: '#232340', cardBg: '#1a1a2e', contentBg: '#0f0f23',
         detailBg: '#232340', inputBg: '#1e1e34', rowStripe: '#1e1e34', rowHover: '#2d2d50', selectedBg: '#1e3a5f',
         surface3: '#2d2d50', sectionBg: '#1e1e34'
@@ -273,6 +295,7 @@
   var THEME_LABELS = {
     accent: 'Brand Color', accentHover: 'Accent Hover',
     navBg: 'Navigation', navBg2: 'Nav Gradient End', navText: 'Nav Text', navTextMuted: 'Nav Muted Text',
+    navActiveBg: 'Nav Active Pill',
     background: 'Background', text: 'Text', textMuted: 'Muted Text', border: 'Borders',
     statusGreen: 'Healthy', statusYellow: 'Warning', statusRed: 'Error',
     surface1: 'Cards', surface2: 'Panels', surface3: 'Tertiary Surface', sectionBg: 'Section Header', cardBg: 'Card Fill', contentBg: 'Content Area',
@@ -288,6 +311,7 @@
     statusGreen: 'Healthy/online indicators', statusYellow: 'Warning/degraded + hop conflicts',
     statusRed: 'Error/offline indicators', accentHover: 'Hover state for accent elements',
     navBg2: 'Darker end of nav gradient', navTextMuted: 'Inactive nav links, nav buttons',
+    navActiveBg: 'Background of the active nav link (current page pill)',
     textMuted: 'Labels, timestamps, secondary text', border: 'Dividers, table borders, card borders',
     surface1: 'Card and panel backgrounds', surface2: 'Nested surfaces, secondary panels',
     surface3: 'Tertiary surfaces, hover accents', sectionBg: 'Section header backgrounds',
@@ -302,7 +326,7 @@
     repeater: 'Infrastructure nodes that relay packets', companion: 'End-user devices',
     room: 'Room/chat server nodes', sensor: 'Sensor/telemetry nodes', observer: 'MQTT observer stations'
   };
-  var NODE_EMOJI = { repeater: '◆', companion: '●', room: '■', sensor: '▲', observer: '★' };
+  var NODE_EMOJI = { repeater: 'ph:diamond', companion: 'ph:circle-fill', room: 'ph:square-fill', sensor: 'ph:triangle', observer: 'ph:star-fill' };
 
   var TYPE_LABELS = {
     ADVERT: 'Advertisement', GRP_TXT: 'Channel Message', TXT_MSG: 'Direct Message', ACK: 'Acknowledgment',
@@ -313,13 +337,33 @@
     ACK: 'Acknowledgments', REQUEST: 'Requests', RESPONSE: 'Responses',
     TRACE: 'Traceroute', PATH: 'Path packets', ANON_REQ: 'Encrypted anonymous requests'
   };
+  // #1648 M5: defaults use 'ph:<name>' tokens. renderConfigGlyph() below
+  // accepts both new ph tokens AND legacy emoji strings (back-compat).
   var TYPE_EMOJI = {
-    ADVERT: '📡', GRP_TXT: '💬', TXT_MSG: '✉️', ACK: '✓', REQUEST: '❓',
-    RESPONSE: '📨', TRACE: '🔍', PATH: '🛤️', ANON_REQ: '🕵️'
+    ADVERT: 'ph:broadcast', GRP_TXT: 'ph:chat-circle', TXT_MSG: 'ph:envelope', ACK: 'ph:check', REQUEST: 'ph:question',
+    RESPONSE: 'ph:envelope-simple', TRACE: 'ph:magnifying-glass', PATH: 'ph:path', ANON_REQ: 'ph:lock'
   };
 
+  // renderConfigGlyph(value): renders a Phosphor sprite for 'ph:<name>' OR
+  // returns the operator's stored string (escaped) for legacy emoji/text.
+  // This is #1648 M5 design call #1: never override operator-stored values.
+  function renderConfigGlyph(value) {
+    if (value == null) return '';
+    var s = String(value);
+    var m = s.match(/^ph:([a-z][a-z0-9-]+)$/);
+    if (m) return '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-' + m[1] + '"/></svg>';
+    return esc(s); // EMOJI-OK-LEGACY-RENDER
+  }
+  function renderConfigLabel(label) {
+    if (label == null) return '';
+    var s = String(label);
+    var m = s.match(/^(ph:[a-z][a-z0-9-]+)\s+(.*)$/);
+    if (m) return renderConfigGlyph(m[1]) + ' ' + esc(m[2]);
+    return esc(s); // EMOJI-OK-LEGACY-RENDER
+  }
+
   var BASIC_KEYS = ['accent', 'navBg', 'navText', 'background', 'text', 'statusGreen', 'statusYellow', 'statusRed'];
-  var ADVANCED_KEYS = ['accentHover', 'navBg2', 'navTextMuted', 'textMuted', 'border', 'surface1', 'surface2', 'cardBg', 'contentBg', 'detailBg', 'inputBg', 'rowStripe', 'rowHover', 'selectedBg'];
+  var ADVANCED_KEYS = ['accentHover', 'navBg2', 'navTextMuted', 'navActiveBg', 'textMuted', 'border', 'surface1', 'surface2', 'cardBg', 'contentBg', 'detailBg', 'inputBg', 'rowStripe', 'rowHover', 'selectedBg'];
   var FONT_KEYS = ['font', 'mono'];
 
   // ── Validation helpers ──
@@ -340,6 +384,36 @@
 
   function isValidOpacity(val) {
     return typeof val === 'number' && isFinite(val) && val >= 0 && val <= 1;
+  }
+
+  // ── isValidHomeUrl (#1518) ──
+  // Branding.homeUrl is rendered into <a class="nav-brand">[href], so it MUST
+  // reject any scheme that can execute script (javascript:, data:, vbscript:,
+  // etc.). Whitelist only:
+  //   - http://...   (absolute, plain http — operators may need it for intranet)
+  //   - https://...  (absolute, https)
+  //   - #...         (app-relative hash route, e.g. "#/", "#/home")
+  // Empty / whitespace / non-string → invalid (caller falls through to default).
+  //
+  // Defence-in-depth: also strip ALL whitespace before scheme-sniffing so a
+  // payload like "java\tscript:alert(1)" — which some lenient URL parsers
+  // collapse to javascript: — is rejected here too.
+  function isValidHomeUrl(val) {
+    if (typeof val !== 'string') return false;
+    var trimmed = val.replace(/^\s+/, '');
+    if (trimmed.length === 0) return false;
+    // Hash routes (app-internal) are always safe.
+    if (trimmed.charAt(0) === '#') return true;
+    // For scheme detection, collapse interior whitespace inside the scheme
+    // portion (chars before first ':'). HTML attribute parsing has been known
+    // to drop these, turning "java\tscript:" into "javascript:" at click time.
+    var colonIdx = trimmed.indexOf(':');
+    if (colonIdx === -1) return false;
+    var schemeRaw = trimmed.slice(0, colonIdx);
+    var schemeClean = schemeRaw.replace(/\s+/g, '').toLowerCase();
+    if (schemeClean !== 'http' && schemeClean !== 'https') return false;
+    // Must look like a real absolute URL: scheme://...
+    return /^https?:\/\//i.test(trimmed);
   }
 
   var TS_ENUMS = {
@@ -407,6 +481,32 @@
         } else {
           console.warn('[customizer-v2] Invalid opacity value rejected:', key, delta[key]);
         }
+      } else if (key === 'markerStroke' && typeof delta[key] === 'object' && delta[key] !== null) {
+        // #1488 — markerStroke { color, width, opacity }
+        var msIn = delta[key];
+        var msOut = {};
+        if (typeof msIn.color === 'string' && isValidColor(msIn.color)) {
+          msOut.color = msIn.color;
+        } else if (msIn.color != null) {
+          console.warn('[customizer-v2] Invalid markerStroke.color rejected:', msIn.color);
+        }
+        var msW = typeof msIn.width === 'string' ? parseFloat(msIn.width) : msIn.width;
+        if (msIn.width != null) {
+          if (isFinite(msW) && msW >= 0 && msW <= 10) {
+            msOut.width = msW;
+          } else {
+            console.warn('[customizer-v2] Invalid markerStroke.width rejected:', msIn.width);
+          }
+        }
+        var msO = typeof msIn.opacity === 'string' ? parseFloat(msIn.opacity) : msIn.opacity;
+        if (msIn.opacity != null) {
+          if (isValidOpacity(msO)) {
+            msOut.opacity = msO;
+          } else {
+            console.warn('[customizer-v2] Invalid markerStroke.opacity rejected:', msIn.opacity);
+          }
+        }
+        if (Object.keys(msOut).length) clean[key] = msOut;
       } else if (key === 'timestamps' && typeof delta[key] === 'object' && delta[key] !== null) {
         var ts = {};
         var tsrc = delta[key];
@@ -544,15 +644,65 @@
 
     // Derived vars
     if (themeSection.background) root.setProperty('--content-bg', themeSection.contentBg || themeSection.background);
-    if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface1);
+    if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface2 || themeSection.surface1);
 
-    // Node colors → CSS vars + global objects
+    // Node colors → --node-X CSS var only (legacy compat).
+    // #1412: do NOT push server-config nodeColors into window.ROLE_COLORS —
+    // that defeats cb-presets propagation by trapping the legacy palette in
+    // the _roleOverrides map (where the live getter prefers it over the
+    // --mc-role-X CSS vars that presets actually write). User-chosen
+    // overrides still flow through setRoleColorOverride() in customize.js.
     var nc = effectiveConfig.nodeColors;
     if (nc) {
+      // #1438 final: scope --mc-role-{role} writes to USER overrides only,
+      // UNLESS no CB preset is active (#1446). When a preset is active the
+      // server-config palette must stay out of --mc-role-* so the preset
+      // wins (preserves #1412). When NO preset is active, the cascade is:
+      //   user override > server config > built-in :root default.
+      // → server config gets to write --mc-role-{role} in that case.
+      var userNc = (userOverrides && userOverrides.nodeColors) || {};
+      var presetActive = false;
+      try {
+        var presetAttr = document.body && document.body.getAttribute && document.body.getAttribute('data-cb-preset');
+        presetActive = !!(presetAttr && presetAttr !== 'none');
+      } catch (e) {}
       for (var role in nc) {
         root.setProperty('--node-' + role, nc[role]);
-        if (window.ROLE_COLORS && role in window.ROLE_COLORS) window.ROLE_COLORS[role] = nc[role];
-        if (window.ROLE_STYLE && window.ROLE_STYLE[role]) window.ROLE_STYLE[role].color = nc[role];
+        if (Object.prototype.hasOwnProperty.call(userNc, role)) {
+          // Operator picked this color → drive --mc-role-{role} so marker
+          // SVGs (fill="var(--mc-role-X)") and other CSS-var consumers
+          // pick it up on every page load. Without this the user pick
+          // sits in localStorage but --mc-role-{role} falls back to the
+          // active preset on reload, reverting marker fills.
+          root.setProperty('--mc-role-' + role, nc[role]);
+          // #1446 — also write to body.style with !important so the user
+          // pick beats the body[data-cb-preset="X"] selector cascade when
+          // a CB preset is active. Without this, the root-level write is
+          // shadowed by the preset's body-scoped CSS rule (root cause of
+          // #1444). When no preset is active, the body write is harmless
+          // and still wins inheritance.
+          if (presetActive && document.body && document.body.style) {
+            document.body.style.setProperty('--mc-role-' + role, nc[role], 'important');
+          }
+        } else if (!presetActive) {
+          // #1446 — no preset is active; server config is the legitimate
+          // source of role colors. Write --mc-role-{role} so marker SVGs
+          // honor operator's config.json without forcing visitors to pick
+          // a CB preset to "unlock" their server palette.
+          root.setProperty('--mc-role-' + role, nc[role]);
+        } else if (presetActive && document.body && document.body.style) {
+          // Preset active AND this role has no user override:
+          // ensure any prior body inline !important is removed so the
+          // preset value (from body[data-cb-preset=X] CSS rule) takes over.
+          // Also remove the root-level --mc-role-{role} that a PREVIOUS
+          // setOverride call left behind (#1446 followup): without this,
+          // :root.style.--mc-role-{role} stays stuck at the old user-pick
+          // value even though body's cascaded preset rule now wins for
+          // descendant elements. The visible UI is correct but introspection
+          // (getComputedStyle on documentElement) reports stale color.
+          document.body.style.removeProperty('--mc-role-' + role);
+          root.removeProperty('--mc-role-' + role);
+        }
       }
     }
 
@@ -583,6 +733,22 @@
     }
     if (typeof effectiveConfig.liveHeatmapOpacity === 'number') {
       localStorage.setItem('meshcore-live-heatmap-opacity', effectiveConfig.liveHeatmapOpacity);
+    }
+
+    // #1488 — marker stroke: drive CSS vars from effective config. SVG
+    // markers across map.js / live.js / roles.js all read these vars, so
+    // a single write here repaints every mounted marker without a reload.
+    var ms = effectiveConfig.markerStroke;
+    if (ms && typeof ms === 'object') {
+      if (typeof ms.color === 'string' && ms.color) {
+        root.setProperty('--mc-marker-stroke-color', ms.color);
+      }
+      if (ms.width != null && isFinite(ms.width)) {
+        root.setProperty('--mc-marker-stroke-width', String(ms.width));
+      }
+      if (ms.opacity != null && isFinite(ms.opacity)) {
+        root.setProperty('--mc-marker-stroke-opacity', String(ms.opacity));
+      }
     }
 
     // Distance unit → sync to localStorage for all pages
@@ -616,6 +782,10 @@
         var fav = document.querySelector('link[rel="icon"]');
         if (fav) fav.href = br.faviconUrl;
       }
+      // #1518 — apply validated homeUrl override to .nav-brand[href].
+      // Always call: invalid/empty restores '#/' so a cleared override visibly
+      // reverts. Validator rejects javascript:/data:/etc to prevent XSS.
+      _setBrandHomeUrl(br.homeUrl);
     }
 
     // Dispatch theme-changed event (bare, no payload — matches existing behavior)
@@ -864,7 +1034,7 @@
     if (!el) return;
     if (status === 'saved') { el.textContent = 'All changes saved'; el.style.color = 'var(--text-muted)'; }
     else if (status === 'saving') { el.textContent = 'Saving...'; el.style.color = 'var(--text-muted)'; }
-    else if (status === 'error') { el.textContent = '⚠️ Storage full — changes may not be saved'; el.style.color = '#ef4444'; }
+    else if (status === 'error') { el.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Storage full — changes may not be saved'; el.style.color = '#ef4444'; }
   }
 
   function _showQuotaWarning() {
@@ -877,6 +1047,16 @@
   var _panelEl = null;
   var _activeTab = 'branding';
   var _styleEl = null;
+
+  // GeoFilter tab state
+  var _gfMap = null;
+  var _gfModalMap = null;
+  var _gfWriteEnabled = false;
+  var _gfPoints = [];
+  var _gfMarkers = [];
+  var _gfPolygon = null;
+  var _gfClosingLine = null;
+  var _gfLoaded = false; // true after initial server load
 
   function esc(s) { var d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
   function escAttr(s) { return (s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
@@ -923,7 +1103,7 @@
 
   function _overrideDot(section, key) {
     if (!_isOverridden(section, key)) return '';
-    return '<span class="cv2-override-dot" data-reset-s="' + (section || '') + '" data-reset-k="' + key + '" title="Reset to server default">●</span>';
+    return '<span class="cv2-override-dot" data-reset-s="' + (section || '') + '" data-reset-k="' + key + '" title="Reset to server default"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>';
   }
 
   function _injectStyles() {
@@ -999,16 +1179,25 @@
 
   function _renderTabs() {
     var tabs = [
-      { id: 'branding', label: '🏷️', title: 'Branding', badge: _tabBadge('branding') },
-      { id: 'theme', label: '🎨', title: 'Theme', badge: _tabBadge(isDarkMode() ? 'themeDark' : 'theme') },
-      { id: 'nodes', label: '🎯', title: 'Colors', badge: (function () { var n = _countOverrides('nodeColors') + _countOverrides('typeColors'); return n ? ' <span class="cv2-tab-badge">' + n + '</span>' : ''; })() },
-      { id: 'home', label: '🏠', title: 'Home', badge: _tabBadge('home') },
-      { id: 'display', label: '🖥️', title: 'Display', badge: (function () { var n = _countOverrides('timestamps') + (_isOverridden(null, 'distanceUnit') ? 1 : 0); return n ? ' <span class="cv2-tab-badge">' + n + '</span>' : ''; })() },
-      { id: 'export', label: '📤', title: 'Export' }
+      { id: 'branding', glyph: 'ph:tag', title: 'Branding', badge: _tabBadge('branding') },
+      { id: 'theme', glyph: 'ph:palette', title: 'Theme', badge: _tabBadge(isDarkMode() ? 'themeDark' : 'theme') },
+      { id: 'nodes', glyph: 'ph:target', title: 'Colors', badge: (function () { var n = _countOverrides('nodeColors') + _countOverrides('typeColors'); return n ? ' <span class="cv2-tab-badge">' + n + '</span>' : ''; })() },
+      { id: 'home', glyph: 'ph:house', title: 'Home', badge: _tabBadge('home') },
+      { id: 'display', glyph: 'ph:monitor', title: 'Display', badge: (function () { var n = _countOverrides('timestamps') + (_isOverridden(null, 'distanceUnit') ? 1 : 0); return n ? ' <span class="cv2-tab-badge">' + n + '</span>' : ''; })() },
+      { id: 'geofilter', glyph: 'ph:map-trifold', title: 'GeoFilter' },
+      { id: 'export', glyph: 'ph:download-simple', title: 'Export' }
     ];
+    // #1508 — operators can hide individual tabs server-side via
+    // config.customizer.disabledTabs. The list arrives on
+    // window.MC_CUSTOMIZER_CFG (set by roles.js after /api/config/client).
+    // Default empty so behavior is unchanged when the field is absent.
+    var disabled = (typeof window !== 'undefined' && window.MC_CUSTOMIZER_CFG && window.MC_CUSTOMIZER_CFG.disabledTabs) || [];
+    if (disabled.length) {
+      tabs = tabs.filter(function (t) { return disabled.indexOf(t.id) === -1; });
+    }
     return '<div class="cust-tabs">' + tabs.map(function (t) {
       return '<button class="cust-tab' + (t.id === _activeTab ? ' active' : '') + '" data-tab="' + t.id + '" title="' + t.title + '">' +
-        t.label + ' <span class="cust-tab-text">' + t.title + '</span>' + (t.badge || '') + '</button>';
+        renderConfigGlyph(t.glyph) + ' <span class="cust-tab-text">' + t.title + '</span>' + (t.badge || '') + '</button>';
     }).join('') + '</div>';
   }
 
@@ -1039,16 +1228,29 @@
     var effDark = eff.themeDark || {};
     for (var id in PRESETS) {
       var p = PRESETS[id];
+      var pTheme = p.theme || {};
+      var pDark = p.themeDark || {};
       var match = true;
       for (var i = 0; i < THEME_COLOR_KEYS.length && match; i++) {
         var k = THEME_COLOR_KEYS[i];
-        if (effTheme[k] !== (p.theme || {})[k] || effDark[k] !== (p.themeDark || {})[k]) match = false;
+        // An undefined value in the effective theme means the operator
+        // (and server config) has not customized this key — the preset's
+        // value will become effective via the CSS cascade, so it should
+        // match ANY preset value rather than invalidating the match.
+        // This keeps _detectActivePreset() correct as we add new themeable
+        // keys to PRESETS.default (e.g. navActiveBg in #1509).
+        if (effTheme[k] !== undefined && effTheme[k] !== pTheme[k]) match = false;
+        else if (effDark[k] !== undefined && effDark[k] !== pDark[k]) match = false;
       }
       if (match && p.nodeColors && eff.nodeColors) {
-        for (var nk in p.nodeColors) { if (eff.nodeColors[nk] !== p.nodeColors[nk]) { match = false; break; } }
+        for (var nk in p.nodeColors) {
+          if (eff.nodeColors[nk] !== undefined && eff.nodeColors[nk] !== p.nodeColors[nk]) { match = false; break; }
+        }
       }
       if (match && p.typeColors && eff.typeColors) {
-        for (var tk in p.typeColors) { if (eff.typeColors[tk] !== p.typeColors[tk]) { match = false; break; } }
+        for (var tk in p.typeColors) {
+          if (eff.typeColors[tk] !== undefined && eff.typeColors[tk] !== p.typeColors[tk]) { match = false; break; }
+        }
       }
       if (match) return id;
     }
@@ -1082,6 +1284,7 @@
       '<div class="cust-field"><label>Site Name' + _overrideDot('branding', 'siteName') + '</label><input type="text" data-cv2-field="branding.siteName" value="' + escAttr(b.siteName || '') + '"></div>' +
       '<div class="cust-field"><label>Tagline' + _overrideDot('branding', 'tagline') + '</label><input type="text" data-cv2-field="branding.tagline" value="' + escAttr(b.tagline || '') + '"></div>' +
       '<div class="cust-field"><label>Logo URL' + _overrideDot('branding', 'logoUrl') + '</label><input type="text" data-cv2-field="branding.logoUrl" value="' + escAttr(b.logoUrl || '') + '" placeholder="https://...">' + logoPreview + '</div>' +
+      '<div class="cust-field"><label>Home URL' + _overrideDot('branding', 'homeUrl') + '</label><input type="text" data-cv2-field="branding.homeUrl" value="' + escAttr(b.homeUrl || '') + '" placeholder="https://your-site.example/ or #/"></div>' +
       '<div class="cust-field"><label>Favicon URL' + _overrideDot('branding', 'faviconUrl') + '</label><input type="text" data-cv2-field="branding.faviconUrl" value="' + escAttr(b.faviconUrl || '') + '" placeholder="https://..."></div>' +
     '</div>';
   }
@@ -1093,7 +1296,7 @@
     var server = _getServer();
     var current = dark ? Object.assign({}, eff.theme || {}, eff.themeDark || {}) : (eff.theme || {});
     var serverCurrent = dark ? Object.assign({}, server.theme || {}, server.themeDark || {}) : (server.theme || {});
-    var modeLabel = dark ? '🌙 Dark Mode' : '☀️ Light Mode';
+    var modeLabel = dark ? (renderConfigGlyph('ph:moon') + ' Dark Mode') : (renderConfigGlyph('ph:sun') + ' Light Mode');
 
     var basicRows = '';
     for (var i = 0; i < BASIC_KEYS.length; i++) basicRows += _renderColorRow(BASIC_KEYS[i], section, current[BASIC_KEYS[i]], serverCurrent[BASIC_KEYS[i]]);
@@ -1105,11 +1308,141 @@
     return '<div class="cust-panel' + (_activeTab === 'theme' ? ' active' : '') + '" data-panel="theme">' +
       _renderPresets() +
       '<p class="cust-section-title">' + modeLabel + '</p>' +
-      '<p style="font-size:11px;color:var(--text-muted);margin:0 0 10px">Toggle ☀️/🌙 in nav to edit the other mode.</p>' +
+      '<p style="font-size:11px;color:var(--text-muted);margin:0 0 10px">Toggle ' + renderConfigGlyph('ph:sun') + '/' + renderConfigGlyph('ph:moon') + ' in nav to edit the other mode.</p>' +
       basicRows +
       '<details class="cust-advanced"><summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-muted);margin:12px 0 8px">Advanced (' + ADVANCED_KEYS.length + ' options)</summary>' + advancedRows + '</details>' +
       '<details class="cust-fonts" style="margin-top:12px"><summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-muted);margin:12px 0 8px">Fonts</summary>' + fontRows + '</details>' +
     '</div>';
+  }
+
+  // ── #1361 Colorblind preset selector ──
+  // MVP scope: radio selector + 1-line description + WCAG warning badge.
+  // Stretch (live Brettel/Vienot simulation overlay, "Reset to default Wong"
+  // button) intentionally deferred to a follow-up issue.
+  function _renderColorblindPresetSelector() {
+    var MCP = (typeof window !== 'undefined') && window.MeshCorePresets;
+    if (!MCP || !Array.isArray(MCP.list)) return '';
+    // #1446 — currentPreset() now returns null when no preset is stored.
+    var current = MCP.currentPreset ? MCP.currentPreset() : null;
+    var clearOpt = _renderCbPresetClearOption(current);
+    var options = MCP.list.map(function (p) {
+      var checked = p.id === current ? ' checked' : '';
+      return '<label class="cust-cb-preset-row" style="display:flex;gap:8px;align-items:flex-start;margin:6px 0;cursor:pointer">' +
+        '<input type="radio" name="cv2-cb-preset" data-cv2-cb-preset value="' + escAttr(p.id) + '"' + checked + ' style="margin-top:3px">' +
+        '<div style="flex:1">' +
+          '<div style="font-weight:600">' + esc(p.label) + '</div>' +
+          '<div class="cust-hint" style="font-size:12px;color:var(--text-muted)">' + esc(p.description) + '</div>' +
+          _renderCbPresetWarning(p.id) +
+        '</div>' +
+      '</label>';
+    }).join('');
+    return '<p class="cust-section-title">Optional: Colorblind-Safe Preset</p>' +
+      '<p class="cust-hint" style="margin-bottom:8px">A CB preset is an end-user opt-in that swaps the role/status palette for color-vision variants. ' +
+      'Leave unset to use the operator\'s configured colors (or pick from above). ' +
+      'Achromatopsia uses a luminance-only ramp and relies on the shape/letter/glyph carriers from #1356/#1357.</p>' +
+      '<div class="cust-cb-presets" data-cv2-cb-preset-group>' + clearOpt + options + '</div>' +
+      _renderCbSimSelector() +
+      _renderCbResetButton() +
+      '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">';
+  }
+
+  // #1380 — Brettel/Vienot 1997 dichromatic simulation overlay.
+  // Preview-only: NOT persisted; clears on reload. Toggled via
+  // body[data-cb-sim] + CSS filter:url(#cb-*) defined in public/index.html.
+  function _renderCbSimSelector() {
+    var SIMS = [
+      { id: '',         label: 'Off',           desc: 'No simulation (default).' },
+      { id: 'deut',     label: 'Deuteranopia',  desc: 'Brettel/Vienot 1997 — green-cone deficit.' },
+      { id: 'prot',     label: 'Protanopia',    desc: 'Brettel/Vienot 1997 — red-cone deficit.' },
+      { id: 'trit',     label: 'Tritanopia',    desc: 'Brettel/Vienot 1997 — blue-cone deficit.' },
+      { id: 'achromat', label: 'Achromatopsia', desc: 'Luminance-only (Rec.601).' }
+    ];
+    // Hardcoded literal lookup so the source contains `value="deut"` etc.
+    // (See test-issue-1380-cb-sim-overlay.js, asserts on source text.)
+    var VALUE_ATTRS = {
+      '':         'value=""',
+      'deut':     'value="deut"',
+      'prot':     'value="prot"',
+      'trit':     'value="trit"',
+      'achromat': 'value="achromat"'
+    };
+    var current = '';
+    try {
+      if (typeof document !== 'undefined' && document.body && document.body.getAttribute) {
+        current = document.body.getAttribute('data-cb-sim') || '';
+      }
+    } catch (e) {}
+    var rows = SIMS.map(function (s) {
+      var checked = s.id === current ? ' checked' : '';
+      return '<label class="cust-cb-sim-row" style="display:flex;gap:8px;align-items:flex-start;margin:4px 0;cursor:pointer">' +
+        '<input type="radio" name="cv2-cb-sim" data-cv2-cb-sim ' + (VALUE_ATTRS[s.id] || ('value="' + escAttr(s.id) + '"')) + checked + ' style="margin-top:3px">' +
+        '<div style="flex:1">' +
+          '<div style="font-weight:600">' + esc(s.label) + '</div>' +
+          '<div class="cust-hint" style="font-size:12px;color:var(--text-muted)">' + esc(s.desc) + '</div>' +
+        '</div>' +
+      '</label>';
+    }).join('');
+    return '<p class="cust-section-title" style="margin-top:12px">Simulation overlay <span style="font-weight:normal;color:var(--text-muted);font-size:11px">(preview-only)</span></p>' +
+      '<p class="cust-hint" style="margin-bottom:8px">Apply a Brettel/Vienot 1997 dichromatic filter to the entire page to preview how the UI reads to colorblind viewers. Not persisted — clears on reload.</p>' +
+      '<div class="cust-cb-sim" data-cv2-cb-sim-group>' + rows + '</div>';
+  }
+
+  // #1380 — Reset-to-default-Wong button. Clears any stored CB preset and
+  // re-applies the Wong palette via MeshCorePresets.applyPreset('default').
+  function _renderCbResetButton() {
+    return '<div style="margin-top:12px">' +
+      '<button type="button" data-cv2-cb-reset class="cust-btn" ' +
+      'style="padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-1);color:var(--text);cursor:pointer;font-size:12px">' +
+      'Reset to default Wong</button>' +
+      '<div class="cust-hint" style="font-size:11px;color:var(--text-muted);margin-top:4px">' +
+      'Restores the Wong 2011 palette and clears any saved colorblind preset.</div>' +
+      '</div>';
+  }
+
+  // Exposed helper — toggles body[data-cb-sim]. Pure DOM, no persistence.
+  function _applyCbSim(id) {
+    if (typeof document === 'undefined' || !document.body) return false;
+    if (!id) {
+      if (document.body.removeAttribute) document.body.removeAttribute('data-cb-sim');
+    } else {
+      document.body.setAttribute('data-cb-sim', id);
+    }
+    return true;
+  }
+
+  // Exposed helper — applies the default Wong preset and clears storage.
+  function _resetCbPreset() {
+    var MCP = (typeof window !== 'undefined') && window.MeshCorePresets;
+    var ok = false;
+    if (MCP && typeof MCP.applyPreset === 'function') {
+      ok = MCP.applyPreset('default') || ok;
+    }
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.removeItem('meshcore-cb-preset');
+    } catch (e) {}
+    return ok;
+  }
+
+  function _renderCbPresetClearOption(current) {
+    var checked = !current ? ' checked' : '';
+    return '<label class="cust-cb-preset-row" style="display:flex;gap:8px;align-items:flex-start;margin:6px 0;cursor:pointer">' +
+      '<input type="radio" name="cv2-cb-preset" data-cv2-cb-preset value="" data-cv2-cb-preset-none' + checked + ' style="margin-top:3px">' +
+      '<div style="flex:1">' +
+        '<div style="font-weight:600">No preset (use operator / custom colors)</div>' +
+        '<div class="cust-hint" style="font-size:12px;color:var(--text-muted)">Default — server-configured colors apply, then any per-role overrides above.</div>' +
+      '</div>' +
+    '</label>';
+  }
+
+  function _renderCbPresetWarning(id) {
+    var MCP = window.MeshCorePresets;
+    if (!MCP || typeof MCP.validatePreset !== 'function') return '';
+    var rep = MCP.validatePreset(id);
+    var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+    var failing = rep.filter(function (r) { return dark ? !r.passDark : !r.passLight; });
+    if (!failing.length) return '';
+    var names = failing.map(function (r) { return r.role; }).join(', ');
+    return '<div class="cust-cb-warn" style="margin-top:4px;font-size:11px;color:var(--status-yellow);background:rgba(255,200,0,0.08);padding:4px 6px;border-radius:4px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> WCAG 1.4.11: ' + esc(names) + ' below 3:1 vs ' + (dark ? 'dark' : 'light') + ' tiles</div>';
   }
 
   function _renderNodes() {
@@ -1121,7 +1454,7 @@
     for (var key in NODE_LABELS) {
       var val = nc[key] || '#000000';
       rows += '<div class="cust-color-row">' +
-        '<div><label>' + NODE_EMOJI[key] + ' ' + NODE_LABELS[key] + _overrideDot('nodeColors', key) + '</label>' +
+        '<div><label>' + renderConfigGlyph(NODE_EMOJI[key]) + ' ' + NODE_LABELS[key] + _overrideDot('nodeColors', key) + '</label>' +
         '<div class="cust-hint">' + (NODE_HINTS[key] || '') + '</div></div>' +
         '<input type="color" data-cv2-field="nodeColors.' + key + '" value="' + val + '">' +
         '<span class="cust-node-dot" style="background:' + val + '"></span>' +
@@ -1135,7 +1468,7 @@
     for (var tkey in TYPE_LABELS) {
       var tval = tc[tkey] || fallbackTC[tkey] || '#000000';
       typeRows += '<div class="cust-color-row">' +
-        '<div><label>' + (TYPE_EMOJI[tkey] || '') + ' ' + TYPE_LABELS[tkey] + _overrideDot('typeColors', tkey) + '</label>' +
+        '<div><label>' + renderConfigGlyph(TYPE_EMOJI[tkey] || '') + ' ' + TYPE_LABELS[tkey] + _overrideDot('typeColors', tkey) + '</label>' +
         '<div class="cust-hint">' + (TYPE_HINTS[tkey] || '') + '</div></div>' +
         '<input type="color" data-cv2-field="typeColors.' + tkey + '" value="' + tval + '">' +
         '<span class="cust-node-dot" style="background:' + tval + '"></span>' +
@@ -1148,20 +1481,48 @@
     var liveHeatOpacity = typeof eff.liveHeatmapOpacity === 'number' ? eff.liveHeatmapOpacity : 0.3;
     var liveHeatPct = Math.round(liveHeatOpacity * 100);
 
+    // #1488 — marker stroke controls. Defaults match the :root values in
+    // style.css; the UI shows the effective merged value (server config →
+    // local override) so the operator sees what's actually painted.
+    var ms = eff.markerStroke || {};
+    var msColor = typeof ms.color === 'string' && ms.color ? ms.color : '#ffffff';
+    var msWidth = ms.width != null && isFinite(ms.width) ? Number(ms.width) : 2;
+    var msOpacity = ms.opacity != null && isFinite(ms.opacity) ? Number(ms.opacity) : 1;
+    var msOpacityPct = Math.round(msOpacity * 100);
+
     return '<div class="cust-panel' + (_activeTab === 'nodes' ? ' active' : '') + '" data-panel="nodes">' +
-      '<p class="cust-section-title">Node Role Colors</p>' + rows +
+      '<p class="cust-section-title">Node Role Colors</p>' +
+      '<p class="cust-hint" style="margin-bottom:8px">These are the canonical role colors used across the app. They inherit from your server config (or built-in defaults), and can be optionally remapped by a colorblind-safe preset below.</p>' +
+      rows +
       '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">' +
+      _renderColorblindPresetSelector() +
       '<p class="cust-section-title">Packet Type Colors</p>' + typeRows +
       '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">' +
       '<p class="cust-section-title">Heatmap Opacity</p>' +
-      '<div class="cust-color-row"><div><label>🗺️ Nodes Map' + _overrideDot(null, 'heatmapOpacity') + '</label>' +
+      '<div class="cust-color-row"><div><label><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> Nodes Map' + _overrideDot(null, 'heatmapOpacity') + '</label>' +
         '<div class="cust-hint">Heatmap overlay on the Nodes → Map page (0–100%)</div></div>' +
         '<input type="range" data-cv2-slider="heatmapOpacity" min="0" max="100" value="' + heatPct + '" style="width:120px;cursor:pointer">' +
         '<span class="cust-hex" id="cv2HeatPct">' + heatPct + '%</span></div>' +
-      '<div class="cust-color-row"><div><label>📡 Live Map' + _overrideDot(null, 'liveHeatmapOpacity') + '</label>' +
+      '<div class="cust-color-row"><div><label><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Live Map' + _overrideDot(null, 'liveHeatmapOpacity') + '</label>' +
         '<div class="cust-hint">Heatmap overlay on the Live page (0–100%)</div></div>' +
         '<input type="range" data-cv2-slider="liveHeatmapOpacity" min="0" max="100" value="' + liveHeatPct + '" style="width:120px;cursor:pointer">' +
         '<span class="cust-hex" id="cv2LiveHeatPct">' + liveHeatPct + '%</span></div>' +
+      '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">' +
+      '<p class="cust-section-title">Marker Stroke <span style="font-weight:normal;color:var(--text-muted);font-size:11px">(#1488)</span></p>' +
+      '<p class="cust-hint" style="margin-bottom:8px">Outline around each map marker. Dial these down when hundreds of nodes make the default white border overwhelming. Changes are live on every mounted marker.</p>' +
+      '<div class="cust-color-row"><div><label>Color' + _overrideDot('markerStroke', 'color') + '</label>' +
+        '<div class="cust-hint">Marker outline color. Defaults to white for contrast on dark + light tiles.</div></div>' +
+        '<input type="color" data-cv2-field="markerStroke.color" value="' + esc(msColor) + '">' +
+        '<span class="cust-node-dot" style="background:' + esc(msColor) + '"></span>' +
+        '<span class="cust-hex">' + esc(msColor) + '</span></div>' +
+      '<div class="cust-color-row"><div><label>Width' + _overrideDot('markerStroke', 'width') + '</label>' +
+        '<div class="cust-hint">Stroke thickness in SVG units (0–4). Set to 0 to remove the outline entirely.</div></div>' +
+        '<input type="range" data-cv2-marker-stroke="width" min="0" max="4" step="0.1" value="' + msWidth + '" style="width:120px;cursor:pointer">' +
+        '<span class="cust-hex" id="cv2MarkerStrokeW">' + msWidth + '</span></div>' +
+      '<div class="cust-color-row"><div><label>Opacity' + _overrideDot('markerStroke', 'opacity') + '</label>' +
+        '<div class="cust-hint">Stroke alpha (0–100%). Drop this to ~30% for a softer outline.</div></div>' +
+        '<input type="range" data-cv2-marker-stroke="opacity" min="0" max="100" value="' + msOpacityPct + '" style="width:120px;cursor:pointer">' +
+        '<span class="cust-hex" id="cv2MarkerStrokeO">' + msOpacityPct + '%</span></div>' +
     '</div>';
   }
 
@@ -1205,9 +1566,76 @@
       '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Gesture Hints</p>' +
       '<p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Re-show first-visit gesture discoverability hints (swipe rows, swipe tabs, edge-swipe drawer, pull-to-refresh).</p>' +
       '<button type="button" class="cust-dl-btn" data-cv2-reset-hints data-reset-gesture-hints>↺ Reset gesture hints</button>' +
+      _renderChannelsShowEncryptedToggle() +
+      _renderTileProviderSelector() +
     '</div>';
   }
 
+  // ── #1454 Show-encrypted-channels toggle ──
+  // Writes localStorage["channels-show-encrypted"]. Default OFF: key is
+  // removed (not set to "false") so the read-gate in channels.js cleanly
+  // returns false. Fires `mc-channels-show-encrypted-changed`; channels.js
+  // re-fetches the list live without a page reload.
+  function _renderChannelsShowEncryptedToggle() {
+    var on = false;
+    try { on = localStorage.getItem('channels-show-encrypted') === 'true'; } catch (_e) {}
+    return '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Channels</p>' +
+      '<p class="cust-hint" style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Encrypted channels appear as "Encrypted (0xAB)" with no name. Operators usually leave this off.</p>' +
+      '<div class="cust-field" style="display:flex;align-items:center;gap:8px">' +
+        '<input type="checkbox" id="cv2-channels-show-encrypted" data-cv2-channels-show-encrypted' +
+          (on ? ' checked' : '') +
+          ' style="width:16px;height:16px;cursor:pointer">' +
+        '<label for="cv2-channels-show-encrypted" style="cursor:pointer;margin:0">Show encrypted channels</label>' +
+      '</div>';
+  }
+
+  // ── #1420 Dark-tile provider selector ──
+  // Persists per-browser via MC_setDarkTileProvider; map.js / live.js
+  // listen for `mc-tile-provider-changed` and swap tiles live.
+  
+  function _renderTileProviderSelector() {
+    var reg = (typeof window !== 'undefined') && window.MC_TILE_PROVIDERS;
+    if (!reg) return '';
+    var activeDark = (typeof window.MC_getDarkTileProvider === 'function') ? window.MC_getDarkTileProvider() : 'carto-dark';
+    var activeLight = (typeof window.MC_getLightTileProvider === 'function') ? window.MC_getLightTileProvider() : 'carto-light';
+    
+    var darkIds = Object.keys(reg).filter(function(id) { return reg[id].type === 'dark'; });
+    var lightIds = Object.keys(reg).filter(function(id) { return reg[id].type === 'light'; });
+    
+    var hasMultipleDark = darkIds.length > 1;
+    var hasMultipleLight = lightIds.length > 1;
+    
+    if (darkIds.length === 0 && lightIds.length === 0) return ''; // hide if no options
+    
+    var html = '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Map Tiles</p>' +
+      '<p class="cust-hint" style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Choose the basemap providers. Available options depend on server configuration.</p>';
+      
+    if (lightIds.length > 0) {
+      var optionsLight = lightIds.map(function (id) {
+        var label = reg[id].label || id;
+        var sel   = id === activeLight ? ' selected' : '';
+        return '<option value="' + escAttr(id) + '"' + sel + '>' + esc(label) + '</option>';
+      }).join('');
+      html += '<div class="cust-field"><label for="cv2-light-tile-provider">Light Mode Provider</label>' +
+        '<select id="cv2-light-tile-provider" data-cv2-light-tile-provider style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--input-bg);color:var(--text)">' +
+        optionsLight +
+        '</select></div>';
+    }
+    
+    if (darkIds.length > 0) {
+      var optionsDark = darkIds.map(function (id) {
+        var label = reg[id].label || id;
+        var sel   = id === activeDark ? ' selected' : '';
+        return '<option value="' + escAttr(id) + '"' + sel + '>' + esc(label) + '</option>';
+      }).join('');
+      html += '<div class="cust-field"><label for="cv2-dark-tile-provider">Dark Mode Provider</label>' +
+        '<select id="cv2-dark-tile-provider" data-cv2-dark-tile-provider style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--input-bg);color:var(--text)">' +
+        optionsDark +
+        '</select></div>';
+    }
+    
+    return html;
+  }
   function _renderHome() {
     var eff = _getEffective();
     var h = eff.home || {};
@@ -1218,11 +1646,14 @@
     var stepsHtml = steps.map(function (s, i) {
       return '<div class="cust-list-item">' +
         '<div class="cust-list-row">' +
-          '<input class="cust-emoji-input" data-cv2-home="steps.' + i + '.emoji" value="' + escAttr(s.emoji) + '" placeholder="📡">' +
+          // Glyph preview + freeform input. EMOJI-OK-LEGACY-RENDER: legacy
+          // operator emoji values still display via renderConfigGlyph().
+          '<span class="cust-emoji-preview" aria-hidden="true" style="min-width:1em;display:inline-block">' + renderConfigGlyph(s.emoji) + '</span>' +
+          '<input class="cust-emoji-input" data-cv2-home="steps.' + i + '.emoji" value="' + escAttr(s.emoji) + '" placeholder="ph:broadcast">' +
           '<input data-cv2-home="steps.' + i + '.title" value="' + escAttr(s.title) + '" placeholder="Title">' +
-          '<button class="cust-list-btn" data-cv2-move="steps.' + i + '.up">↑</button>' +
-          '<button class="cust-list-btn" data-cv2-move="steps.' + i + '.down">↓</button>' +
-          '<button class="cust-list-btn danger" data-cv2-rm="steps.' + i + '">✕</button>' +
+          '<button class="cust-list-btn" data-cv2-move="steps.' + i + '.up"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-up"/></svg></button>' +
+          '<button class="cust-list-btn" data-cv2-move="steps.' + i + '.down"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-caret-down"/></svg></button>' +
+          '<button class="cust-list-btn danger" data-cv2-rm="steps.' + i + '"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button>' +
         '</div>' +
         '<textarea data-cv2-home="steps.' + i + '.description" placeholder="Description" rows="2">' + esc(s.description) + '</textarea>' +
         '<div class="cust-md-hint">Markdown: <code>**bold**</code> <code>*italic*</code> <code>`code`</code> <code>[text](url)</code></div></div>';
@@ -1231,14 +1662,14 @@
     var checkHtml = checklist.map(function (c, i) {
       return '<div class="cust-list-item">' +
         '<div class="cust-list-row"><input data-cv2-home="checklist.' + i + '.question" value="' + escAttr(c.question) + '" placeholder="Question">' +
-          '<button class="cust-list-btn danger" data-cv2-rm="checklist.' + i + '">✕</button></div>' +
+          '<button class="cust-list-btn danger" data-cv2-rm="checklist.' + i + '"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button></div>' +
         '<textarea data-cv2-home="checklist.' + i + '.answer" placeholder="Answer" rows="2">' + esc(c.answer) + '</textarea></div>';
     }).join('');
 
     var linksHtml = footerLinks.map(function (l, i) {
       return '<div class="cust-list-item">' +
-        '<div class="cust-list-row"><input data-cv2-home="footerLinks.' + i + '.label" value="' + escAttr(l.label) + '" placeholder="Label">' +
-          '<button class="cust-list-btn danger" data-cv2-rm="footerLinks.' + i + '">✕</button></div>' +
+        '<div class="cust-list-row"><input data-cv2-home="footerLinks.' + i + '.label" value="' + escAttr(l.label) + '" placeholder="Label (e.g. ph:package Packets)">' +
+          '<button class="cust-list-btn danger" data-cv2-rm="footerLinks.' + i + '"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button></div>' +
         '<input data-cv2-home="footerLinks.' + i + '.url" value="' + escAttr(l.url) + '" placeholder="URL"></div>';
     }).join('');
 
@@ -1256,6 +1687,383 @@
     '</div>';
   }
 
+  function _renderGeoFilter() {
+    return '<div class="cust-panel' + (_activeTab === 'geofilter' ? ' active' : '') + '" data-panel="geofilter">' +
+      '<p class="cust-section-title">Geographic Filter</p>' +
+      '<p style="font-size:12px;color:var(--text-muted);margin-bottom:12px">Shows the active geographic filter. Nodes outside this area are excluded at ingest time and in API responses.</p>' +
+      '<div style="position:relative;margin-bottom:8px">' +
+        '<div id="cv2-gf-map" style="height:200px;border-radius:6px;border:1px solid var(--border);background:var(--surface-1);cursor:pointer"></div>' +
+        '<div style="position:absolute;top:7px;right:7px;background:rgba(255,255,255,0.88);border-radius:4px;padding:3px 8px;font-size:11px;color:#444;pointer-events:none;box-shadow:0 1px 3px rgba(0,0,0,0.15)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> click to expand</div>' +
+      '</div>' +
+      '<div id="cv2-gf-status" style="font-size:12px;color:var(--text-muted);margin-bottom:10px">Loading current filter…</div>' +
+      // Edit controls — hidden until server confirms write access (writeEnabled=true)
+      '<div id="cv2-gf-edit" style="display:none">' +
+        '<div style="display:flex;gap:8px;margin-bottom:10px;align-items:center">' +
+          '<label style="font-size:12px;color:var(--text-muted)">Buffer km:</label>' +
+          '<input type="number" id="cv2-gf-buffer" value="20" min="0" max="500" style="width:64px;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--input-bg);color:var(--text);font-size:12px">' +
+        '</div>' +
+        '<div class="cust-field"><label>Server API Key</label>' +
+          '<input type="password" id="cv2-gf-apikey" placeholder="apiKey from config.json" style="width:100%;padding:5px 8px;border:1px solid var(--border);border-radius:6px;background:var(--input-bg);color:var(--text);font-size:12px">' +
+        '</div>' +
+        '<div style="display:flex;gap:8px;margin-top:12px">' +
+          '<button id="cv2-gf-save" style="padding:7px 16px;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500">Save to server</button>' +
+          '<button id="cv2-gf-remove" style="padding:7px 14px;background:var(--surface-1);color:var(--status-red);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:13px">Remove filter</button>' +
+        '</div>' +
+        '<div id="cv2-gf-msg" style="margin-top:8px;font-size:12px;display:none"></div>' +
+        // Prune section — only shown when a polygon is active (toggled in _initGeoFilterTab)
+        '<div id="cv2-gf-prune-section" style="display:none;margin-top:16px;border-top:1px solid var(--border);padding-top:14px">' +
+          '<p class="cust-section-title" style="font-size:13px;margin-bottom:6px">Prune historical nodes</p>' +
+          '<p style="font-size:11px;color:var(--text-muted);margin-bottom:10px">Remove nodes already in the database that fall outside the current filter. Run once after first enabling geo filtering.</p>' +
+          '<button id="cv2-gf-prune-preview" style="padding:6px 14px;background:var(--surface-1);color:var(--text-muted);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:12px">Preview prune</button>' +
+          '<div id="cv2-gf-prune-result" style="display:none;margin-top:10px">' +
+            '<div id="cv2-gf-prune-list" style="font-size:11px;color:var(--text-muted);max-height:100px;overflow-y:auto;margin-bottom:8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px"></div>' +
+            '<button id="cv2-gf-prune-confirm" style="padding:6px 14px;background:var(--status-red);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500">Delete nodes</button>' +
+          '</div>' +
+          '<div id="cv2-gf-prune-msg" style="margin-top:8px;font-size:12px;display:none"></div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function _gfOpenModal(container) {
+    var existing = document.getElementById('cv2-gf-modal-overlay');
+    if (existing) existing.remove();
+    if (_gfModalMap) { _gfModalMap.remove(); _gfModalMap = null; }
+
+    var overlay = document.createElement('div');
+    overlay.id = 'cv2-gf-modal-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:99999;display:flex;align-items:center;justify-content:center;';
+
+    var dialog = document.createElement('div');
+    dialog.style.cssText = 'width:92vw;height:86vh;background:#fff;border-radius:10px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+
+    var toolbarEl = document.createElement('div');
+    toolbarEl.style.cssText = 'padding:10px 14px;display:flex;gap:8px;align-items:center;border-bottom:1px solid #e0e0e0;background:#f5f5f5;flex-shrink:0;';
+    var title = document.createElement('span');
+    title.style.cssText = 'font-weight:600;color:#333;font-size:14px;';
+    title.textContent = _gfWriteEnabled ? 'Edit GeoFilter — click map to add points' : 'GeoFilter — read only';
+    toolbarEl.appendChild(title);
+
+    if (_gfWriteEnabled) {
+      var undoBtn = document.createElement('button');
+      undoBtn.id = 'cv2-gfm-undo';
+      undoBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-arrow-u-up-left"/></svg> Undo';
+      undoBtn.style.cssText = 'padding:5px 10px;background:#eee;color:#555;border:1px solid #ccc;border-radius:6px;cursor:pointer;font-size:12px;';
+      var clearBtn = document.createElement('button');
+      clearBtn.id = 'cv2-gfm-clear';
+      clearBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg> Clear';
+      clearBtn.style.cssText = 'padding:5px 10px;background:#fee;color:#c44;border:1px solid #fcc;border-radius:6px;cursor:pointer;font-size:12px;';
+      var countEl = document.createElement('span');
+      countEl.id = 'cv2-gfm-count';
+      countEl.style.cssText = 'font-size:12px;color:#888;';
+      var spacer = document.createElement('span');
+      spacer.style.cssText = 'flex:1;';
+      var doneBtn = document.createElement('button');
+      doneBtn.id = 'cv2-gfm-done';
+      doneBtn.textContent = 'Done';
+      doneBtn.style.cssText = 'padding:7px 18px;background:#4a9eff;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;';
+      toolbarEl.appendChild(undoBtn);
+      toolbarEl.appendChild(clearBtn);
+      toolbarEl.appendChild(countEl);
+      toolbarEl.appendChild(spacer);
+      toolbarEl.appendChild(doneBtn);
+    } else {
+      var spacer2 = document.createElement('span');
+      spacer2.style.cssText = 'flex:1;';
+      toolbarEl.appendChild(spacer2);
+    }
+
+    var closeBtn = document.createElement('button');
+    closeBtn.id = 'cv2-gfm-close';
+    closeBtn.textContent = _gfWriteEnabled ? 'Cancel' : 'Close';
+    closeBtn.style.cssText = 'padding:7px 14px;background:#eee;color:#555;border:1px solid #ccc;border-radius:6px;cursor:pointer;font-size:13px;';
+    toolbarEl.appendChild(closeBtn);
+
+    var mapDiv = document.createElement('div');
+    mapDiv.id = 'cv2-gf-modal-map';
+    mapDiv.style.cssText = 'flex:1;';
+
+    dialog.appendChild(toolbarEl);
+    dialog.appendChild(mapDiv);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    var modalPoints = _gfPoints.map(function (p) { return [p[0], p[1]]; });
+    var modalMarkers = [];
+    var modalPolygon = null;
+    var modalClosingLine = null;
+
+    _gfModalMap = L.map(mapDiv, { zoomControl: true });
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+      attribution: '© OpenStreetMap © CartoDB', maxZoom: 19
+    }).addTo(_gfModalMap);
+
+    function renderModal() {
+      if (modalPolygon) { _gfModalMap.removeLayer(modalPolygon); modalPolygon = null; }
+      if (modalClosingLine) { _gfModalMap.removeLayer(modalClosingLine); modalClosingLine = null; }
+      modalMarkers.forEach(function (m) { _gfModalMap.removeLayer(m); });
+      modalMarkers = [];
+      modalPoints.forEach(function (pt, i) {
+        var m = L.circleMarker(pt, { radius: 6, color: '#4a9eff', weight: 2, fillColor: '#4a9eff', fillOpacity: 0.9 })
+          .addTo(_gfModalMap)
+          .bindTooltip(String(i + 1), { permanent: true, direction: 'top', offset: [0, -8] });
+        modalMarkers.push(m);
+      });
+      if (modalPoints.length >= 3) {
+        modalPolygon = L.polygon(modalPoints, { color: '#4a9eff', weight: 2, fillColor: '#4a9eff', fillOpacity: 0.12 }).addTo(_gfModalMap);
+      } else if (modalPoints.length === 2) {
+        modalClosingLine = L.polyline(modalPoints, { color: '#4a9eff', weight: 2, dashArray: '5,5' }).addTo(_gfModalMap);
+      }
+      var ce = document.getElementById('cv2-gfm-count');
+      if (ce) ce.textContent = modalPoints.length + ' point' + (modalPoints.length !== 1 ? 's' : '');
+    }
+
+    function closeModal() {
+      if (_gfModalMap) { _gfModalMap.remove(); _gfModalMap = null; }
+      overlay.remove();
+    }
+
+    setTimeout(function () {
+      _gfModalMap.invalidateSize();
+      renderModal();
+      if (modalPoints.length >= 3) {
+        _gfModalMap.fitBounds(L.latLngBounds(modalPoints), { padding: [40, 40] });
+      } else {
+        _gfModalMap.setView([50.5, 4.4], 5);
+      }
+    }, 80);
+
+    if (_gfWriteEnabled) {
+      _gfModalMap.on('click', function (e) {
+        modalPoints.push([parseFloat(e.latlng.lat.toFixed(6)), parseFloat(e.latlng.lng.toFixed(6))]);
+        renderModal();
+      });
+      document.getElementById('cv2-gfm-undo').addEventListener('click', function () {
+        if (!modalPoints.length) return;
+        modalPoints.pop();
+        renderModal();
+      });
+      document.getElementById('cv2-gfm-clear').addEventListener('click', function () {
+        modalPoints = [];
+        renderModal();
+      });
+      document.getElementById('cv2-gfm-done').addEventListener('click', function () {
+        _gfPoints = modalPoints;
+        _gfRender();
+        var prune = container.querySelector('#cv2-gf-prune-section');
+        if (prune) prune.style.display = _gfPoints.length >= 3 ? '' : 'none';
+        _gfStatus(container, _gfPoints.length + ' point' + (_gfPoints.length !== 1 ? 's' : '') + '.');
+        closeModal();
+      });
+    }
+
+    closeBtn.addEventListener('click', closeModal);
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) closeModal(); });
+  }
+
+  function _gfRender() {
+    if (!_gfMap) return;
+    if (_gfPolygon) { _gfMap.removeLayer(_gfPolygon); _gfPolygon = null; }
+    if (_gfClosingLine) { _gfMap.removeLayer(_gfClosingLine); _gfClosingLine = null; }
+    _gfMarkers.forEach(function (m) { _gfMap.removeLayer(m); });
+    _gfMarkers = [];
+
+    _gfPoints.forEach(function (pt, i) {
+      var m = L.circleMarker(pt, { radius: 6, color: '#4a9eff', weight: 2, fillColor: '#4a9eff', fillOpacity: 0.9 })
+        .addTo(_gfMap)
+        .bindTooltip(String(i + 1), { permanent: true, direction: 'top', offset: [0, -8] });
+      _gfMarkers.push(m);
+    });
+
+    if (_gfPoints.length >= 3) {
+      _gfPolygon = L.polygon(_gfPoints, { color: '#4a9eff', weight: 2, fillColor: '#4a9eff', fillOpacity: 0.12 }).addTo(_gfMap);
+    } else if (_gfPoints.length === 2) {
+      _gfClosingLine = L.polyline(_gfPoints, { color: '#4a9eff', weight: 2, dashArray: '5,5' }).addTo(_gfMap);
+    }
+  }
+
+  function _gfStatus(container, msg) {
+    var el = container.querySelector('#cv2-gf-status');
+    if (el) el.textContent = msg;
+  }
+
+  function _gfMsg(container, msg, ok) {
+    var el = container.querySelector('#cv2-gf-msg');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.display = msg ? '' : 'none';
+    el.style.color = ok ? 'var(--status-green)' : 'var(--status-red)';
+  }
+
+  function _gfSave(container) {
+    if (_gfPoints.length < 3) { _gfMsg(container, 'Need at least 3 polygon points.', false); return; }
+    var apiKey = (container.querySelector('#cv2-gf-apikey') || {}).value || '';
+    if (!apiKey) { _gfMsg(container, 'API key required to save.', false); return; }
+    var bufferKm = parseFloat((container.querySelector('#cv2-gf-buffer') || {}).value) || 0;
+    fetch('/api/config/geo-filter', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+      body: JSON.stringify({ polygon: _gfPoints, bufferKm: bufferKm })
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || ('HTTP ' + r.status)); });
+      _gfMsg(container, 'Saved. Filter is active immediately.', true);
+      _gfStatus(container, _gfPoints.length + ' points · bufferKm=' + bufferKm + ' · saved');
+    }).catch(function (e) { _gfMsg(container, 'Error: ' + e.message, false); });
+  }
+
+  function _gfRemove(container) {
+    var apiKey = (container.querySelector('#cv2-gf-apikey') || {}).value || '';
+    if (!apiKey) { _gfMsg(container, 'API key required.', false); return; }
+    if (!confirm('Remove geo filter? All nodes will be allowed through.')) return;
+    fetch('/api/config/geo-filter', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+      body: JSON.stringify({ polygon: null })
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || ('HTTP ' + r.status)); });
+      _gfPoints = []; _gfLoaded = true;
+      _gfRender();
+      _gfStatus(container, 'No geo filter. Click the map to draw a polygon.');
+      _gfMsg(container, 'Geo filter removed.', true);
+    }).catch(function (e) { _gfMsg(container, 'Error: ' + e.message, false); });
+  }
+
+  var _gfPruneNodes = []; // nodes returned by last dry-run preview
+
+  function _gfPruneMsg(container, msg, ok) {
+    var el = container.querySelector('#cv2-gf-prune-msg');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.display = msg ? '' : 'none';
+    el.style.color = ok ? 'var(--status-green)' : 'var(--status-red)';
+  }
+
+  function _gfPrunePreview(container) {
+    var apiKey = (container.querySelector('#cv2-gf-apikey') || {}).value || '';
+    if (!apiKey) { _gfPruneMsg(container, 'API key required.', false); return; }
+    var btn = container.querySelector('#cv2-gf-prune-preview');
+    if (btn) btn.textContent = 'Loading…';
+    fetch('/api/admin/prune-geo-filter', {
+      method: 'POST',
+      headers: { 'X-API-Key': apiKey }
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || ('HTTP ' + r.status)); });
+      return r.json();
+    }).then(function (data) {
+      if (btn) btn.textContent = 'Preview prune';
+      _gfPruneNodes = data.nodes || [];
+      var count = data.count || 0;
+      var resultEl = container.querySelector('#cv2-gf-prune-result');
+      var listEl = container.querySelector('#cv2-gf-prune-list');
+      var confirmBtn = container.querySelector('#cv2-gf-prune-confirm');
+      if (!resultEl || !listEl || !confirmBtn) return;
+      if (count === 0) {
+        _gfPruneMsg(container, 'No nodes outside the filter. Nothing to prune.', true);
+        resultEl.style.display = 'none';
+        return;
+      }
+      listEl.innerHTML = _gfPruneNodes.map(function (n) {
+        var coords = n.lat != null ? (' · ' + n.lat.toFixed(4) + ', ' + n.lon.toFixed(4)) : '';
+        return '<div>' + (n.name || n.pubkey.slice(0, 12)) + coords + '</div>';
+      }).join('');
+      confirmBtn.textContent = 'Delete ' + count + ' node' + (count !== 1 ? 's' : '');
+      resultEl.style.display = '';
+      _gfPruneMsg(container, '', true);
+    }).catch(function (e) {
+      if (btn) btn.textContent = 'Preview prune';
+      _gfPruneMsg(container, 'Error: ' + e.message, false);
+    });
+  }
+
+  function _gfPruneConfirm(container) {
+    if (!_gfPruneNodes.length) { _gfPruneMsg(container, 'Run preview first.', false); return; }
+    var apiKey = (container.querySelector('#cv2-gf-apikey') || {}).value || '';
+    if (!apiKey) { _gfPruneMsg(container, 'API key required.', false); return; }
+    var count = _gfPruneNodes.length;
+    if (!confirm('Delete ' + count + ' node' + (count !== 1 ? 's' : '') + ' from the database? This cannot be undone.')) return;
+    var pubkeys = _gfPruneNodes.map(function (n) { return n.pubkey; });
+    fetch('/api/admin/prune-geo-filter?confirm=true', {
+      method: 'POST',
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pubkeys: pubkeys })
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || ('HTTP ' + r.status)); });
+      return r.json();
+    }).then(function (data) {
+      _gfPruneNodes = [];
+      var resultEl = container.querySelector('#cv2-gf-prune-result');
+      if (resultEl) resultEl.style.display = 'none';
+      var n = data.deleted;
+      _gfPruneMsg(container, 'Deleted ' + n + ' node' + (n !== 1 ? 's' : '') + '.', true);
+    }).catch(function (e) { _gfPruneMsg(container, 'Error: ' + e.message, false); });
+  }
+
+  function _initGeoFilterTab(container) {
+    var mapEl = container.querySelector('#cv2-gf-map');
+    if (!mapEl || typeof L === 'undefined') return;
+
+    _gfMap = L.map(mapEl, { zoomControl: false, dragging: false, scrollWheelZoom: false, doubleClickZoom: false, touchZoom: false });
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+      attribution: '© OpenStreetMap © CartoDB', maxZoom: 19
+    }).addTo(_gfMap);
+
+    if (!_gfLoaded) {
+      api('/config/geo-filter', { ttl: 0 }).then(function (gf) {
+        // Show edit controls only on servers that have a write-capable API key configured
+        if (gf && gf.writeEnabled) {
+          _gfWriteEnabled = true;
+          var editEl = container.querySelector('#cv2-gf-edit');
+          if (editEl) editEl.style.display = '';
+        }
+        if (gf && gf.polygon && gf.polygon.length >= 3) {
+          _gfPoints = gf.polygon.map(function (p) { return [p[0], p[1]]; });
+          var buf = container.querySelector('#cv2-gf-buffer');
+          if (buf) buf.value = gf.bufferKm || 0;
+          _gfRender();
+          if (_gfPolygon) _gfMap.fitBounds(_gfPolygon.getBounds(), { padding: [20, 20] });
+          _gfStatus(container, gf.polygon.length + ' points · bufferKm=' + (gf.bufferKm || 0));
+          // Show prune section when a polygon is active and write access is available
+          if (gf.writeEnabled) {
+            var pruneEl = container.querySelector('#cv2-gf-prune-section');
+            if (pruneEl) pruneEl.style.display = '';
+          }
+        } else {
+          _gfPoints = [];
+          _gfStatus(container, gf && gf.writeEnabled ? 'No geo filter. Click the map to open the editor.' : 'No geo filter configured.');
+          _gfMap.setView([50.5, 4.4], 5);
+        }
+        _gfLoaded = true;
+        setTimeout(function () { if (_gfMap) _gfMap.invalidateSize(); }, 100);
+      }).catch(function () {
+        _gfStatus(container, 'Could not load current filter.');
+        _gfMap.setView([50.5, 4.4], 5);
+        _gfLoaded = true;
+        setTimeout(function () { if (_gfMap) _gfMap.invalidateSize(); }, 100);
+      });
+    } else {
+      if (_gfPoints.length >= 3) {
+        _gfRender();
+        if (_gfPolygon) _gfMap.fitBounds(_gfPolygon.getBounds(), { padding: [20, 20] });
+        _gfStatus(container, _gfPoints.length + ' points.');
+      } else {
+        _gfMap.setView([50.5, 4.4], 5);
+        _gfStatus(container, _gfPoints.length ? _gfPoints.length + ' points (need at least 3).' : 'Click the map to draw a polygon.');
+        _gfRender();
+      }
+      setTimeout(function () { if (_gfMap) _gfMap.invalidateSize(); }, 100);
+    }
+
+    _gfMap.on('click', function () { _gfOpenModal(container); });
+
+    container.querySelector('#cv2-gf-save').addEventListener('click', function () { _gfSave(container); });
+    container.querySelector('#cv2-gf-remove').addEventListener('click', function () { _gfRemove(container); });
+
+    var prunePreviewBtn = container.querySelector('#cv2-gf-prune-preview');
+    var pruneConfirmBtn = container.querySelector('#cv2-gf-prune-confirm');
+    if (prunePreviewBtn) prunePreviewBtn.addEventListener('click', function () { _gfPrunePreview(container); });
+    if (pruneConfirmBtn) pruneConfirmBtn.addEventListener('click', function () { _gfPruneConfirm(container); });
+  }
+
   function _renderExport() {
     var delta = readOverrides();
     var json = JSON.stringify(delta, null, 2);
@@ -1265,18 +2073,18 @@
       '<p class="cust-section-title">Export / Import</p>' +
       '<p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Your customizations are stored in your browser. Export to share or back up.</p>' +
       '<div class="cust-export-btns">' +
-        '<button class="cust-dl-btn" id="cv2Download">💾 Download JSON</button>' +
-        '<button class="cust-dl-btn" id="cv2ImportFile">📂 Import File</button>' +
+        '<button class="cust-dl-btn" id="cv2Download"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-floppy-disk"/></svg> Download JSON</button>' +
+        '<button class="cust-dl-btn" id="cv2ImportFile"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-folder-open"/></svg> Import File</button>' +
         '<input type="file" id="cv2ImportInput" accept=".json,application/json" style="display:none">' +
-        '<button class="cust-copy-btn" id="cv2Copy">📋 Copy</button>' +
+        '<button class="cust-copy-btn" id="cv2Copy"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-clipboard-text"/></svg> Copy</button>' +
       '</div>' +
-      (hasDelta ? '<div style="margin-top:12px"><button class="cust-reset-all" id="cv2ResetAll">🗑️ Reset All Customizations</button></div>' : '') +
+      (hasDelta ? '<div style="margin-top:12px"><button class="cust-reset-all" id="cv2ResetAll"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-trash"/></svg> Reset All Customizations</button></div>' : '') +
       '<details style="margin-top:12px"><summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-muted)">Raw JSON</summary>' +
         '<textarea id="cv2ExportJson" style="width:100%;min-height:200px;font-family:var(--mono);font-size:12px;background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:12px;color:var(--text);resize:vertical;box-sizing:border-box;margin-top:8px">' + esc(json) + '</textarea>' +
       '</details>' +
       '<p class="cust-section-title" style="margin-top:20px">Tools</p>' +
       '<p style="font-size:12px;color:var(--text-muted);margin-bottom:10px">Server-side configuration helpers.</p>' +
-      '<a href="/geofilter-builder.html" target="_blank" style="display:inline-block;padding:7px 14px;background:var(--surface-1);border:1px solid var(--border);border-radius:6px;color:var(--accent);font-size:13px;text-decoration:none;font-weight:500">🗺️ GeoFilter Builder →</a>' +
+      '<a href="/geofilter-builder.html" target="_blank" style="display:inline-block;padding:7px 14px;background:var(--surface-1);border:1px solid var(--border);border-radius:6px;color:var(--accent);font-size:13px;text-decoration:none;font-weight:500"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> GeoFilter Builder →</a>' +
       '<p style="font-size:11px;color:var(--text-muted);margin-top:6px">Draw a polygon on the map to generate a <code style="font-family:var(--mono)">geo_filter</code> block for <code style="font-family:var(--mono)">config.json</code>.</p>' +
     '</div>';
   }
@@ -1290,6 +2098,7 @@
         _renderNodes() +
         _renderHome() +
         _renderDisplay() +
+        _renderGeoFilter() +
         _renderExport() +
       '</div>';
     _bindEvents(container);
@@ -1358,8 +2167,83 @@
     // Tab switching
     container.querySelectorAll('.cust-tab').forEach(function (btn) {
       btn.addEventListener('click', function () {
+        if (_gfMap) { _gfMap.remove(); _gfMap = null; _gfMarkers = []; _gfPolygon = null; _gfClosingLine = null; } if (_gfModalMap) { _gfModalMap.remove(); _gfModalMap = null; } var _ov = document.getElementById('cv2-gf-modal-overlay'); if (_ov) _ov.remove();
         _activeTab = btn.dataset.tab;
         _renderPanel(container);
+      });
+    });
+
+    // GeoFilter tab init
+    if (_activeTab === 'geofilter') _initGeoFilterTab(container);
+
+    // #1361 Colorblind preset radio — switches preset via MeshCorePresets.applyPreset
+    // #1446 — empty-value radio = "no preset" → clearPreset(), then re-run
+    // the customizer pipeline so server-config colors take over.
+    container.querySelectorAll('[data-cv2-cb-preset]').forEach(function (radio) {
+      radio.addEventListener('change', function () {
+        if (!radio.checked) return;
+        var id = radio.value;
+        var MCP = window.MeshCorePresets;
+        if (!MCP) return;
+        if (!id) {
+          if (typeof MCP.clearPreset === 'function') MCP.clearPreset();
+          _runPipeline();
+        } else if (typeof MCP.applyPreset === 'function') {
+          MCP.applyPreset(id);
+        }
+        _refreshPanel();
+      });
+    });
+
+    // #1380 — Brettel/Vienot sim overlay radio: toggle body[data-cb-sim].
+    // Preview-only — no persistence.
+    container.querySelectorAll('[data-cv2-cb-sim]').forEach(function (radio) {
+      radio.addEventListener('change', function () {
+        if (!radio.checked) return;
+        _applyCbSim(radio.value || '');
+      });
+    });
+
+    // #1380 — Reset-to-default-Wong button.
+    container.querySelectorAll('[data-cv2-cb-reset]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        _resetCbPreset();
+        _refreshPanel();
+      });
+    });
+
+    // #1420 Dark-tile provider dropdown — persists + fires mc-tile-provider-changed
+    container.querySelectorAll('[data-cv2-dark-tile-provider]').forEach(function (sel) {
+      sel.addEventListener('change', function () {
+        var id = sel.value;
+        if (typeof window.MC_setDarkTileProvider === 'function') {
+          window.MC_setDarkTileProvider(id);
+        }
+      });
+    });
+
+    // Light-tile provider dropdown — persists + fires mc-tile-provider-changed
+    container.querySelectorAll('[data-cv2-light-tile-provider]').forEach(function (sel) {
+      sel.addEventListener('change', function () {
+        var id = sel.value;
+        if (typeof window.MC_setLightTileProvider === 'function') {
+          window.MC_setLightTileProvider(id);
+        }
+      });
+    });
+
+    // #1454 Show-encrypted-channels checkbox — persists + fires
+    // mc-channels-show-encrypted-changed; channels.js re-fetches live.
+    container.querySelectorAll('[data-cv2-channels-show-encrypted]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var on = !!cb.checked;
+        try {
+          if (on) localStorage.setItem('channels-show-encrypted', 'true');
+          else localStorage.removeItem('channels-show-encrypted');
+        } catch (_e) { /* private mode etc. */ }
+        window.dispatchEvent(new CustomEvent('mc-channels-show-encrypted-changed', {
+          detail: { value: on }
+        }));
       });
     });
 
@@ -1411,6 +2295,11 @@
           // Mirror to logo brand vars so the wordmark recolors live too.
           if (key === 'accent') document.documentElement.style.setProperty('--logo-accent', inp.value);
           if (key === 'accentHover') document.documentElement.style.setProperty('--logo-accent-hi', inp.value);
+          // #1488 — marker stroke color also gets a live CSS-var write
+          // so the operator sees outlines repaint on drag.
+          if (section === 'markerStroke' && key === 'color') {
+            document.documentElement.style.setProperty('--mc-marker-stroke-color', inp.value);
+          }
           // Update hex display
           var hex = inp.parentElement.querySelector('.cust-hex');
           if (hex) hex.textContent = inp.value;
@@ -1437,12 +2326,17 @@
             var iconEl = document.querySelector('.brand-icon');
             if (iconEl) {
               if (inp.value) iconEl.innerHTML = '<img src="' + inp.value + '" style="height:24px" onerror="this.style.display=\'none\'">';
-              else iconEl.textContent = '📡';
+              else iconEl.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg>';
             }
           }
           if (section === 'branding' && key === 'faviconUrl') {
             var link = document.querySelector('link[rel="icon"]');
             if (link && inp.value) link.href = inp.value;
+          }
+          if (section === 'branding' && key === 'homeUrl') {
+            // #1518 — live nav-brand[href] swap. Validator silently drops
+            // bogus schemes so typing 'javascript:' never sets the attribute.
+            _setBrandHomeUrl(inp.value);
           }
         });
       }
@@ -1490,6 +2384,40 @@
       });
     });
 
+    // #1488 — Marker stroke width/opacity sliders. Color picker uses the
+    // generic data-cv2-field handler (markerStroke.color) above.
+    container.querySelectorAll('[data-cv2-marker-stroke]').forEach(function (inp) {
+      var which = inp.dataset.cv2MarkerStroke; // 'width' | 'opacity'
+      inp.addEventListener('input', function () {
+        var raw = parseFloat(inp.value);
+        if (!isFinite(raw)) return;
+        if (which === 'opacity') {
+          var lbl = document.getElementById('cv2MarkerStrokeO');
+          if (lbl) lbl.textContent = Math.round(raw) + '%';
+          // Optimistic CSS write so the markers repaint on drag.
+          document.documentElement.style.setProperty('--mc-marker-stroke-opacity', String(raw / 100));
+        } else {
+          var lblW = document.getElementById('cv2MarkerStrokeW');
+          if (lblW) lblW.textContent = String(raw);
+          document.documentElement.style.setProperty('--mc-marker-stroke-width', String(raw));
+        }
+      });
+      inp.addEventListener('change', function () {
+        var raw = parseFloat(inp.value);
+        if (!isFinite(raw)) return;
+        var eff = _getEffective();
+        var current = JSON.parse(JSON.stringify(eff.markerStroke || {}));
+        if (which === 'opacity') current.opacity = raw / 100;
+        else current.width = raw;
+        // Persist the whole object so partial picks survive (color +
+        // width + opacity coexist in a single section).
+        var delta = JSON.parse(JSON.stringify(readOverrides()));
+        delta.markerStroke = Object.assign({}, delta.markerStroke || {}, current);
+        writeOverrides(delta);
+        _runPipeline();
+      });
+    });
+
     // Home page list editing
     container.querySelectorAll('[data-cv2-home]').forEach(function (inp) {
       inp.addEventListener('input', function () {
@@ -1501,6 +2429,16 @@
         if (arr && arr[parseInt(path[1])]) {
           arr[parseInt(path[1])][path[2]] = inp.value;
           setOverride('home', path[0], arr);
+        }
+        // #1648 M6 (M5 CDP carry-forward): live re-render of the glyph
+        // preview when an operator types a new `ph:<name>` token or
+        // legacy emoji into a steps.N.emoji input. Without this, the
+        // .cust-emoji-preview swatch only updated on Save+reload.
+        if (inp.classList.contains('cust-emoji-input')) {
+          var preview = inp.previousElementSibling;
+          if (preview && preview.classList && preview.classList.contains('cust-emoji-preview')) {
+            preview.innerHTML = renderConfigGlyph(inp.value);
+          }
         }
       });
     });
@@ -1541,7 +2479,7 @@
         var eff = _getEffective();
         var home = JSON.parse(JSON.stringify(eff.home || {}));
         var arr = home[listKey] || [];
-        if (listKey === 'steps') arr.push({ emoji: '📌', title: '', description: '' });
+        if (listKey === 'steps') arr.push({ emoji: 'ph:push-pin', title: '', description: '' });
         else if (listKey === 'checklist') arr.push({ question: '', answer: '' });
         else if (listKey === 'footerLinks') arr.push({ label: '', url: '' });
         setOverride('home', listKey, arr);
@@ -1565,8 +2503,8 @@
       var json = JSON.stringify(readOverrides(), null, 2);
       if (window.copyToClipboard) {
         window.copyToClipboard(json, function () {
-          copyBtn.textContent = '✓ Copied!';
-          setTimeout(function () { copyBtn.textContent = '📋 Copy'; }, 2000);
+          copyBtn.textContent = 'Copied!';
+          setTimeout(function () { copyBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-clipboard-text"/></svg> Copy'; }, 2000);
         });
       }
     });
@@ -1585,18 +2523,18 @@
             var data = JSON.parse(reader.result);
             var result = validateShape(data);
             if (!result.valid) {
-              importBtn.textContent = '✕ ' + result.errors[0];
-              setTimeout(function () { importBtn.textContent = '📂 Import File'; }, 3000);
+              importBtn.textContent = result.errors[0];
+              setTimeout(function () { importBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-folder-open"/></svg> Import File'; }, 3000);
               return;
             }
             writeOverrides(data);
             _runPipeline();
             _renderPanel(container);
-            importBtn.textContent = '✓ Imported!';
-            setTimeout(function () { importBtn.textContent = '📂 Import File'; }, 2000);
+            importBtn.textContent = 'Imported!';
+            setTimeout(function () { importBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-folder-open"/></svg> Import File'; }, 2000);
           } catch (e) {
-            importBtn.textContent = '✕ Invalid JSON';
-            setTimeout(function () { importBtn.textContent = '📂 Import File'; }, 3000);
+            importBtn.textContent = 'Invalid JSON';
+            setTimeout(function () { importBtn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-folder-open"/></svg> Import File'; }, 3000);
           }
         };
         reader.readAsText(file);
@@ -1604,11 +2542,13 @@
       });
     }
 
-    // Reset All
+    // Reset All — #1496: clear every customizer-touched piece of state,
+    // not just STORAGE_KEY. Implementation lives in resetAll() on the
+    // public API so tests can drive it without a DOM button.
     var resetBtn = document.getElementById('cv2ResetAll');
     if (resetBtn) resetBtn.addEventListener('click', function () {
       if (!confirm('Reset all customizations to server defaults?')) return;
-      localStorage.removeItem(STORAGE_KEY);
+      _resetAll();
       _runPipeline();
       _renderPanel(container);
     });
@@ -1639,13 +2579,16 @@
     _panelEl = document.createElement('div');
     _panelEl.className = 'cust-overlay';
     _panelEl.innerHTML =
-      '<div class="cust-header"><h2>🎨 Customize</h2><button class="cust-close" title="Close">✕</button></div>' +
+      '<div class="cust-header"><h2><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-palette"/></svg> Customize</h2><button class="cust-close" title="Close"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-x"/></svg></button></div>' +
       '<div class="cv2-local-banner">These settings are saved in your browser only and don\'t affect other users.</div>' +
       '<div class="cust-inner"></div>' +
       '<div class="cv2-footer"><span id="cv2-save-status">All changes saved</span></div>';
     document.body.appendChild(_panelEl);
 
-    _panelEl.querySelector('.cust-close').addEventListener('click', function () { _panelEl.classList.add('hidden'); });
+    _panelEl.querySelector('.cust-close').addEventListener('click', function () {
+      if (_gfMap) { _gfMap.remove(); _gfMap = null; _gfMarkers = []; _gfPolygon = null; _gfClosingLine = null; } if (_gfModalMap) { _gfModalMap.remove(); _gfModalMap = null; } var _ov = document.getElementById('cv2-gf-modal-overlay'); if (_ov) _ov.remove();
+      _panelEl.classList.add('hidden');
+    });
 
     // Drag support
     var header = _panelEl.querySelector('.cust-header');
@@ -1672,6 +2615,18 @@
   // 1. Migration check
   migrateOldKeys();
 
+  // #1446 — when a CB preset is cleared (or applied), re-run the customizer
+  // pipeline so server-config nodeColors take over the --mc-role-{role}
+  // CSS vars (the gating logic in applyCSS checks the body[data-cb-preset]
+  // attribute to decide whether to write them).
+  try {
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('cb-preset-changed', function () {
+        if (_initDone) _runPipeline();
+      });
+    }
+  } catch (e) {}
+
   // 2. Read overrides and apply CSS immediately (before DOMContentLoaded)
   // Server defaults will be set later when /api/config/theme completes.
   // For now, apply whatever overrides exist on top of current SITE_CONFIG.
@@ -1696,12 +2651,12 @@
     if (ovTheme.accent) root.setProperty('--logo-accent', ovTheme.accent);
     if (ovTheme.accentHover) root.setProperty('--logo-accent-hi', ovTheme.accentHover);
     if (themeSection.background) root.setProperty('--content-bg', themeSection.contentBg || themeSection.background);
-    if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface1);
-    // Apply node/type colors from overrides early
+    if (themeSection.surface1) root.setProperty('--card-bg', themeSection.cardBg || themeSection.surface2 || themeSection.surface1);
+    // Apply node colors from overrides early — --node-X CSS var only.
+    // #1412: do NOT write to window.ROLE_COLORS / ROLE_STYLE here.
     if (earlyOverrides.nodeColors) {
       for (var role in earlyOverrides.nodeColors) {
-        if (window.ROLE_COLORS && role in window.ROLE_COLORS) window.ROLE_COLORS[role] = earlyOverrides.nodeColors[role];
-        if (window.ROLE_STYLE && window.ROLE_STYLE[role]) window.ROLE_STYLE[role].color = earlyOverrides.nodeColors[role];
+        root.setProperty('--node-' + role, earlyOverrides.nodeColors[role]);
       }
     }
     if (earlyOverrides.typeColors && window.TYPE_COLORS) {
@@ -1735,6 +2690,11 @@
         var link = document.querySelector('link[rel="icon"]');
         if (link) link.href = overrides.branding.faviconUrl;
       }
+      // #1518 — re-apply homeUrl override after DOM is ready (handles cold
+      // page loads where the customizer pipeline ran before .nav-brand mounted).
+      if (overrides.branding.homeUrl) {
+        _setBrandHomeUrl(overrides.branding.homeUrl);
+      }
     }
 
     // Watch dark/light mode toggle and re-apply
@@ -1743,6 +2703,124 @@
       if (_panelEl && !_panelEl.classList.contains('hidden')) _refreshPanel();
     }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
   });
+
+  // ── Reset All (#1496) ──
+  //
+  // The original "Reset All" only cleared STORAGE_KEY (cs-theme-overrides),
+  // leaving CB-preset, encrypted-channel toggle, dark-tile pick, marker
+  // stroke vars and per-role body.style writes stuck — each subsequent
+  // customizer feature (PRs #1430, #1454, #1488, #1448) added its own
+  // out-of-band side effect and forgot to teach Reset about it.
+  //
+  // Single source of truth: this function. Adding a new customizer
+  // feature requires adding its teardown here. Each removal is wrapped
+  // in try/catch because we run before/after page lifecycle in tests
+  // and operators' browsers where any one surface (localStorage,
+  // document, body) could be missing.
+  function _resetAll() {
+    // 1. localStorage — customizer-owned keys ONLY. Theme / favorites /
+    //    gesture hints / channel selection state are explicitly preserved
+    //    (see issue #1496 "Out of scope").
+    var CUSTOMIZER_LS_KEYS = [
+      STORAGE_KEY,                 // 'cs-theme-overrides'
+      'meshcore-cb-preset',        // #1361 CB preset id
+      'channels-show-encrypted',   // #1454 encrypted-channel toggle
+      'mc-dark-tile-provider'      // #1430 dark-tile provider pick
+    ];
+    for (var i = 0; i < CUSTOMIZER_LS_KEYS.length; i++) {
+      try { localStorage.removeItem(CUSTOMIZER_LS_KEYS[i]); } catch (_e) { /* ignore */ }
+    }
+
+    // 2. CB preset — body[data-cb-preset] + CSS var teardown lives in
+    //    MeshCorePresets.clearPreset(). Prefer the canonical helper so
+    //    the dispatch (cb-preset-changed event) fires and downstream
+    //    consumers re-sync to server config without a reload.
+    try {
+      var MCP = (typeof window !== 'undefined') && window.MeshCorePresets;
+      if (MCP && typeof MCP.clearPreset === 'function') {
+        MCP.clearPreset();
+      } else if (typeof document !== 'undefined' && document.body) {
+        // Defensive fallback (e.g. cb-presets.js failed to load).
+        document.body.removeAttribute('data-cb-preset');
+      }
+    } catch (_e) { /* ignore */ }
+
+    // 3. body.style — #1446/#1448 wrote --mc-role-{role} / -text with
+    //    !important so they trump :root.  Strip per role + text role.
+    try {
+      if (typeof document !== 'undefined' && document.body && document.body.style) {
+        ['repeater', 'companion', 'room', 'sensor', 'observer'].forEach(function (role) {
+          document.body.style.removeProperty('--mc-role-' + role);
+          document.body.style.removeProperty('--mc-role-' + role + '-text');
+        });
+      }
+    } catch (_e) { /* ignore */ }
+
+    // 4. :root style — everything the customizer pipeline + cb-presets
+    //    + marker-stroke + tile providers ever wrote onto documentElement.
+    //    A fresh _runPipeline() will re-set whatever server config /
+    //    remaining (theme-only) preferences dictate.
+    try {
+      if (typeof document !== 'undefined' && document.documentElement && document.documentElement.style) {
+        var rs = document.documentElement.style;
+        ['repeater', 'companion', 'room', 'sensor', 'observer'].forEach(function (role) {
+          rs.removeProperty('--mc-role-' + role);
+          rs.removeProperty('--mc-role-' + role + '-text');
+          rs.removeProperty('--node-' + role);
+        });
+        // #1488 marker stroke vars.
+        rs.removeProperty('--mc-marker-stroke-color');
+        rs.removeProperty('--mc-marker-stroke-width');
+        rs.removeProperty('--mc-marker-stroke-opacity');
+        // CB-preset MB / RT-ramp vars (also cleared by clearPreset above
+        // but stripped here defensively in case clearPreset is absent).
+        ['confirmed', 'suspected', 'unknown'].forEach(function (k) {
+          rs.removeProperty('--mc-mb-' + k);
+        });
+        for (var ri = 0; ri < 5; ri++) rs.removeProperty('--mc-rt-ramp-' + ri);
+        // Theme vars the customizer might have stamped onto :root via
+        // applyCSS (logo accents + every entry in THEME_CSS_MAP).
+        rs.removeProperty('--logo-accent');
+        rs.removeProperty('--logo-accent-hi');
+        for (var tkey in THEME_CSS_MAP) {
+          if (Object.prototype.hasOwnProperty.call(THEME_CSS_MAP, tkey)) {
+            rs.removeProperty(THEME_CSS_MAP[tkey]);
+          }
+        }
+      }
+    } catch (_e) { /* ignore */ }
+
+    // 5. Tile provider — clearing the localStorage key (step 1) takes
+    //    care of persistence, but a live consumer needs the
+    //    mc-tile-provider-changed event to swap back to the server
+    //    default. Re-applying the effective active id achieves that
+    //    without forcing a particular value (it falls through to the
+    //    server default / DEFAULT_ID inside getActiveId()).
+    try {
+      if (typeof window !== 'undefined' &&
+          typeof window.MC_setDarkTileProvider === 'function' &&
+          typeof window.MC_getDarkTileProvider === 'function') {
+        window.MC_setDarkTileProvider(window.MC_getDarkTileProvider());
+        // Re-clear so we don't re-persist the just-re-applied value.
+        try { localStorage.removeItem('mc-dark-tile-provider'); } catch (_e) {}
+      }
+    } catch (_e) { /* ignore */ }
+
+    // 6. Encrypted-channel toggle — removing the LS key (step 1) fixes
+    //    persistence, but channels.js subscribes to
+    //    mc-channels-show-encrypted-changed for live re-render. Fire it
+    //    explicitly with on:false so the channels list reverts to "hide
+    //    encrypted" without a page reload.
+    try {
+      if (typeof window !== 'undefined' &&
+          typeof window.dispatchEvent === 'function' &&
+          typeof window.CustomEvent === 'function') {
+        window.dispatchEvent(new window.CustomEvent('mc-channels-show-encrypted-changed', {
+          detail: { on: false }
+        }));
+      }
+    } catch (_e) { /* ignore */ }
+  }
 
   // ── Public API for app.js integration ──
 
@@ -1768,7 +2846,15 @@
     validateShape: validateShape,
     applyCSS: applyCSS,
     isValidColor: isValidColor,
+    isValidHomeUrl: isValidHomeUrl,
     isOverridden: _isOverridden,
+    // #1496 — full reset (not just STORAGE_KEY). See _resetAll() above.
+    resetAll: _resetAll,
+    // Exposed for tests — see test-issue-1509-detect-preset.js.
+    detectActivePreset: _detectActivePreset,
+    // #1380 — exposed for unit tests; see test-issue-1380-*.
+    applyCbSim: _applyCbSim,
+    resetCbPreset: _resetCbPreset,
     THEME_CSS_MAP: THEME_CSS_MAP
   };
 })();

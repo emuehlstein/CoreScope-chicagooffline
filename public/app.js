@@ -113,7 +113,35 @@ async function api(path, { ttl = 0, bust = false } = {}) {
   // Deduplicate in-flight requests
   if (_inflight.has(path)) return _inflight.get(path);
   const promise = (async () => {
+    // Issue #1659: 503 with Retry-After indicates server-side warm-up
+    // (analytics recomputer first-pass, index build, etc.). Retry with
+    // exponential backoff capped at 30s, up to 6 attempts (~63s total),
+    // so the analytics cards never display the stale post-restart slice.
+    //
+    // PR #1688 r1 (adv #1 + munger #4): use a single `notified` flag
+    // per outer call + `try / finally` so the in-flight banner counter
+    // is decremented exactly once regardless of retry count or
+    // exception path (success, retry-exhausted throw, network throw).
+    // Previously, multi-attempt retries leaked the counter (incremented
+    // per attempt, decremented at most once) and exhausted-retries
+    // threw without decrementing at all — banner stuck across three
+    // analytics endpoints, multiplied.
+    let attempt = 0;
+    let delay = 1000;
+    const maxAttempts = 6;
+    let notified = false;
+    try {
+      while (true) {
     const res = await fetch('/api' + path);
+        if (res.status === 503 && attempt < maxAttempts) {
+          const ra = parseInt(res.headers.get('Retry-After'), 10);
+          const wait = isFinite(ra) && ra > 0 ? ra * 1000 : delay;
+          if (!notified) { _warmupNotify_1659(true); notified = true; }
+          await new Promise(r => setTimeout(r, Math.min(wait, 30000)));
+          delay = Math.min(delay * 2, 30000);
+          attempt++;
+          continue;
+        }
     if (!res.ok) throw new Error(`API ${res.status}: ${path}`);
     const data = await res.json();
     const ms = performance.now() - t0;
@@ -124,10 +152,41 @@ async function api(path, { ttl = 0, bust = false } = {}) {
     if (ms > 500) console.warn(`[SLOW API] ${path} took ${Math.round(ms)}ms`);
     if (ttl > 0) _apiCache.set(path, { data, expires: Date.now() + ttl });
     return data;
+      }
+    } finally {
+      // Decrement exactly once iff we incremented. Runs on return,
+      // throw, or retry-exhausted throw — counter is balanced.
+      if (notified) _warmupNotify_1659(false);
+    }
   })();
   _inflight.set(path, promise);
   promise.finally(() => _inflight.delete(path));
   return promise;
+}
+
+// Issue #1659: minimal "Computing…" indicator while an analytics
+// endpoint is serving 503-warmup. We expose a small fixed banner; if a
+// page later wants to wire its own indicator it can override
+// window.onWarmup_1659 to receive the boolean state.
+let _warmupBannerEl_1659 = null;
+let _warmupInflight_1659 = 0;
+function _warmupNotify_1659(active) {
+  if (active) _warmupInflight_1659++;
+  else _warmupInflight_1659 = Math.max(0, _warmupInflight_1659 - 1);
+  const visible = _warmupInflight_1659 > 0;
+  if (typeof window !== 'undefined' && typeof window.onWarmup_1659 === 'function') {
+    try { window.onWarmup_1659(visible); } catch (_) { /* ignore */ }
+  }
+  if (typeof document === 'undefined') return;
+  if (!_warmupBannerEl_1659) {
+    const el = document.createElement('div');
+    el.id = 'cs-warmup-banner-1659';
+    el.style.cssText = 'position:fixed;top:8px;right:8px;z-index:9999;padding:6px 10px;background:var(--bg-elev,#222);color:var(--fg,#eee);border:1px solid var(--border,#444);border-radius:4px;font-size:12px;font-family:sans-serif;display:none;';
+    el.textContent = 'Computing analytics…';
+    if (document.body) document.body.appendChild(el);
+    _warmupBannerEl_1659 = el;
+  }
+  _warmupBannerEl_1659.style.display = visible ? 'block' : 'none';
 }
 
 // Fetch the COMPLETE /api/nodes set, transparently paging around the server's
@@ -223,6 +282,54 @@ function timeAgo(iso) {
 function getHashParams() {
   return new URLSearchParams(location.hash.split('?')[1] || '');
 }
+
+// parseViewportHash — issue #1709. Parses lat/lon/zoom viewport params from a
+// hash query string and returns {lat, lon, zoom} if BOTH lat and lon are valid
+// (and zoom, if present, is numeric), otherwise null. Partial lat-only or
+// lon-only inputs are intentionally rejected (the issue explicitly forbids
+// partial application of a center). When zoom is missing, defaults to 12. When
+// zoom is out of the [minZoom, maxZoom] range it is clamped to that range.
+//
+// `hashOrSearch` may be either a full `location.hash` (e.g. `#/live?lat=...`)
+// or a bare query string (e.g. `lat=...&lon=...`). Either is accepted.
+//
+// Bounds: lat ∈ [-90, 90], lon ∈ [-180, 180]; zoom defaults clamp to [1, 20]
+// when bounds not supplied (sensible Leaflet fallback when tile-provider
+// minZoom/maxZoom is unknown).
+function parseViewportHash(hashOrSearch, opts) {
+  if (hashOrSearch == null) return null;
+  var s = String(hashOrSearch);
+  if (s === '') return null;
+  // Strip leading '#...?' if present so callers can pass raw location.hash.
+  var qIdx = s.indexOf('?');
+  if (qIdx >= 0) s = s.slice(qIdx + 1);
+  // Also tolerate a leading '?' on a bare search string.
+  if (s.charAt(0) === '?') s = s.slice(1);
+  var params;
+  try { params = new URLSearchParams(s); } catch (_) { return null; }
+  var latStr = params.get('lat');
+  var lonStr = params.get('lon');
+  if (latStr == null || lonStr == null || latStr === '' || lonStr === '') return null;
+  var lat = parseFloat(latStr);
+  var lon = parseFloat(lonStr);
+  if (!isFinite(lat) || !isFinite(lon)) return null;
+  if (lat < -90 || lat > 90) return null;
+  if (lon < -180 || lon > 180) return null;
+  var minZ = (opts && typeof opts.minZoom === 'number') ? opts.minZoom : 1;
+  var maxZ = (opts && typeof opts.maxZoom === 'number') ? opts.maxZoom : 20;
+  var zoomStr = params.get('zoom');
+  var zoom;
+  if (zoomStr == null || zoomStr === '') {
+    zoom = (opts && typeof opts.defaultZoom === 'number') ? opts.defaultZoom : 12;
+  } else {
+    zoom = parseFloat(zoomStr);
+    if (!isFinite(zoom)) return null;
+  }
+  if (zoom < minZ) zoom = minZ;
+  if (zoom > maxZ) zoom = maxZ;
+  return { lat: lat, lon: lon, zoom: zoom };
+}
+if (typeof window !== 'undefined') { window.parseViewportHash = parseViewportHash; }
 
 // shouldEmbedRoute — issue #1369. Returns true when the SPA should render in
 // "embed" mode (chrome suppressed: no top-nav, no bottom-nav, no side drawer,
@@ -1529,7 +1636,15 @@ window.addEventListener('DOMContentLoaded', () => {
           + '</a>';
       }
     }));
-    favDropdown.innerHTML = items.join('');
+    // Footer action, separated from the favorites list by a top border. It is
+    // deliberately not a favorite row (no star), so it carries no data-key the
+    // star handler would act on.
+    favDropdown.innerHTML = items.join('')
+      + '<a href="#/analytics?tab=my-repeaters" class="fav-dd-item" style="border-top:1px solid var(--border)">'
+      + '<span class="fav-dd-status"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-line"/></svg></span>'
+      + '<span class="fav-dd-name">Monitor my repeaters</span>'
+      + '<span class="fav-dd-meta"></span>'
+      + '</a>';
     bindFavStars(favDropdown, () => renderFavDropdown());
     // Close dropdown on link click
     favDropdown.querySelectorAll('.fav-dd-item').forEach(a => {

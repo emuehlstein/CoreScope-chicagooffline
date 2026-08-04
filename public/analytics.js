@@ -120,6 +120,7 @@
             <button class="tab-btn" data-tab="collisions">Hash Issues</button>
             <button class="tab-btn" data-tab="subpaths">Route Patterns</button>
             <button class="tab-btn" data-tab="nodes">Nodes</button>
+            <button class="tab-btn" data-tab="my-repeaters">My Repeaters</button>
             <button class="tab-btn" data-tab="distance">Distance</button>
             <button class="tab-btn" data-tab="neighbor-graph">Neighbor Graph</button>
             <button class="tab-btn" data-tab="rf-health">RF Health</button>
@@ -138,7 +139,7 @@
       </div>`;
 
     // Tabs where the area filter is meaningful (transmitter GPS attribution)
-    const AREA_FILTER_TABS = new Set(['overview', 'rf', 'topology', 'hashsizes', 'collisions', 'nodes', 'clock-health']);
+    const AREA_FILTER_TABS = new Set(['overview', 'rf', 'topology', 'hashsizes', 'collisions', 'nodes', 'my-repeaters', 'clock-health']);
 
     function setAreaFilterVisibility(tab) {
       const el = document.getElementById('analyticsAreaFilter');
@@ -284,6 +285,7 @@
       case 'collisions': await renderCollisionTab(el, d.hashData, d.collisionData); break;
       case 'subpaths': await renderSubpaths(el); break;
       case 'nodes': await renderNodesTab(el); break;
+      case 'my-repeaters': await renderMyRepeatersTab(el); break;
       case 'distance': await renderDistanceTab(el); break;
       case 'neighbor-graph': await renderNeighborGraphTab(el); break;
       case 'rf-health': await renderRFHealthTab(el); break;
@@ -406,7 +408,7 @@
       <div class="analytics-row">
         <div class="analytics-card flex-1">
           <h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Relay Airtime Share</h3>
-          <p class="text-muted" style="margin-top:-4px;font-size:12px">Score = payload bytes × distinct repeaters that forwarded the packet. Counts relay re-transmissions; originator TX excluded. Not comparable across meshes.</p>
+          <p class="text-muted" style="margin-top:-4px;font-size:12px">Score = LoRa Time-on-Air × distinct repeaters that forwarded the packet (issue #1768). Counts relay re-transmissions; originator TX excluded. Not comparable across meshes — see preset caption below.</p>
           ${renderRelayAirtimeDumbbell(d.airtimeData)}
         </div>
       </div>
@@ -474,9 +476,33 @@
     if (totalScore <= 0) {
       return '<div class="text-muted" style="padding:20px">No relay activity observed in this window (all packets direct).</div>';
     }
+    // Issue #1768 — surface the LoRa preset baked into the ToA score. Share
+    // numbers are only meaningful relative to one PHY preset; operators must
+    // know what was assumed. All fields are run through esc() defensively
+    // (preset.sf/cr/preamble/bw_khz/freq_hz arrive from the server JSON,
+    // which the operator can configure — never inject untrusted text raw).
+    // BW formatted consistent with home.js / customize-v2.js presets
+    // (e.g. `62.5 kHz`, `125 kHz`) — strip trailing `.0` for integer kHz.
+    var preset = data && data.preset;
+    var presetCaption = '';
+    if (preset && typeof preset === 'object') {
+      var freqMHz = Number(preset.freq_hz || 0) / 1e6;
+      var bwKhz = Number(preset.bw_khz || 0);
+      var bwStr = bwKhz ? bwKhz.toFixed(1).replace(/\.0$/, '') : '0';
+      presetCaption =
+        '<div class="dumbbell-preset text-muted" style="font-size:11px;padding:0 4px 6px 4px">' +
+        'Assumed LoRa preset: ' +
+        (freqMHz ? esc(freqMHz.toFixed(3)) + ' MHz / ' : '') +
+        'BW ' + esc(bwStr) + ' kHz / ' +
+        'SF ' + esc(String(Number(preset.sf || 0))) + ' / ' +
+        'CR 4/' + esc(String(Number(preset.cr || 0))) +
+        ' (preamble ' + esc(String(Number(preset.preamble || 0))) + ' sym)' +
+        '</div>';
+    }
     // Layout: per row → label | track 0..100% | values
     var palette = ['#ef4444','#f59e0b','#22c55e','#3b82f6','#8b5cf6','#ec4899','#14b8a6','#64748b','#f97316','#06b6d4','#84cc16'];
     var html = '<div class="dumbbell-chart" style="display:flex;flex-direction:column;gap:8px;padding:8px 4px">';
+    if (presetCaption) html += presetCaption;
     rows.forEach(function (r, i) {
       var name = r.payload_type || 'UNK';
       var cnt = Number(r.count || 0);
@@ -487,11 +513,18 @@
       var loPct = Math.min(cpct, apct);
       var hiPct = Math.max(cpct, apct);
       // Tooltip per row — payload_type, count %, count N, airtime %, raw score, caveat.
+      // Score is summed (ToA in ns) × distinct repeaters across packets of
+      // this type; converted to ms for human-readable display per #1768
+      // round-1 review.
+      var scoreMs = score / 1e6;
+      var scoreStr = scoreMs >= 1000
+        ? (scoreMs / 1000).toFixed(2) + ' s'
+        : scoreMs.toFixed(2) + ' ms';
       var tip =
         name + '\n' +
         'Count: ' + cnt.toLocaleString() + ' (' + cpct.toFixed(2) + '%)\n' +
-        'Airtime: ' + apct.toFixed(2) + '% (score ' + score.toLocaleString() + ')\n' +
-        'Score = bytes × distinct repeaters. Within-mesh only.';
+        'Airtime: ' + apct.toFixed(2) + '% (score ' + scoreStr + ' · airtime × repeaters)\n' +
+        'Score = LoRa Time-on-Air × distinct repeaters. Within-mesh only.';
       html += '<div class="dumbbell-row" title="' + esc(tip) + '" style="display:grid;grid-template-columns:80px 1fr 180px;align-items:center;gap:10px;font-size:12px">' +
         '<div class="dumbbell-label" style="font-weight:600;color:var(--text)">' + esc(name) + '</div>' +
         '<div class="dumbbell-track" style="position:relative;height:18px;background:var(--bg-elev,rgba(127,127,127,0.12));border-radius:9px">' +
@@ -502,7 +535,7 @@
         '<div class="dumbbell-values" style="text-align:right;color:var(--text-muted);font-variant-numeric:tabular-nums">' +
           '<span style="color:var(--text-muted)">cnt ' + cpct.toFixed(1) + '%</span>' +
           ' &nbsp;·&nbsp; ' +
-          '<span style="color:' + color + ';font-weight:600">air ' + apct.toFixed(1) + '%</span>' +
+          '<span style="display:inline-flex;align-items:center;gap:4px;color:var(--text);font-weight:600"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + color + '" aria-hidden="true"></span>air ' + apct.toFixed(1) + '%</span>' +
         '</div>' +
       '</div>';
     });
@@ -1364,7 +1397,7 @@
               var roleColor = (window.ROLE_COLORS || {})[r.role] || '#6b7280';
               return '<tr class="clickable-row" data-action="navigate" data-value="#/nodes/' + encodeURIComponent(r.pubkey) + '" tabindex="0" role="row">' +
                 '<td><strong>' + esc(r.name) + '</strong></td>' +
-                '<td><span class="badge" style="background:' + roleColor + '20;color:' + roleColor + '">' + esc(r.role || 'unknown') + '</span></td>' +
+                '<td><span class="badge" style="' + (window.aaBadgeStyle ? window.aaBadgeStyle(roleColor) : 'background:' + roleColor + ';color:#fff') + '">' + esc(r.role || 'unknown') + '</span></td>' +
                 '<td><span style="color:' + (statusColor[r.status] || statusColor.unknown) + '">' +
                   (statusIcon[r.status] || '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-question"/></svg>') + ' ' + (statusLabel[r.status] || 'Unknown') + '</span></td>' +
                 '<td><span class="badge badge-hash-' + r.hashSize + '">' + r.hashSize + '-byte</span></td>' +
@@ -1458,19 +1491,19 @@
   async function renderCollisionTab(el, data, collisionData) {
     el.innerHTML = `
       <nav id="hashIssuesToc" style="display:flex;gap:12px;margin-bottom:12px;font-size:13px;flex-wrap:wrap">
-        <a href="#/analytics?tab=collisions&section=inconsistentHashSection" style="color:var(--accent)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Inconsistent Sizes</a>
+        <a href="#/analytics?tab=collisions&section=inconsistentHashSection" style="color:var(--link-color)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Inconsistent Sizes</a>
         <span style="color:var(--border)">|</span>
-        <a href="#/analytics?tab=collisions&section=hashMatrixSection" style="color:var(--accent)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-list-numbers"/></svg> Hash Matrix</a>
+        <a href="#/analytics?tab=collisions&section=hashMatrixSection" style="color:var(--link-color)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-list-numbers"/></svg> Hash Matrix</a>
         <span style="color:var(--border)">|</span>
-        <a href="#/analytics?tab=collisions&section=collisionRiskSection" style="color:var(--accent)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-bomb"/></svg> Collision Risk</a>
+        <a href="#/analytics?tab=collisions&section=collisionRiskSection" style="color:var(--link-color)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-bomb"/></svg> Collision Risk</a>
         <span style="color:var(--border)">|</span>
-        <a href="#/analytics?tab=prefix-tool" style="color:var(--accent)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Check a prefix →</a>
+        <a href="#/analytics?tab=prefix-tool" style="color:var(--link-color)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Check a prefix →</a>
       </nav>
-      <p class="text-muted" style="margin:0 0 12px;font-size:0.78em">Collisions <strong>actually observed in packet traffic</strong> — among <strong>repeaters</strong> grouped by their configured hash size. For <em>theoretical</em> address conflicts that <em>would</em> occur if all repeaters used a given hash size, see the <a href="#/analytics?tab=prefix-tool" style="color:var(--accent)">Prefix Tool</a> tab.</p>
+      <p class="text-muted" style="margin:0 0 12px;font-size:0.78em">Collisions <strong>actually observed in packet traffic</strong> — among <strong>repeaters</strong> grouped by their configured hash size. For <em>theoretical</em> address conflicts that <em>would</em> occur if all repeaters used a given hash size, see the <a href="#/analytics?tab=prefix-tool" style="color:var(--link-color)">Prefix Tool</a> tab.</p>
 
       <div class="analytics-card" id="inconsistentHashSection">
         <div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Inconsistent Hash Sizes</h3><a href="#/analytics?tab=collisions" style="font-size:11px;color:var(--text-muted)">↑ top</a></div>
-        <p class="text-muted" style="margin:4px 0 8px;font-size:0.8em">Repeaters and room servers sending adverts with varying hash sizes in the last 7 days. Originally caused by a <a href="https://github.com/meshcore-dev/MeshCore/commit/fcfdc5f" target="_blank" style="color:var(--accent)">firmware bug</a> where automatic adverts ignored the configured multibyte path setting, fixed in <a href="https://github.com/meshcore-dev/MeshCore/releases/tag/repeater-v1.14.1" target="_blank" style="color:var(--accent)">repeater v1.14.1</a>. Companion nodes are excluded.</p>
+        <p class="text-muted" style="margin:4px 0 8px;font-size:0.8em">Repeaters and room servers sending adverts with varying hash sizes in the last 7 days. Originally caused by a <a href="https://github.com/meshcore-dev/MeshCore/commit/fcfdc5f" target="_blank" style="color:var(--link-color)">firmware bug</a> where automatic adverts ignored the configured multibyte path setting, fixed in <a href="https://github.com/meshcore-dev/MeshCore/releases/tag/repeater-v1.14.1" target="_blank" style="color:var(--link-color)">repeater v1.14.1</a>. Companion nodes are excluded.</p>
         <div id="inconsistentHashList"><div class="text-muted" style="padding:8px"><span class="spinner"></span> Loading…</div></div>
       </div>
 
@@ -1515,8 +1548,8 @@
             }).join(' ');
             const stripe = i % 2 === 1 ? 'background:var(--row-stripe)' : '';
             return `<tr style="${stripe}">
-              <td><a href="#/nodes/${encodeURIComponent(n.public_key)}?section=node-packets" style="font-weight:600;color:var(--accent)">${esc(n.name || n.public_key.slice(0, 12))}</a></td>
-              <td><span class="badge" style="background:${roleColor}20;color:${roleColor}">${n.role}</span></td>
+              <td><a href="#/nodes/${encodeURIComponent(n.public_key)}?section=node-packets" style="font-weight:600;color:var(--link-color)">${esc(n.name || n.public_key.slice(0, 12))}</a></td>
+              <td><span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(roleColor)) || ('background:'+roleColor+';color:#fff')}">${n.role}</span></td>
               <td><code style="font-family:var(--mono);font-weight:700">${prefix}</code> <span class="text-muted">(${n.hash_size || '?'}B)</span></td>
               <td>${sizeBadges}</td>
             </tr>`;
@@ -1718,7 +1751,13 @@
     if (!isConfirmedCollision && !isPossibleConflict) return { cls: 'hash-cell-taken', bg: '' };
     if (isPossibleConflict) return { cls: 'hash-cell-possible', bg: '' };
     const t = Math.min((count - 2) / 4, 1);
-    return { cls: 'hash-cell-collision', bg: `background:rgb(${Math.round(220+35*t)},${Math.round(120*(1-t))},30);` };
+    // #1668-M4 r1: gradient endpoints darkened from orange-500→red-500 (3.11:1/3.96:1 vs #fff)
+    // to orange-800→red-800 (7.31:1→8.31:1 vs #fff) — passes WCAG AA across the whole range.
+    // Encoding stays distinguishable from green-700 (taken) and yellow-800 (possible).
+    const cr = Math.round(154 + (-1) * t);   // 154 → 153
+    const cg = Math.round(52  + (-25) * t);  // 52  → 27
+    const cb = Math.round(18  + 9 * t);      // 18  → 27
+    return { cls: 'hash-cell-collision', bg: `background:rgb(${cr},${cg},${cb});` };
   }
 
   // hashCellTd — emits a hash-matrix <td>. Tooltip data rides as separate
@@ -1737,7 +1776,7 @@
     const linesAttr = (spec.lines && spec.lines.length)
       ? ' data-tip-lines="' + esc(spec.lines.join('\u001f')) + '"'
       : '';
-    return `<td class="hash-cell ${cls}${count ? ' hash-active' : ''}" data-hex="${hex}"${hexAttr}${statusAttr}${linesAttr} style="width:${cellSize}px;height:${cellSize}px;text-align:center;${bg}border:1px solid var(--border);cursor:${count ? 'pointer' : 'default'};font-size:11px;font-weight:${fontWeight}">${hex}</td>`;
+    return `<td class="hash-cell ${cls}${count ? ' hash-active' : ''}" data-hex="${hex}"${hexAttr}${statusAttr}${linesAttr} style="width:${cellSize}px;height:${cellSize}px;text-align:center;${bg}border:1px solid var(--border);cursor:${count ? 'pointer' : 'default'};font-size:12px;font-weight:${fontWeight}">${hex}</td>`;
   }
 
   // hashTooltipSpec — returns a plain-data tooltip descriptor consumed by
@@ -1786,7 +1825,7 @@
     if (bytes === 3) {
       el.innerHTML = hashStatCardsHtml(totalNodes, stats.using_this_size || 0, '3-byte', 16777216, stats.unique_prefixes || 0, stats.collision_count || 0) +
         `<p class="text-muted" style="margin:0;font-size:0.8em">The 3-byte prefix space (16.7M values) is too large to visualize as a grid.${(stats.collision_count || 0) > 0 ? ' See collision details below.' : ''}</p>` +
-        `<p class="text-muted" style="margin:8px 0 0;font-size:0.8em">ℹ️ This tab only counts collisions among repeaters configured for this hash size. The <a href="#/analytics?tab=prefix-tool" style="color:var(--accent)">Prefix Tool</a> checks all repeaters regardless of configured hash size.</p>`;
+        `<p class="text-muted" style="margin:8px 0 0;font-size:0.8em">ℹ️ This tab only counts collisions among repeaters configured for this hash size. The <a href="#/analytics?tab=prefix-tool" style="color:var(--link-color)">Prefix Tool</a> checks all repeaters regardless of configured hash size.</p>`;
       return;
     }
 
@@ -1819,7 +1858,7 @@
           {cls: 'hash-cell-empty', style: 'border:1px solid var(--border)', text: 'Available'},
           {cls: 'hash-cell-taken', text: 'One node'},
           {cls: 'hash-cell-possible', text: 'Possible conflict'},
-          {cls: 'hash-cell-collision', style: 'background:rgb(220,80,30)', text: 'Collision'}
+          {cls: 'hash-cell-collision', style: 'background:rgb(154,40,22)', text: 'Collision'}
         ],
         (td) => {
           const hex = td.dataset.hex.toUpperCase();
@@ -1866,7 +1905,7 @@
           {cls: 'hash-cell-empty', style: 'border:1px solid var(--border)', text: 'No nodes in group'},
           {cls: 'hash-cell-taken', text: 'Nodes present, no collision'},
           {cls: 'hash-cell-possible', text: 'Possible conflict'},
-          {cls: 'hash-cell-collision', style: 'background:rgb(220,80,30)', text: 'Collision'}
+          {cls: 'hash-cell-collision', style: 'background:rgb(154,40,22)', text: 'Collision'}
         ],
         (td) => {
           const hex = td.dataset.hex.toUpperCase();
@@ -1886,7 +1925,7 @@
             for (const [twoHex, nodes] of Object.entries(info.two_byte_map || {}).sort()) {
               const isCollision = nodes.length > 1;
               dhtml += `<div style="margin-bottom:6px;padding:4px 6px;border-radius:4px;background:${isCollision ? 'rgba(220,50,30,0.1)' : 'transparent'};border:1px solid ${isCollision ? 'rgba(220,50,30,0.3)' : 'transparent'}">`;
-              dhtml += `<code class="mono" style="font-size:0.9em;font-weight:${isCollision?'700':'400'}">${twoHex}</code>${isCollision ? ' <span style="color:#dc2626;font-size:0.75em;font-weight:700">COLLISION</span>' : ''} `;
+              dhtml += `<code class="mono" style="font-size:0.9em;font-weight:${isCollision?'700':'400'}">${twoHex}</code>${isCollision ? ' <span style="color:var(--danger);font-size:0.75em;font-weight:700">COLLISION</span>' : ''} `;
               dhtml += nodes.map(m => `<a href="#/nodes/${encodeURIComponent(m.public_key)}" class="analytics-link" style="font-size:0.85em">${esc(m.name || m.public_key.slice(0,12))}</a>`).join(', ');
               dhtml += `</div>`;
             }
@@ -1973,13 +2012,27 @@
 
       function renderTable(data, title) {
         if (!data.subpaths.length) return `<h4>${title}</h4><div class="text-muted">No data</div>`;
-        const maxCount = data.subpaths[0]?.count || 1;
+        // #1633 — when "Hide 1-byte path hops" is ON, filter route patterns
+        // whose underlying rawHops contain any 1-byte hex token. We filter
+        // INPUT (not just CSS-hide) so the displayed % and ordering reflect
+        // the surviving population.
+        const _hide1 = !!(typeof window !== 'undefined' && window.MC_getHide1ByteHops && window.MC_getHide1ByteHops());
+        const _hop1 = function (h) { return String(h || '').length === 2; };
+        const subpaths = _hide1
+          ? data.subpaths.filter(function (s) {
+              var rh = s.rawHops || [];
+              for (var k = 0; k < rh.length; k++) if (_hop1(rh[k])) return false;
+              return true;
+            })
+          : data.subpaths;
+        if (!subpaths.length) return `<h4>${title}</h4><div class="text-muted">No data (all matching routes contained 1-byte hops — toggle off in customizer to see)</div>`;
+        const maxCount = subpaths[0]?.count || 1;
         return `<h4>${title}</h4>
-          <p class="text-muted" style="margin:4px 0 8px">From ${data.totalPaths.toLocaleString()} paths with 2+ hops</p>
+          <p class="text-muted" style="margin:4px 0 8px">From ${data.totalPaths.toLocaleString()} paths with 2+ hops${_hide1 ? ` · showing ${subpaths.length} of ${data.subpaths.length} (1-byte filtered)` : ''}</p>
           <table class="analytics-table"><thead><tr>
             <th scope="col">#</th><th scope="col">Route</th><th scope="col">Occurrences</th><th scope="col">% of paths</th><th scope="col">Frequency</th>
           </tr></thead><tbody>
-          ${data.subpaths.map((s, i) => {
+          ${subpaths.map((s, i) => {
             const barW = Math.max(2, Math.round(s.count / maxCount * 100));
             const hops = s.path.split(' → ');
             const rawHops = s.rawHops || [];
@@ -2091,7 +2144,7 @@
                   ? window.HopResolver.haversineKm(a.lat, a.lon, b.lat, b.lon)
                   : (() => { const R=6371, dLat=(b.lat-a.lat)*Math.PI/180, dLon=(b.lon-a.lon)*Math.PI/180, h=Math.sin(dLat/2)**2+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLon/2)**2; return R*2*Math.atan2(Math.sqrt(h),Math.sqrt(1-h)); })();
                 total += km;
-                const cls = km > 200 ? 'color:var(--status-red);font-weight:bold' : km > 50 ? 'color:var(--status-yellow)' : 'color:var(--status-green)';
+                const cls = km > 200 ? 'color:var(--status-red);font-weight:bold' : km > 50 ? 'color:var(--status-yellow)' : 'color:var(--status-green-text)';
                 dists.push(`<div style="padding:2px 0"><span style="${cls}">${formatDistance(km)}</span> <span class="text-muted">${esc(a.name)} → ${esc(b.name)}</span></div>`);
               } else {
                 dists.push(`<div style="padding:2px 0"><span class="text-muted">? ${esc(a.name)} → ${esc(b.name)} (no coords)</span></div>`);
@@ -2208,7 +2261,7 @@
         return `<a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="analytics-link">${esc(n.name || n.public_key.slice(0, 12))}</a>`;
       }
       function claimedBadge(n) {
-        return myKeys.has(n.public_key) ? ' <span style="color:var(--accent);font-size:10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg> MINE</span>' : '';
+        return myKeys.has(n.public_key) ? ' <span style="color:var(--link-color);font-size:10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg> MINE</span>' : '';
       }
 
       // ROLE_COLORS from shared roles.js
@@ -2218,8 +2271,8 @@
           <h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Network Status</h3>
           <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px">
             <div class="analytics-stat-card" style="flex:1;min-width:120px;text-align:center;padding:16px;background:var(--card-bg);border:1px solid var(--border);border-radius:8px">
-              <div style="font-size:28px;font-weight:700;color:var(--status-green)">${active}</div>
-              <div style="font-size:11px;text-transform:uppercase;color:var(--text-muted)"><span style="color:var(--status-green)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> Active</div>
+              <div style="font-size:28px;font-weight:700;color:var(--status-green-text)">${active}</div>
+              <div style="font-size:11px;text-transform:uppercase;color:var(--text-muted)"><span style="color:var(--status-green-text)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> Active</div>
             </div>
             <div class="analytics-stat-card" style="flex:1;min-width:120px;text-align:center;padding:16px;background:var(--card-bg);border:1px solid var(--border);border-radius:8px">
               <div style="font-size:28px;font-weight:700;color:var(--status-yellow)">${degraded}</div>
@@ -2239,7 +2292,7 @@
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:24px">
             ${Object.entries(roleCounts).sort((a,b) => b[1]-a[1]).map(([role, count]) => {
               const c = ROLE_COLORS[role] || '#6b7280';
-              return `<span class="badge" style="background:${c}20;color:${c};padding:6px 12px;font-size:13px">${role}: ${count}</span>`;
+              return `<span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(c)) || ('background:'+c+';color:#fff')};padding:6px 12px;font-size:13px">${role}: ${count}</span>`;
             }).join('')}
           </div>
 
@@ -2251,7 +2304,7 @@
                 const s = n.health.stats;
                 return `<tr>
                   <td>${nodeLink(n)}</td>
-                  <td><span class="badge" style="background:${(ROLE_COLORS[n.role]||'#6b7280')}20;color:${ROLE_COLORS[n.role]||'#6b7280'}">${n.role}</span></td>
+                  <td><span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(ROLE_COLORS[n.role]||'#6b7280')) || ('background:'+(ROLE_COLORS[n.role]||'#6b7280')+';color:#fff')}">${n.role}</span></td>
                   <td>${s.totalTransmissions || s.totalPackets || 0}</td>
                   <td>${s.avgSnr != null ? s.avgSnr.toFixed(1) + ' dB' : '—'}</td>
                   <td>${n.health.observers?.length || 0}</td>
@@ -2268,7 +2321,7 @@
               ${byPackets.slice(0, 15).map((n, i) => `<tr>
                 <td>${i + 1}</td>
                 <td>${nodeLink(n)}${claimedBadge(n)}</td>
-                <td><span class="badge" style="background:${(ROLE_COLORS[n.role]||'#6b7280')}20;color:${ROLE_COLORS[n.role]||'#6b7280'}">${n.role}</span></td>
+                <td><span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(ROLE_COLORS[n.role]||'#6b7280')) || ('background:'+(ROLE_COLORS[n.role]||'#6b7280')+';color:#fff')}">${n.role}</span></td>
                 <td>${n.health.stats.totalTransmissions || n.health.stats.totalPackets || 0}</td>
                 <td>${n.health.stats.packetsToday || 0}</td>
                 <td><a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="analytics-link" aria-label="Per-node analytics"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg></a></td>
@@ -2283,7 +2336,7 @@
               ${bySnr.slice(0, 15).map((n, i) => `<tr>
                 <td>${i + 1}</td>
                 <td>${nodeLink(n)}${claimedBadge(n)}</td>
-                <td><span class="badge" style="background:${(ROLE_COLORS[n.role]||'#6b7280')}20;color:${ROLE_COLORS[n.role]||'#6b7280'}">${n.role}</span></td>
+                <td><span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(ROLE_COLORS[n.role]||'#6b7280')) || ('background:'+(ROLE_COLORS[n.role]||'#6b7280')+';color:#fff')}">${n.role}</span></td>
                 <td>${n.health.stats.avgSnr.toFixed(1)} dB</td>
                 <td>${n.health.observers?.length || 0}</td>
                 <td><a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="analytics-link" aria-label="Per-node analytics"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg></a></td>
@@ -2298,7 +2351,7 @@
               ${byObservers.slice(0, 15).map((n, i) => `<tr>
                 <td>${i + 1}</td>
                 <td>${nodeLink(n)}${claimedBadge(n)}</td>
-                <td><span class="badge" style="background:${(ROLE_COLORS[n.role]||'#6b7280')}20;color:${ROLE_COLORS[n.role]||'#6b7280'}">${n.role}</span></td>
+                <td><span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(ROLE_COLORS[n.role]||'#6b7280')) || ('background:'+(ROLE_COLORS[n.role]||'#6b7280')+';color:#fff')}">${n.role}</span></td>
                 <td>${n.health.observers?.length || 0}</td>
                 <td>${n.health.stats.avgSnr != null ? n.health.stats.avgSnr.toFixed(1) + ' dB' : '—'}</td>
                 <td><a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="analytics-link" aria-label="Per-node analytics"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg></a></td>
@@ -2312,7 +2365,7 @@
             <tbody>
               ${byRecent.slice(0, 15).map(n => `<tr>
                 <td>${nodeLink(n)}${claimedBadge(n)}</td>
-                <td><span class="badge" style="background:${(ROLE_COLORS[n.role]||'#6b7280')}20;color:${ROLE_COLORS[n.role]||'#6b7280'}">${n.role}</span></td>
+                <td><span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(ROLE_COLORS[n.role]||'#6b7280')) || ('background:'+(ROLE_COLORS[n.role]||'#6b7280')+';color:#fff')}">${n.role}</span></td>
                 <td>${timeAgo(n.health.stats.lastHeard)}</td>
                 <td>${n.health.stats.packetsToday || 0}</td>
                 <td><a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="analytics-link" aria-label="Per-node analytics"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg></a></td>
@@ -2324,6 +2377,222 @@
       el.innerHTML = `<div style="padding:40px;text-align:center;color:#ff6b6b">Failed to load node analytics: ${esc(e.message)}</div>`;
     }
   }
+
+  // ===================== MY REPEATERS (favorites monitoring dashboard) =====================
+  // An at-a-glance monitor over the repeaters the operator has starred
+  // (meshcore-favorites). Pure frontend aggregation over existing endpoints:
+  //   /api/nodes                      relay activity + traffic/bridge scores
+  //   /api/nodes/clock-skew           per-node "is the clock OK" severity
+  //   /api/analytics/neighbor-graph   affinity edges, filtered to favorites
+  //                                   ("throughput between my repeaters")
+  function _mrSummaryCard(value, label, color) {
+    return `<div class="analytics-stat-card" style="flex:1;min-width:110px;text-align:center;padding:16px;background:var(--card-bg);border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:26px;font-weight:700${color ? ';color:' + color : ''}">${esc(String(value))}</div>
+      <div style="font-size:11px;text-transform:uppercase;color:var(--text-muted)">${esc(label)}</div>
+    </div>`;
+  }
+
+  // Status is carried by colour AND text — never colour alone — so it is
+  // legible to color-blind users and screen readers.
+  const MR_STATUS_META = {
+    active: { color: 'var(--status-green)', label: 'Active' },
+    degraded: { color: 'var(--status-yellow)', label: 'Degraded' },
+    silent: { color: 'var(--status-red)', label: 'Silent' },
+    unknown: { color: 'var(--text-muted)', label: 'Unknown' },
+  };
+  function _mrStatusCell(status) {
+    // Fall back to an explicit "Unknown" rather than silently mislabelling an
+    // unexpected status as "Silent".
+    const m = MR_STATUS_META[status] || MR_STATUS_META.unknown;
+    return `<span style="display:inline-flex;gap:5px;align-items:center;white-space:nowrap"><span style="color:${m.color}" aria-hidden="true"><svg class="ph-icon"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span><span style="font-size:11px">${m.label}</span></span>`;
+  }
+
+  function _mrEmptyState() {
+    return `
+      <div class="analytics-section" style="text-align:center;padding:48px 24px;color:var(--text-muted)">
+        <svg class="ph-icon" aria-hidden="true" style="width:40px;height:40px;opacity:0.6"><use href="/icons/phosphor-sprite.svg#ph-star"/></svg>
+        <h3 style="margin:12px 0 6px">No favorite repeaters yet</h3>
+        <p>Star a repeater (the <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star"/></svg> on the <a href="#/nodes" class="analytics-link">Nodes</a> page or a node's detail) to add it to your watch-list. Starred repeaters show up here for at-a-glance monitoring.</p>
+      </div>`;
+  }
+
+  async function renderMyRepeatersTab(el) {
+    const haveFavs = () => (typeof getFavorites === 'function' ? getFavorites() : []);
+    if (!haveFavs().length) { el.innerHTML = _mrEmptyState(); return; }
+    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading your repeaters…</div>';
+    try {
+      const rq = RegionFilter.regionQueryString() + AreaFilter.areaQueryString();
+      // When a region/area filter is active the node fetch is scoped, so a
+      // starred repeater outside that scope won't come back. Surface that count
+      // instead of silently dropping it from the watch-list (#1761 MAJOR).
+      const filterActive = rq.length > 0;
+      // Fetch the three sources ONCE; star toggles re-paint from this cache
+      // (paint() below) instead of re-hitting the network. Trade-off: this
+      // pages the full node list (up to ~10k) to keep only the starred few —
+      // fine for a handful of favorites and amortized by CLIENT_TTL.nodeList
+      // across tabs. If favorite counts ever grow large, switch to per-node
+      // Promise.all(favs.map(pk => api('/nodes/' + pk))).
+      const [nodesResp, clockData, graphData] = await Promise.all([
+        fetchAllNodes('&sortBy=lastSeen' + rq, { ttl: CLIENT_TTL.nodeList }),
+        api('/nodes/clock-skew', { ttl: CLIENT_TTL.analyticsRF }).catch(() => []),
+        api('/analytics/neighbor-graph?min_count=1&min_score=0', { ttl: CLIENT_TTL.analyticsRF }).catch(() => ({ nodes: [], edges: [] })),
+      ]);
+      const allNodes = nodesResp.nodes || nodesResp;
+      const clockByPk = {};
+      (Array.isArray(clockData) ? clockData : []).forEach(c => { if (c && c.pubkey) clockByPk[c.pubkey] = c; });
+
+      const now = Date.now();
+      function ageOf(n) {
+        const ms = n.last_heard ? new Date(n.last_heard).getTime() : n.last_seen ? new Date(n.last_seen).getTime() : 0;
+        return ms ? now - ms : Infinity;
+      }
+      function statusOf(n) {
+        const th = (typeof getHealthThresholds === 'function') ? getHealthThresholds(n.role) : { degradedMs: 3600000, silentMs: 86400000 };
+        const age = ageOf(n);
+        return age < th.degradedMs ? 'active' : age < th.silentMs ? 'degraded' : 'silent';
+      }
+      const pct = v => (v != null ? (v * 100).toFixed(1) + '%' : '—');
+      // #1456: prefer traffic_share_score, fall back to usefulness_score.
+      const trafficOf = n => (n.traffic_share_score != null ? n.traffic_share_score : (n.usefulness_score != null ? n.usefulness_score : null));
+      function roleBadge(role) {
+        // Route the unknown-role fallback through ROLE_COLORS.unknown (backed by
+        // --mc-role-unknown / the shared Wong palette) instead of a hard-coded
+        // literal, so every swatch color flows through the CSS-variable system
+        // (#1761 nit). ROLE_COLORS always resolves .unknown.
+        const rc = window.ROLE_COLORS || {};
+        const c = rc[role] || rc.unknown || 'var(--role-unknown, #6b7280)';
+        const style = (window.aaBadgeStyle && window.aaBadgeStyle(c)) || ('background:' + c + ';color:#fff');
+        return `<span class="badge" style="${style}">${esc(role)}</span>`;
+      }
+
+      // Re-renders from the cached fetch using the LIVE favorites set, so an
+      // un-star drops the row with no refetch. Re-binds its stars after each
+      // paint (the innerHTML reset clears listeners).
+      function paint() {
+        const favs = new Set(haveFavs());
+        if (!favs.size) { el.innerHTML = _mrEmptyState(); return; }
+        const myNodes = allNodes.filter(n => favs.has(n.public_key) && (n.role === 'repeater' || n.role === 'room'));
+        const myKeys = new Set(myNodes.map(n => n.public_key));
+
+        // Favorites the scoped fetch didn't return — with a region/area filter
+        // active these are (most likely) outside the current scope. Surface the
+        // count so a hidden favorite isn't silently missing (#1761 MAJOR).
+        const allByPk = new Set(allNodes.map(n => n.public_key));
+        // Favorites absent from the scoped fetch: usually outside the active
+        // region/area filter, but the set also covers deleted/expired stars
+        // and role-filtered clients — so the notice stays causally neutral
+        // ("not shown with the active filter") rather than claiming a cause.
+        const hiddenByFilter = [...favs].filter(pk => !allByPk.has(pk)).length;
+        const filterNotice = (filterActive && hiddenByFilter > 0)
+          ? `<p class="text-muted" style="display:flex;gap:6px;align-items:center"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-funnel"/></svg>${hiddenByFilter} favorite${hiddenByFilter === 1 ? '' : 's'} not shown with the active region/area filter.</p>`
+          : '';
+
+        let active = 0, degraded = 0, silent = 0, clockOk = 0, totalRelay24 = 0;
+        myNodes.forEach(n => {
+          const s = statusOf(n); if (s === 'active') active++; else if (s === 'degraded') degraded++; else silent++;
+          const cs = clockByPk[n.public_key];
+          if (cs && cs.severity === 'ok') clockOk++;
+          totalRelay24 += (n.relay_count_24h || 0);
+        });
+
+        const rank = { silent: 0, degraded: 1, active: 2 };
+        const sorted = myNodes.slice().sort((a, b) => {
+          const d = rank[statusOf(a)] - rank[statusOf(b)];
+          return d !== 0 ? d : (a.name || '').localeCompare(b.name || '');
+        });
+
+        const rowsHtml = sorted.map(n => {
+          const cs = clockByPk[n.public_key];
+          const clockCell = cs ? renderSkewBadge(cs.severity, currentSkewValue(cs), cs) : '<span class="text-muted">—</span>';
+          const battery = n.battery_mv != null ? (n.battery_mv / 1000).toFixed(2) + ' V' : '—';
+          return `<tr>
+            <td>${favStar(n.public_key)}</td>
+            <td><a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="analytics-link">${esc(n.name || n.public_key.slice(0, 12))}</a></td>
+            <td>${roleBadge(n.role)}</td>
+            <td>${_mrStatusCell(statusOf(n))}</td>
+            <td>${clockCell}</td>
+            <td style="text-align:right">${pct(trafficOf(n))}</td>
+            <td style="text-align:right">${pct(n.bridge_score)}</td>
+            <td style="text-align:right">${n.relay_count_1h != null ? n.relay_count_1h : '—'}</td>
+            <td style="text-align:right">${n.relay_count_24h != null ? n.relay_count_24h : '—'}</td>
+            <td>${n.last_relayed ? timeAgo(n.last_relayed) : '—'}</td>
+            <td>${(n.last_heard || n.last_seen) ? timeAgo(n.last_heard || n.last_seen) : '—'}</td>
+            <td style="text-align:right">${battery}</td>
+          </tr>`;
+        }).join('');
+
+        const nameByPk = {};
+        myNodes.forEach(n => { nameByPk[n.public_key] = n.name || n.public_key.slice(0, 12); });
+        const myEdges = ((graphData && graphData.edges) || [])
+          .filter(e => myKeys.has(e.source) && myKeys.has(e.target))
+          .sort((a, b) => (b.score || 0) - (a.score || 0));
+        let affinityHtml;
+        if (!myEdges.length) {
+          affinityHtml = `<p class="text-muted" style="padding:8px 0">No affinity links detected between your repeaters yet — they may be too far apart, or not enough shared traffic has been observed.</p>`;
+        } else {
+          affinityHtml = `<table class="analytics-table">
+            <thead><tr><th scope="col">Link</th><th scope="col" style="text-align:right">Affinity</th><th scope="col" style="text-align:right">Packets</th><th scope="col" style="text-align:right">Avg SNR</th></tr></thead>
+            <tbody>${myEdges.map(e => {
+              // The affinity graph is undirected — the server marks every edge
+              // bidirectional — so the link glyph is always a double arrow.
+              const arrow = '&harr;';
+              const snr = (e.avg_snr != null) ? e.avg_snr.toFixed(1) + ' dB' : '—';
+              return `<tr>
+                <td>${esc(nameByPk[e.source] || e.source.slice(0, 12))} ${arrow} ${esc(nameByPk[e.target] || e.target.slice(0, 12))}${e.ambiguous ? ' <svg class="ph-icon" role="img" aria-label="Path attribution ambiguous"><title>Path attribution ambiguous</title><use href="/icons/phosphor-sprite.svg#ph-question"/></svg>' : ''}</td>
+                <td style="text-align:right">${pct(e.score)}</td>
+                <td style="text-align:right">${e.weight != null ? e.weight : '—'}</td>
+                <td style="text-align:right">${snr}</td>
+              </tr>`;
+            }).join('')}</tbody>
+          </table>`;
+        }
+
+        el.innerHTML = `
+          <div class="analytics-section">
+            <h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg> My Repeaters</h3>
+            <p class="text-muted">At-a-glance monitoring over the repeaters you have starred. Un-star a row to drop it from this list.</p>
+            ${filterNotice}
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:16px;margin-bottom:20px">
+              ${_mrSummaryCard(myNodes.length, 'My Repeaters')}
+              ${_mrSummaryCard(active, 'Active')}
+              ${_mrSummaryCard(degraded, 'Degraded')}
+              ${_mrSummaryCard(silent, 'Silent')}
+              ${_mrSummaryCard(clockOk + ' / ' + myNodes.length, 'Clock OK')}
+              ${_mrSummaryCard(totalRelay24.toLocaleString(), 'Relays (24h)')}
+            </div>
+
+            <table class="analytics-table" id="my-repeaters-table">
+              <thead><tr>
+                <th scope="col" aria-label="Favorite"></th>
+                <th scope="col">Repeater</th>
+                <th scope="col">Role</th>
+                <th scope="col">Status</th>
+                <th scope="col">Clock</th>
+                <th scope="col" style="text-align:right">Traffic</th>
+                <th scope="col" style="text-align:right">Bridge</th>
+                <th scope="col" style="text-align:right" title="Relays in the last hour">Relays 1h</th>
+                <th scope="col" style="text-align:right" title="Relays in the last 24 hours">Relays 24h</th>
+                <th scope="col">Last Relayed</th>
+                <th scope="col">Last Heard</th>
+                <th scope="col" style="text-align:right">Battery</th>
+              </tr></thead>
+              <tbody>${rowsHtml || '<tr><td colspan="12" class="text-muted">None of your favorites are repeaters/rooms in this view.</td></tr>'}</tbody>
+            </table>
+
+            <h3 style="margin-top:28px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-graph"/></svg> Links Between My Repeaters</h3>
+            <p class="text-muted">Affinity sub-graph filtered to your favorites — how much traffic flows directly between them.</p>
+            ${affinityHtml}
+          </div>`;
+
+        // Live un-star: re-paint from cache (no refetch) when a star toggles.
+        if (typeof bindFavStars === 'function') bindFavStars(el, paint);
+      }
+      paint();
+    } catch (e) {
+      el.innerHTML = `<div style="padding:40px;text-align:center;color:var(--status-red)">Failed to load your repeaters: ${esc(e.message)}</div>`;
+    }
+  }
+  // === MY REPEATERS BLOCK END (test harness slices the renderer block to here) ===
 
   async function renderDistanceTab(el) {
     try {
@@ -2467,16 +2736,19 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       </div>`;
 
     // Role checkboxes
+    // #1715 — swatches use `.role-swatch--{role}` classes that read the
+    // per-theme `--role-*` CSS tokens (public/style.css). The previous
+    // inline `style="color:${ROLE_COLORS[r]}"` bypassed dark-theme
+    // overrides and failed WCAG AA on #1a1a2e. Do NOT reintroduce inline
+    // color hex here.
     const roles = ['repeater','companion','room','sensor'];
     const rcEl = document.getElementById('ngRoleChecks');
     roles.forEach(r => {
-      const color = (window.ROLE_COLORS || {})[r] || '#888';
-      rcEl.innerHTML += `<label style="font-size:12px;margin-right:8px"><input type="checkbox" data-role="${r}" checked> <span style="color:${esc(color)}">${esc(r)}</span></label>`;
+      rcEl.innerHTML += `<label style="font-size:12px;margin-right:8px"><input type="checkbox" data-role="${r}" checked> <span class="role-swatch role-swatch--${r}">${esc(r)}</span></label>`;
     });
     // Observer checkbox — unchecked by default (observers create hub-and-spoke noise)
     {
-      const color = (window.ROLE_COLORS || {}).observer || '#8b5cf6';
-      rcEl.innerHTML += `<label style="font-size:12px;margin-right:8px"><input type="checkbox" data-role="observer"> <span style="color:${esc(color)}">observer</span></label>`;
+      rcEl.innerHTML += `<label style="font-size:12px;margin-right:8px"><input type="checkbox" data-role="observer"> <span class="role-swatch role-swatch--observer">observer</span></label>`;
     }
 
     // Load data
@@ -2491,8 +2763,11 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     }
 
     _ngState = createGraphState(graphData);
-    renderNGStats(_ngState);
-    startGraphRenderer();
+    // Render through the filter path so the first paint already respects the
+    // default filters (observers unchecked, saved min-score) and the
+    // node-count guard is evaluated against the displayed set, not the full
+    // fetched graph.
+    applyNGFilters();
 
     // Filter listeners
     // Restore saved min score from localStorage
@@ -2503,10 +2778,14 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       applyNGFilters();
     }
 
+    var ngScoreDebounce;
     document.getElementById('ngMinScore').addEventListener('input', function() {
       document.getElementById('ngMinScoreVal').textContent = (this.value / 100).toFixed(2);
       localStorage.setItem('ng-min-score', this.value);
-      applyNGFilters();
+      // Debounce the O(N+E) refilter so dragging the slider doesn't rebuild the
+      // node set on every pixel (review of #1758).
+      clearTimeout(ngScoreDebounce);
+      ngScoreDebounce = setTimeout(applyNGFilters, 50);
     });
     document.getElementById('ngConfidence').addEventListener('change', applyNGFilters);
     rcEl.addEventListener('change', applyNGFilters);
@@ -2529,6 +2808,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       stats: data.stats || {},
       zoom: 1, panX: 0, panY: 0,
       dragging: null, panning: false,
+      hoverNode: null,
       lastMouseX: 0, lastMouseY: 0,
       cooling: 1.0, animId: null
     };
@@ -2565,8 +2845,15 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     _ngState.nodeIdx = {};
     _ngState.nodes.forEach((n, i) => { _ngState.nodeIdx[n.pubkey] = i; });
 
+    // A full re-anneal (cooling back to 1.0) on every filter change is
+    // deliberate: the displayed node set just changed, so the prior layout
+    // is stale and we want the simulation to settle the new graph. This is
+    // acceptable at the current 1000-node limit; revisit if the limit grows.
     _ngState.cooling = 1.0;
     renderNGStats(_ngState);
+    // Re-evaluate the node-count guard against the new filtered set and
+    // (re)start or stop the force-simulation loop accordingly.
+    startGraphRenderer();
   }
 
   function renderNGStats(st) {
@@ -2627,35 +2914,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     listEl.innerHTML = html;
   }
 
-  function startGraphRenderer() {
-    if (!_ngState) return;
-
-    // Node count guard: skip force simulation for very large graphs
-    var NODE_LIMIT = 1000;
-    if (_ngState.allNodes.length > NODE_LIMIT) {
-      var el = document.getElementById('ngCanvas');
-      if (el) {
-        el.style.display = 'none';
-        var msg = document.createElement('div');
-        msg.className = 'analytics-card';
-        msg.innerHTML = '<p class="text-muted">Graph has ' + _ngState.allNodes.length + ' nodes (limit: ' + NODE_LIMIT + '). Force simulation skipped for performance. Use filters to reduce the node count.</p>';
-        el.parentNode.insertBefore(msg, el);
-      }
-      return;
-    }
-
-    const canvas = document.getElementById('ngCanvas');
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = canvas.clientWidth * dpr;
-    canvas.height = canvas.clientHeight * dpr;
-    ctx.scale(dpr, dpr);
-    const W = canvas.clientWidth, H = canvas.clientHeight;
-
-    // Interaction
-    let hoverNode = null;
-
+  function bindNGCanvasInteraction(canvas) {
     function canvasToGraph(cx, cy) {
       return { x: (cx - _ngState.panX) / _ngState.zoom, y: (cy - _ngState.panY) / _ngState.zoom };
     }
@@ -2704,8 +2963,8 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
         _ngState.lastMouseY = e.clientY;
       } else {
         const n = findNode(cx, cy);
-        if (n !== hoverNode) {
-          hoverNode = n;
+        if (n !== _ngState.hoverNode) {
+          _ngState.hoverNode = n;
           canvas.style.cursor = n ? 'pointer' : 'grab';
           const tip = document.getElementById('ngTooltip');
           if (n && tip) {
@@ -2716,7 +2975,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
           } else if (tip) {
             tip.style.display = 'none';
           }
-        } else if (hoverNode) {
+        } else if (_ngState.hoverNode) {
           const tip = document.getElementById('ngTooltip');
           if (tip) { tip.style.left = (cx + 12) + 'px'; tip.style.top = (cy - 8) + 'px'; }
         }
@@ -2730,7 +2989,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       }
       _ngState.dragging = null;
       _ngState.panning = false;
-      canvas.style.cursor = hoverNode ? 'pointer' : 'grab';
+      canvas.style.cursor = _ngState.hoverNode ? 'pointer' : 'grab';
     });
 
     canvas.addEventListener('mouseleave', function() {
@@ -2739,7 +2998,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       _ngState._wasDragging = false;
       const tip = document.getElementById('ngTooltip');
       if (tip) tip.style.display = 'none';
-      hoverNode = null;
+      _ngState.hoverNode = null;
     });
 
     canvas.addEventListener('click', function(e) {
@@ -2774,6 +3033,71 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       _ngState.panY = cy - (cy - _ngState.panY) * (newZoom / _ngState.zoom);
       _ngState.zoom = newZoom;
     }, { passive: false });
+  }
+
+  function startGraphRenderer() {
+    if (!_ngState) return;
+
+    // Re-entrant: the filter path calls this to restart against the new node
+    // set, so cancel any loop already running before deciding what to do.
+    if (_ngState.animId) {
+      cancelAnimationFrame(_ngState.animId);
+      _ngState.animId = null;
+    }
+    // Re-entrancy epoch: a just-cancelled in-flight tick() (or one re-entered
+    // from a microtask) must not schedule a second loop. Each run bumps the
+    // epoch; tick() captures its own and early-returns once a newer run starts.
+    _ngState._runEpoch = (_ngState._runEpoch || 0) + 1;
+    var myEpoch = _ngState._runEpoch;
+
+    const canvas = document.getElementById('ngCanvas');
+    if (!canvas) return;
+    var skipMsg = document.getElementById('ngSkipMsg');
+
+    // Node count guard: skip the force simulation for graphs too large to
+    // render usefully. Keyed off the DISPLAYED (filtered) set — _ngState.nodes
+    // — NOT the full fetched graph (_ngState.allNodes), so narrowing the
+    // filters re-enables rendering. The "skipped" notice has a stable id so
+    // it can be toggled on the next call.
+    var NODE_LIMIT = 1000;
+    if (_ngState.nodes.length > NODE_LIMIT) {
+      canvas.style.display = 'none';
+      if (!skipMsg) {
+        skipMsg = document.createElement('div');
+        skipMsg.id = 'ngSkipMsg';
+        skipMsg.className = 'analytics-card';
+        canvas.parentNode.insertBefore(skipMsg, canvas);
+      }
+      // Build via textContent (never innerHTML) per the project's XSS rule —
+      // these are Numbers today, but a future coercion bug must not inject. Show
+      // filtered-of-total so the operator sees the rest were filtered out, not
+      // lost (review of #1758).
+      var ngTotal = (_ngState.allNodes || _ngState.nodes).length;
+      skipMsg.textContent = '';
+      var skipP = document.createElement('p');
+      skipP.className = 'text-muted';
+      skipP.textContent = _ngState.nodes.length + ' of ' + ngTotal + ' nodes match the current filters (limit: ' + NODE_LIMIT + '). Force simulation skipped for performance — tighten the filters to render.';
+      skipMsg.appendChild(skipP);
+      return;
+    }
+    if (skipMsg) skipMsg.remove();
+    canvas.style.display = '';
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = canvas.clientWidth * dpr;
+    canvas.height = canvas.clientHeight * dpr;
+    ctx.scale(dpr, dpr);
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+
+    // Interaction listeners are bound once per tab session (the #ngCanvas
+    // element and _ngState persist across filter re-renders); re-attaching on
+    // every applyNGFilters() would leak handlers (review of #1758). Binding
+    // once also means transient flags like _wasDragging survive re-renders.
+    // Hover state lives on _ngState so listeners and the draw loop agree.
+    if (!_ngState._listenersBound) {
+      bindNGCanvasInteraction(canvas);
+      _ngState._listenersBound = true;
+    }
 
     // Cache text color to avoid getComputedStyle every frame
     const _labelColor = cssVar('--text-primary') || '#e0e0e0';
@@ -2782,6 +3106,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     // Performance: 500 nodes brute-force repulsion: avg ~4ms/frame = 250fps headroom (measured Chrome 120, M1)
     var _perfFrameTimes = [], _perfLastTime = 0;
     function tick() {
+      if (_ngState._runEpoch !== myEpoch) { return; } // a newer startGraphRenderer run superseded this loop
       if (!document.getElementById('ngCanvas')) { _ngState.animId = null; return; }
       var now = performance.now();
       if (_perfLastTime) _perfFrameTimes.push(now - _perfLastTime);
@@ -2874,7 +3199,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
         ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
         ctx.fillStyle = color;
         ctx.fill();
-        if (n === hoverNode) {
+        if (n === _ngState.hoverNode) {
           ctx.strokeStyle = '#fff';
           ctx.lineWidth = 2;
           ctx.stroke();
@@ -3008,7 +3333,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       const rows = entries.map(([prefix, arr]) => {
         const nodeLinks = arr.map(n => {
           const label = esc(n.name || n.public_key.slice(0, 10));
-          return `<a href="#/nodes/${encodeURIComponent(n.public_key)}" style="color:var(--accent);text-decoration:none">${label}</a>`;
+          return `<a href="#/nodes/${encodeURIComponent(n.public_key)}" style="color:var(--link-color);text-decoration:none">${label}</a>`;
         }).join(', ');
         return `<tr>
           <td style="padding:4px 8px;font-family:var(--mono);font-weight:600;border-bottom:1px solid var(--border);white-space:nowrap">${esc(prefix)}</td>
@@ -3041,7 +3366,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     const initGenerate = hashParams.get('generate') || '';
 
     const regionNote = regionLabel
-      ? `<p class="text-muted" style="font-size:0.85em;margin:4px 0 0">Showing data for region: <strong>${esc(regionLabel)}</strong>. <a href="#/analytics?tab=prefix-tool" style="color:var(--accent)">Check all repeaters →</a></p>`
+      ? `<p class="text-muted" style="font-size:0.85em;margin:4px 0 0">Showing data for region: <strong>${esc(regionLabel)}</strong>. <a href="#/analytics?tab=prefix-tool" style="color:var(--link-color)">Check all repeaters →</a></p>`
       : '';
 
     el.innerHTML = `
@@ -3073,7 +3398,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
               // distinguish theoretical/would-collide-if-used from packet-
               // traffic-observed collisions shown on the Hash Issues tab.
               const opLine = opC === 0
-                ? `<span style="color:var(--status-green)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> No address conflicts among configured repeaters</span>`
+                ? `<span style="color:var(--status-green-text)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> No address conflicts among configured repeaters</span>`
                 : `<span style="color:var(--status-red)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> ${opC} address conflict${opC !== 1 ? 's' : ''} among configured repeaters (would-collide-if-used)</span>`;
               // #1306: expandable WHICH-collides toggles (op + theoretical)
               const opEntries = collEntries.operational[b];
@@ -3084,7 +3409,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
                 <div style="margin-top:6px">
                   <button type="button" class="pt-collide-toggle-btn" data-pt-collide-toggle="op-${b}" data-target="${opTogId}"
                     aria-expanded="false"
-                    style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:0.82em;padding:0">
+                    style="background:none;border:none;color:var(--link-color);cursor:pointer;font-size:0.82em;padding:0">
                     Show ${opC} colliding slice${opC !== 1 ? 's' : ''} →
                   </button>
                   <div id="${opTogId}" data-pt-collide-panel="op-${b}" style="display:none;margin-top:6px;max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg)">
@@ -3095,7 +3420,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
                 <div style="margin-top:4px">
                   <button type="button" class="pt-collide-toggle-btn" data-pt-collide-toggle="theo-${b}" data-target="${theoTogId}"
                     aria-expanded="false"
-                    style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:0.78em;padding:0">
+                    style="background:none;border:none;color:var(--link-color);cursor:pointer;font-size:0.78em;padding:0">
                     Show ${theoC} would-collide slice${theoC !== 1 ? 's' : ''} (across all repeaters) →
                   </button>
                   <div id="${theoTogId}" data-pt-collide-panel="theo-${b}" style="display:none;margin-top:6px;max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg)">
@@ -3121,7 +3446,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
             }).join('')}
           </div>
           <div style="background:var(--bg-secondary,var(--bg));border:1px solid var(--accent);border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:0.85em">
-            <strong>ℹ️ Theoretical vs observed:</strong> These are <em>theoretical address conflicts</em> that would occur IF all repeaters used this hash size (would-collide-if-used). For collisions <em>actually observed in packet traffic</em>, see the <a href="#/analytics?tab=collisions" style="color:var(--accent)">Hash Issues</a> tab.
+            <strong>ℹ️ Theoretical vs observed:</strong> These are <em>theoretical address conflicts</em> that would occur IF all repeaters used this hash size (would-collide-if-used). For collisions <em>actually observed in packet traffic</em>, see the <a href="#/analytics?tab=collisions" style="color:var(--link-color)">Hash Issues</a> tab.
           </div>
           <div style="background:var(--bg-secondary,var(--bg));border:1px solid var(--border);border-radius:6px;padding:10px 14px;margin-bottom:12px">
             <strong>Recommendation: ${rec} prefixes</strong> — ${recDetail}
@@ -3129,8 +3454,8 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
           </div>
           <div style="background:var(--bg-secondary,var(--bg));border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:0.85em">
             <strong>ℹ️ About these numbers:</strong> The primary count is how many repeaters are <em>configured</em> for each hash size (their advertised path hash byte length), matching the
-            <a href="#/analytics?tab=hashsizes" style="color:var(--accent)">Hash Stats</a> tab. Address conflicts (would-collide-if-used) count colliding slices among repeaters configured for the same hash size — same definition the
-            <a href="#/analytics?tab=collisions" style="color:var(--accent)">Hash Issues</a> tab uses, except Hash Issues counts collisions <em>actually observed in packet traffic</em> rather than theoretical. The <em>theoretical</em> line shows the math fact: how many distinct slices appear when every repeater pubkey is truncated to N bytes, regardless of configured hash size.
+            <a href="#/analytics?tab=hashsizes" style="color:var(--link-color)">Hash Stats</a> tab. Address conflicts (would-collide-if-used) count colliding slices among repeaters configured for the same hash size — same definition the
+            <a href="#/analytics?tab=collisions" style="color:var(--link-color)">Hash Issues</a> tab uses, except Hash Issues counts collisions <em>actually observed in packet traffic</em> rather than theoretical. The <em>theoretical</em> line shows the math fact: how many distinct slices appear when every repeater pubkey is truncated to N bytes, regardless of configured hash size.
           </div>
         </div>
       </div>
@@ -3142,7 +3467,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
           <input id="ptPrefixInput" type="text" placeholder="e.g. A3F1" maxlength="64"
             style="font-family:var(--mono);font-size:1em;padding:6px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;min-width:180px;flex:1"
             value="${esc(initPrefix)}">
-          <button id="ptCheckBtn" style="padding:6px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.95em">Check</button>
+          <button id="ptCheckBtn" class="btn-active-accent" style="padding:6px 16px;border:none;border-radius:4px;cursor:pointer;font-size:0.95em">Check</button>
         </div>
         <div id="ptCheckerResults" style="margin-top:14px"></div>
       </div>
@@ -3154,7 +3479,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
           <span aria-hidden="true"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-prohibit"/></svg></span>
           <strong>0x00 and 0xFF excluded</strong> as a first byte — the MeshCore firmware keygen routine re-rolls identities whose <code>pub_key[0]</code> is <code>00</code> or <code>FF</code>, so by convention you should not see those prefixes on real nodes (see
           <a href="https://github.com/meshcore-dev/MeshCore/blob/8ede7641/examples/simple_repeater/main.cpp#L83"
-             target="_blank" rel="noopener noreferrer" style="color:var(--accent)">simple_repeater/main.cpp:83</a>).
+             target="_blank" rel="noopener noreferrer" style="color:var(--link-color)">simple_repeater/main.cpp:83</a>).
         </p>
         <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
@@ -3167,13 +3492,13 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
             <input type="radio" name="ptGenSize" value="3" ${initGenerate === '3' ? 'checked' : ''}> 3-byte
           </label>
-          <button id="ptGenBtn" style="padding:6px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.95em">Generate</button>
+          <button id="ptGenBtn" class="btn-active-accent" style="padding:6px 16px;border:none;border-radius:4px;cursor:pointer;font-size:0.95em">Generate</button>
         </div>
         <div id="ptGenResult"></div>
         <div style="margin-top:14px;padding:10px 14px;border:1px solid var(--accent);border-radius:6px;background:var(--bg-secondary,var(--bg));font-size:0.88em">
           <svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-book-open"/></svg> <strong>New to multi-byte prefixes?</strong>
           <a href="https://github.com/meshcore-dev/MeshCore/blob/main/docs/faq.md#39-q-what-is-multi-byte-support--what-do-1-byte-2-byte-3-byte-adverts-and-messages-mean"
-            target="_blank" rel="noopener noreferrer" style="color:var(--accent);margin-left:4px">
+            target="_blank" rel="noopener noreferrer" style="color:var(--link-color);margin-left:4px">
             Read the MeshCore FAQ on multi-byte support →
           </a>
         </div>
@@ -3189,7 +3514,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     }
 
     function severityBadge(count) {
-      if (count === 0) return '<span style="color:var(--status-green)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> Unique</span>';
+      if (count === 0) return '<span style="color:var(--status-green-text)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> Unique</span>';
       if (count <= 2) return `<span style="color:var(--status-yellow)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> ${count} collision${count !== 1 ? 's' : ''}</span>`;
       return `<span style="color:var(--status-red)"><span style="color:var(--status-red)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> ${count} collisions</span>`;
     }
@@ -3318,14 +3643,14 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       genResultEl.innerHTML = `
         <div style="padding:12px 16px;border:1px solid var(--status-green);border-radius:6px;background:var(--bg-secondary,var(--bg))">
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-            <code class="mono" style="font-size:1.3em;font-weight:700;color:var(--status-green)">${prefix}</code>
-            <span style="color:var(--status-green)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> No existing nodes use this prefix</span>
+            <code class="mono" style="font-size:1.3em;font-weight:700;color:var(--status-green-text)">${prefix}</code>
+            <span style="color:var(--status-green-text)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check-circle"/></svg> No existing nodes use this prefix</span>
           </div>
           <div class="text-muted" style="font-size:0.85em;margin-top:6px">${available.toLocaleString()} of ${totalSpace.toLocaleString()} ${b}-byte prefixes are available.</div>
           <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
             <button id="ptRegenBtn" style="padding:5px 14px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;cursor:pointer;font-size:0.9em">Try another</button>
             <a href="https://agessaman.github.io/meshcore-web-keygen/?prefix=${prefix}" target="_blank" rel="noopener noreferrer"
-              style="padding:5px 14px;background:var(--bg);color:var(--accent);border:1px solid var(--border);border-radius:4px;text-decoration:none;font-size:0.9em">
+              style="padding:5px 14px;background:var(--bg);color:var(--link-color);border:1px solid var(--border);border-radius:4px;text-decoration:none;font-size:0.9em">
               Generate key with this prefix →
             </a>
           </div>
@@ -4149,7 +4474,10 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
     // Fix 5: write static frame only once
     if (!el.querySelector('#scopes-cards')) {
       el.innerHTML =
-        '<h3 style="margin:0 0 12px">Scope Statistics</h3>' +
+        '<h3 style="margin:0 0 4px">Scope Statistics</h3>' +
+        '<p class="text-muted" style="margin:0 0 12px;font-size:0.85em">' +
+          'Denominator is all observed transmissions. Only TRANSPORT_FLOOD (0) and TRANSPORT_DIRECT (3) routes carry a scope; FLOOD (1) and DIRECT (2) are inherently unscoped per MeshCore protocol.' +
+        '</p>' +
         '<div style="margin-bottom:12px">' +
           ['1h', '24h', '7d'].map(function(v) {
             return '<button class="tab-btn' + (selectedWindow === v ? ' active' : '') + '" data-win="' + v + '">' + v + '</button>';
@@ -4201,15 +4529,19 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
 
     function updateData(d, w) {
       var s = d.summary;
+      // #1838: denominator = transport-carrying transmissions (route_type 0,3).
+      // Unscoped now includes non-transport routes (1,2) which are inherently
+      // unscoped by MeshCore protocol, so unscoped can exceed transportTotal.
       var total = s.transportTotal || 0;
+      var overall = (s.scoped || 0) + (s.unscoped || 0);
 
       // Summary cards
       var cardsEl = document.getElementById('scopes-cards');
       if (cardsEl) {
         cardsEl.innerHTML = [
-          { label: 'Transport Total', value: total.toLocaleString(), note: '' },
-          { label: 'Scoped', value: s.scoped.toLocaleString(), note: pct(s.scoped, total) },
-          { label: 'Unscoped', value: s.unscoped.toLocaleString(), note: pct(s.unscoped, total) },
+          { label: 'Transport Total', value: total.toLocaleString(), note: 'routes 0,3 (carry scope)' },
+          { label: 'Scoped', value: s.scoped.toLocaleString(), note: pct(s.scoped, overall) + ' of all traffic' },
+          { label: 'Unscoped', value: s.unscoped.toLocaleString(), note: pct(s.unscoped, overall) + ' of all traffic' },
           { label: 'Unknown Scope', value: s.unknownScope.toLocaleString(), note: pct(s.unknownScope, s.scoped) + ' of scoped' },
         ].map(function(c) {
           return '<div class="stat-card"><div class="stat-value">' + c.value + '</div>' +
@@ -4336,7 +4668,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
           '<span title="Warning (5min – 1h)" style="color:var(--color-warning,#e80)">' + (r.warningCount || 0) + '</span> / ' +
           '<span title="Critical (1h – 30d)" style="color:var(--color-error,#c00)">' + (r.criticalCount || 0) + '</span> / ' +
           '<span title="Absurd (&gt; 30d)" style="color:#a0a">' + (r.absurdCount || 0) + '</span> / ' +
-          '<span title="No clock (&gt; 365d)" style="color:#888">' + (r.noClockCount || 0) + '</span>';
+          '<span title="No clock (&gt; 365d)" style="color:var(--text-muted)">' + (r.noClockCount || 0) + '</span>';
         return '' +
           '<tr data-role="' + esc(r.role) + '">' +
             '<td>' + _rolesEmoji(r.role) + ' <strong>' + esc(r.role) + '</strong></td>' +
@@ -4355,7 +4687,7 @@ function destroy() { _stopRolesRefresh(); _stopScopesRefresh(); _analyticsData =
       }).join('');
       el.innerHTML =
         '<p class="text-muted" style="margin:0 0 12px 0">Distribution of node roles across the mesh, with per-role clock-skew posture.</p>' +
-        '<div class="roles-summary" style="margin-bottom:12px;color:var(--color-text-muted,#666)">' +
+        '<div class="roles-summary" style="margin-bottom:12px;color:var(--text-muted)">' +
           '<strong>' + total + '</strong> nodes across <strong>' + roles.length + '</strong> roles' +
         '</div>' +
         '<table id="rolesTable" class="data-table analytics-table" style="width:100%">' +

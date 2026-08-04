@@ -96,6 +96,67 @@
  * further below — DO NOT add component CSS in this region.
  * ============================================================ */
 
+/* ============================================================
+ * TIER-1 PALETTE — raw colour stops. Theme-independent.
+ * Issue #1671 / #1668 M2. Single source of truth for every hex
+ * value that ships in this file. Outside this block, no rule
+ * may use a raw `#hex` or `rgb(...)` literal — use a token.
+ * Source: Tailwind CSS v3 default palette (MIT licensed,
+ * battle-tested for WCAG-graded luminance steps).
+ *   gray  ×9   blue  ×9   green ×5
+ *   amber ×5   red   ×5   purple ×5
+ * Total palette tokens: 38.
+ * ============================================================ */
+:root {
+  /* Grays — 9 stops, low → high luminance */
+  --palette-gray-50:  #f9fafb;
+  --palette-gray-100: #f3f4f6;
+  --palette-gray-200: #e5e7eb;
+  --palette-gray-300: #d1d5db;
+  --palette-gray-400: #9ca3af;
+  --palette-gray-500: #6b7280;
+  --palette-gray-600: #4b5563;
+  --palette-gray-700: #374151;
+  --palette-gray-800: #1f2937;
+  --palette-gray-900: #111827;
+
+  /* Blues — accent / info family */
+  --palette-blue-100: #dbeafe;
+  --palette-blue-200: #bfdbfe;
+  --palette-blue-300: #93c5fd;
+  --palette-blue-400: #60a5fa;
+  --palette-blue-500: #3b82f6;
+  --palette-blue-600: #2563eb;
+  --palette-blue-700: #1d4ed8;
+  --palette-blue-800: #1e40af;
+  --palette-blue-900: #1e3a8a;
+
+  /* Greens / ambers / reds / purples — status families */
+  --palette-green-300: #86efac;
+  --palette-green-400: #4ade80;
+  --palette-green-500: #22c55e;
+  --palette-green-600: #16a34a;
+  --palette-green-700: #15803d;
+
+  --palette-amber-300: #fcd34d;
+  --palette-amber-400: #fbbf24;
+  --palette-amber-500: #f59e0b;
+  --palette-amber-600: #d97706;
+  --palette-amber-700: #b45309;
+
+  --palette-red-300: #fca5a5;
+  --palette-red-400: #f87171;
+  --palette-red-500: #ef4444;
+  --palette-red-600: #dc2626;
+  --palette-red-700: #b91c1c;
+
+  --palette-purple-300: #c4b5fd;
+  --palette-purple-400: #a78bfa;
+  --palette-purple-500: #8b5cf6;
+  --palette-purple-600: #7c3aed;
+  --palette-purple-700: #6d28d9;
+}
+
 :root {
   /* Node-quality link strength colours (bottleneck tiers). Dark-theme
      overrides live in the [data-theme="dark"] block below (brighter hues). */
@@ -126,6 +187,15 @@
   --fs-xl:  clamp(18px, 0.50vw + 16px, 28px);
   --fs-2xl: clamp(22px, 0.75vw + 20px, 36px);
 
+  /* --- Typography weight tokens — #1668 M3 ----------------
+   * Chip / badge / meta rule (M3): font-size >= 14px OR
+   * (font-size >= 12px AND font-weight >= 500). Use --fw-medium
+   * on anything that stays at 12-13px to keep it readable. */
+  --fw-normal:   400;
+  --fw-medium:   500;
+  --fw-semibold: 600;
+  --fw-bold:     700;
+
   /* --- Fluid radii ----------------------------------------- */
   --radius-sm: clamp(3px, 0.1vw + 2px, 6px);
   --radius-md: clamp(6px, 0.2vw + 5px, 12px);
@@ -145,10 +215,47 @@
   --nav-text-muted: #cbd5e1;
   --nav-active-bg: rgba(74, 158, 255, 0.15);
   --accent: #4a9eff;
+  /* #1668 M2 — accessible accent for chips/badges/active buttons that put
+     white text on a blue surface. The legacy --accent (#4a9eff) yields
+     #fff/#4a9eff = 2.75:1 (BLOCKER per M1 audit). --accent-strong drops
+     two stops to palette-blue-600 = #2563eb (#fff on it = 4.83:1, AA pass)
+     and is the surface for: .skip-link, .btn.active, .hop-link.hop-named,
+     .nav-link.active background, .fGroup.active. */
+  --accent-strong: var(--palette-blue-600);
+  --text-on-accent: var(--palette-gray-50);
+  /* #1668 M5 — accessible link/text color. The legacy --accent (#4a9eff)
+     used for text-on-light backgrounds was 2.52:1 on white (BLOCKER per
+     M5 axe gate, 219 hits across .analytics-link / .sort-active / .ch-*).
+     Dark theme override below bumps to palette-blue-400 (#60a5fa) so
+     links stay readable on surface-0 (#0f0f23 ≈ 8.4:1, AA pass).
+     Use --link-color for any "text rendered ON the page surface that
+     should look like a link / interactive accent" — NOT for backgrounds.
+     Backgrounds carrying white text continue to use --accent-strong. */
+  /* #1668 M5 — accessible semantic status colors. The legacy fallbacks
+     baked into JS (var(--success, #22c55e)) used the bright palette-500
+     hues which fail AA against white surfaces (#22c55e/white = 2.27:1,
+     #ef4444/white = 3.76:1). New theme-aware tokens use palette-700 on
+     light surfaces (5.0-6.5:1 vs white) and palette-400/500 on dark
+     (6+:1 vs surface-0/1). All callers should now read --success /
+     --warning / --danger WITHOUT a hex fallback (kept as legacy support
+     only). */
+  --success: var(--palette-green-700, #15803d);
+  --warning: #b45309;
+  --danger: var(--palette-red-600, #dc2626);
+  --link-color: var(--palette-blue-600);
   --accent-bg: rgba(59, 130, 246, 0.12);
   --accent-border: rgba(59, 130, 246, 0.25);
   --geo-filter-color: #3b82f6;
   --status-green: #22c55e;
+  /* #1719 — `--status-green` (#22c55e) is the BACKGROUND swatch hue
+     (used as `background:` on badges + dots over white card surfaces).
+     As TEXT on a white .analytics-stat-card it is only 2.28:1 (BLOCKER).
+     `--status-green-text` is the text-only variant for surfaces that
+     render numbers/labels in the green palette over light cards — pinned
+     to palette-green-700 (#15803d) → 5.06:1 on #fff (AA pass). Dark
+     theme overrides keep the bright #22c55e since it reads ≥6:1 on the
+     card-bg #232340. */
+  --status-green-text: var(--palette-green-700, #15803d);
   --status-yellow: #eab308;
   --status-red: #ef4444;
   --status-orange: #f97316;
@@ -156,15 +263,38 @@
   --status-amber: #f59e0b;
   --status-amber-light: #fef3c7;
   --status-amber-text: #92400e;
+  /* #1719 — `--skew-badge-no-clock-bg` carries the muted "no clock data"
+     badge background (was --text-muted which renders #d1d5db in dark
+     theme → #fff text = 1.47:1, BLOCKER × 137 on clock-health). Pinned
+     to palette-gray-600 (#4b5563) so #fff text reads 7.56:1 on both
+     themes (light: 7.56:1, dark: 7.56:1). */
+  --skew-badge-no-clock-bg: var(--palette-gray-600, #4b5563);
   /* #1648 M6 (M4 CDP carry-forward): named token for the neutral/info
      accent used as the unrolled-route hop fallback color (was #3b82f6
      baked in route-render.js). Themes via dark-mode block below. */
   --status-info: #3b82f6;
   --path-inspector-speculative: #d97706;
-  --role-observer: #8b5cf6;
+  /* #1715 — neighbor-graph role swatches (`#ngRoleChecks` labels) read
+   * these tokens via the role-suffixed `.role-swatch--ROLE` class (analytics.js).
+   * Light-theme values are palette-700 shades that clear WCAG AA ≥4.5:1
+   * against the white analytics surface (#ffffff). Dark-theme overrides
+   * live in the [data-theme="dark"] block further down and use palette-400
+   * shades that clear AA against the dark card-bg (#1a1a2e). Keeping the
+   * swatch palette as CSS custom properties is what kept #1715 from
+   * regressing — never reintroduce inline `style="color:#..."` on these
+   * spans. */
+  --role-repeater:  #dc2626;  /* 4.83:1 on #fff */
+  --role-companion: #2563eb;  /* 5.17:1 on #fff */
+  --role-room:      #15803d;  /* 5.02:1 on #fff */
+  --role-sensor:    #b45309;  /* 5.02:1 on #fff */
+  --role-observer:  #7c3aed;  /* 5.70:1 on #fff */
   --accent-hover: #6db3ff;
   --text: #1a1a2e;
-  --text-muted: #5b6370;
+  /* #1668 M2 — bumped from #5b6370 (~5.7:1 on white) to palette-gray-700
+     #374151 (~10.3:1 on white, ~9.9:1 on surface-0 #f4f5f7). Light theme
+     muted text was a MAJOR/borderline case; this clears the buffer. */
+  --text-muted: var(--palette-gray-700);
+  --text-subtle: var(--palette-gray-600);
   --border: #e2e5ea;
   --row-stripe: #f9fafb;
   --row-hover: #eef2ff;
@@ -253,6 +383,11 @@
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --status-green: #22c55e;
+    /* #1719 — on dark card-bg (#232340) #22c55e gives 6.65:1, AA pass.
+       Keep the bright hue for text rather than darkening it. */
+    --status-green-text: #22c55e;
+    /* #1719 — keep --skew-badge-no-clock-bg dark enough for #fff text. */
+    --skew-badge-no-clock-bg: var(--palette-gray-600, #4b5563);
     --status-yellow: #eab308;
     --status-red: #ef4444;
     --status-orange: #f97316;
@@ -261,7 +396,24 @@
     --status-amber-light: #422006;
     --status-amber-text: #fcd34d;
     --path-inspector-speculative: #f59e0b;
+    /* #1715 — dark-theme role swatch overrides. Light values (palette-700)
+     * fail 4.5:1 on the dark analytics card-bg #1a1a2e (e.g. #dc2626 →
+     * 3.53:1). Palette-400/500 shades clear AA on dark. Mirror these in
+     * the [data-theme="dark"] block below. */
+    --role-repeater:  #ef4444;  /* 4.53:1 on #1a1a2e */
+    --role-companion: #3b82f6;  /* 4.64:1 on #1a1a2e */
+    --role-room:      #16a34a;  /* 5.18:1 on #1a1a2e */
+    --role-sensor:    #d97706;  /* 5.35:1 on #1a1a2e */
+    --role-observer:  #a78bfa;  /* 6.27:1 on #1a1a2e */
     --status-info: #60a5fa;
+    /* #1668 M5 — bump link text up two stops on dark surfaces (4a9eff
+       was OK but borderline on card-bg; #60a5fa = palette-blue-400 ≈
+       7.8:1 on surface-0, 5.4:1 on card-bg, AA pass either way). */
+    --link-color: var(--palette-blue-400);
+    /* #1668 M5 — bright -400/-500 hues for AA against dark surfaces */
+    --success: var(--palette-green-400, #4ade80);
+    --warning: #fcd34d;
+    --danger:  var(--palette-red-400, #f87171);
     --surface-0: #0f0f23;
     --surface-1: #1a1a2e;
     --surface-2: #232340;
@@ -270,7 +422,12 @@
     --content-bg: var(--surface-0);
     --card-bg: var(--surface-2);
     --text: #e2e8f0;
-    --text-muted: #a8b8cc;
+    /* #1668 M2 — text-muted bumped from #a8b8cc to palette-gray-300
+       (#d1d5db); ~8.7:1 on surface-0, ~7.6:1 on card-bg (was ~7.5:1).
+       Clears `span.text-muted` BLOCKERs flagged on translucent surfaces
+       (where the legacy value dropped below 4.5 once alpha-stacked). */
+    --text-muted: var(--palette-gray-300);
+    --text-subtle: var(--palette-gray-400);
     --border: #334155;
     --row-stripe: #1e1e34;
     --row-hover: #2d2d50;
@@ -292,6 +449,9 @@
   --link-weak: #f85149;
   --link-oneway: #768390;
   --status-green: #22c55e;
+  /* #1719 — see :root[prefers-color-scheme:dark] block; mirror here. */
+  --status-green-text: #22c55e;
+  --skew-badge-no-clock-bg: var(--palette-gray-600, #4b5563);
   --status-yellow: #eab308;
   --status-red: #ef4444;
   --status-orange: #f97316;
@@ -300,6 +460,18 @@
   --status-amber-light: #422006;
   --status-amber-text: #fcd34d;
   --status-info: #60a5fa;
+  /* #1715 — dark-theme role swatch overrides (mirrors the media-query
+   * block above). Palette-400/500 shades clear WCAG AA on #1a1a2e. */
+  --role-repeater:  #ef4444;  /* 4.53:1 on #1a1a2e */
+  --role-companion: #3b82f6;  /* 4.64:1 on #1a1a2e */
+  --role-room:      #16a34a;  /* 5.18:1 on #1a1a2e */
+  --role-sensor:    #d97706;  /* 5.35:1 on #1a1a2e */
+  --role-observer:  #a78bfa;  /* 6.27:1 on #1a1a2e */
+  /* #1668 M5 — see :root[data-theme="dark"] media block above for rationale */
+  --link-color: var(--palette-blue-400);
+  --success: var(--palette-green-400, #4ade80);
+  --warning: #fcd34d;
+  --danger:  var(--palette-red-400, #f87171);
   --surface-0: #0f0f23;
   --surface-1: #1a1a2e;
   --surface-2: #232340;
@@ -308,7 +480,9 @@
   --content-bg: var(--surface-0);
   --card-bg: var(--surface-2);
   --text: #e2e8f0;
-  --text-muted: #a8b8cc;
+  /* #1668 M2 — see :root[data-theme="dark"] media block for rationale */
+  --text-muted: var(--palette-gray-300);
+  --text-subtle: var(--palette-gray-400);
   --border: #334155;
   --row-stripe: #1e1e34;
   --row-hover: #2d2d50;
@@ -331,7 +505,10 @@ html, body { height: 100%; font-family: var(--font); font-size: var(--fs-md); ba
  * ============================================================ */
 
 /* === Skip Link === */
-.skip-link { position: absolute; top: -100%; left: 16px; padding: 8px 16px; background: var(--accent); color: #fff; border-radius: 6px; z-index: 999; font-weight: 600; text-decoration: none; }
+/* #1668 M2 — was background:var(--accent) (#4a9eff) with white text =
+   2.75:1 BLOCKER. Bumped to --accent-strong / --text-on-accent for
+   4.83:1 AA pass (both themes). */
+.skip-link { position: absolute; top: -100%; left: 16px; padding: 8px 16px; background: var(--accent-strong); color: var(--text-on-accent); border-radius: 6px; z-index: 999; font-weight: 600; text-decoration: none; }
 .skip-link:focus { top: 8px; }
 
 /* === Focus Indicators === */
@@ -681,6 +858,7 @@ img.brand-logo {
 .nav-link {
   color: var(--nav-text-muted); text-decoration: none;
   padding: 14px clamp(8px, 0.6vw + 4px, 14px); font-size: var(--fs-sm);
+  font-weight: var(--fw-medium); /* #1668 M3 — 12-14px fluid + 500 floor */
   border-bottom: 2px solid transparent; transition: all .15s;
   background: none; border-top: none; border-left: none; border-right: none;
   cursor: pointer; font-family: var(--font);
@@ -706,7 +884,7 @@ img.brand-logo {
 .dropdown-item {
   display: block; padding: 8px 16px; color: var(--text-muted); text-decoration: none; font-size: 13px;
 }
-.dropdown-item:hover { background: var(--accent); color: #fff; }
+.dropdown-item:hover { background: var(--accent-strong); color: var(--text-on-accent); }
 
 .nav-right { display: flex; align-items: center; gap: var(--space-sm); flex-shrink: 0; }
 .nav-btn {
@@ -784,7 +962,7 @@ img.brand-logo {
   font-family: var(--mono); margin-right: 4px; white-space: nowrap;
 }
 .nav-stats .stat-val { color: var(--nav-text); font-weight: 600; transition: color 0.3s ease; }
-.nav-stats .stat-val.updated { color: var(--accent); }
+.nav-stats .stat-val.updated { color: var(--link-color); }
 
 /* === Layout === */
 /* Default: body-scroll mode — content pushes beyond viewport, iOS status-bar
@@ -867,8 +1045,8 @@ img.brand-logo {
 /* #1124 (MAJOR-3): each grouped cluster wraps as a single unit at narrow
  * widths instead of letting individual controls reflow across categories. */
 .filter-bar .filter-group { flex-wrap: nowrap; }
-.filter-group .btn { padding: 4px 10px; font-size: 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); cursor: pointer; transition: background 0.15s, color 0.15s; height: 34px; min-height: 34px; box-sizing: border-box; line-height: 1; }
-.filter-group .btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.filter-group .btn { padding: 4px 10px; font-size: 12px; font-weight: var(--fw-medium); border-radius: 12px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); cursor: pointer; transition: background 0.15s, color 0.15s; height: 34px; min-height: 34px; box-sizing: border-box; line-height: 1; } /* #1668 M3 — added 500 weight on chip */
+.filter-group .btn.active { background: var(--accent-strong); color: var(--text-on-accent); border-color: var(--accent-strong); }
 .filter-group .btn:hover:not(.active) { background: var(--surface-2); }
 .filter-group + .filter-group { border-left: 1px solid var(--border); padding-left: 12px; margin-left: 6px; }
 .sort-help { cursor: help; font-size: 14px; color: var(--text-muted, #888); position: relative; display: inline-block; }
@@ -881,7 +1059,7 @@ img.brand-logo {
 }
 .sort-help:hover .sort-help-tip { display: block; }
 .filter-bar .btn:hover { background: var(--row-hover); }
-.filter-bar .btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.filter-bar .btn.active { background: var(--accent-strong); color: var(--text-on-accent); border-color: var(--accent-strong); }
 .filter-bar .col-toggle-btn { height: 34px; min-height: 34px; }
 
 .btn-icon {
@@ -899,9 +1077,9 @@ img.brand-logo {
  *    pill rendered inside thead (clickable to reveal)
  */
 .data-table {
-  width: 100%; border-collapse: collapse; font-size: 12px;
+  width: 100%; border-collapse: collapse; font-size: 13px; font-weight: var(--fw-medium);
   table-layout: auto;
-}
+} /* #1668 M3 — was 12px/400, now 13px paired with 500 weight */
 .data-table th {
   text-align: left; padding: 4px 6px; font-weight: 600; font-size: 11px;
   text-transform: uppercase; letter-spacing: .3px; color: var(--text-muted);
@@ -909,7 +1087,7 @@ img.brand-logo {
   position: sticky; top: 0; z-index: 1;
 }
 .data-table th.sortable { cursor: pointer; }
-.data-table th.sortable:hover { color: var(--accent); }
+.data-table th.sortable:hover { color: var(--link-color); }
 .data-table td {
   padding: 3px 6px; border-bottom: 1px solid var(--border);
   vertical-align: middle; white-space: nowrap;
@@ -1116,9 +1294,14 @@ img.brand-logo {
 .col-hidden-pill {
   display: inline-block; margin-left: 6px;
   padding: 1px 7px; border-radius: 999px;
-  background: var(--accent-bg, rgba(96,165,250,0.18));
-  color: var(--accent, #60a5fa);
-  font-size: 10px; font-weight: 700; letter-spacing: .3px;
+  /* #1668 M5 — was bg:--accent-bg (rgba blue tint) + color:--accent
+     = ~2.4:1 on light theme. Swap the tint for solid --accent-strong
+     (palette-blue-600 #2563eb) and use --text-on-accent (gray-50) so
+     the pill matches the M2 .skip-link / .filter-bar .btn.active
+     pattern: 4.83:1 AA both themes, no per-theme branching. */
+  background: var(--accent-strong);
+  color: var(--text-on-accent);
+  font-size: 12px; font-weight: var(--fw-bold); letter-spacing: .3px; /* #1668 M3 — was 10px */
   cursor: pointer; user-select: none; vertical-align: middle;
   border: 1px solid var(--accent, #60a5fa);
   text-transform: none;
@@ -1258,7 +1441,14 @@ body.scroll-locked { overflow: hidden; }
   font-family:var(--mono)
 }
 /* === Monospace === */
-.mono { font-family: var(--mono); font-size: 12px; }
+.mono { font-family: var(--mono); font-size: 13px; font-weight: var(--fw-medium); } /* #1668 M3 — was 12px/inherit */
+
+/* #1668 M3 — explicit floor for "Xs/Xm/Xd ago" timestamps used on every row
+ * of /packets, /nodes, /live. Was inheriting 12px/400 (thin-small). */
+.timestamp-text {
+  font-size: 13px;
+  font-weight: var(--fw-medium);
+}
 
 /* === Detail Panel === */
 .detail-title {
@@ -1284,7 +1474,7 @@ body.scroll-locked { overflow: hidden; }
 .detail-meta dd { font-weight: 500; margin-bottom: 4px; }
 /* #1281: 📍map link inside detail-meta — UA-default blue is unreadable on EMOJI-OK-COMMENT
  * dark backgrounds. Force theme-aware color via --accent. */
-.loc-map-link { color: var(--accent); font-size: 0.85em; text-decoration: none; }
+.loc-map-link { color: var(--link-color); font-size: 0.85em; text-decoration: none; }
 .loc-map-link:hover { text-decoration: underline; }
 .observation-current { background: var(--accent-bg, rgba(0,122,255,0.1)); font-weight: 600; }
 .detail-obs-row:hover { background: var(--hover-bg, rgba(255,255,255,0.05)); }
@@ -1349,14 +1539,24 @@ body.scroll-locked { overflow: hidden; }
   overflow: hidden;
   vertical-align: middle;
 }
-.path-hops .hop { color: var(--accent); line-height: 18px; }
-.path-hops .hop-named { color: #fff; background: var(--accent); padding: 1px 6px; border-radius: 3px; font-family: var(--font); font-weight: 600; cursor: default; flex: 0 0 auto; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 18px; }
+.path-hops .hop { color: var(--link-color); line-height: 18px; }
+/* #1668 M2 / operator-flagged chip: was `color:#fff; background:var(--accent)`
+   = 2.75:1 on dark theme (BLOCKER). Now uses --accent-strong (#2563eb)
+   with --text-on-accent (gray-50) for 4.83:1 — WCAG AA body pass in
+   both themes. */
+.path-hops .hop-named { color: var(--text-on-accent); background: var(--accent-strong); padding: 1px 6px; border-radius: 3px; font-family: var(--font); font-size: 12px; font-weight: 600; cursor: default; flex: 0 0 auto; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 18px; }
 .path-hops .arrow { color: var(--text-muted); flex: 0 0 auto; line-height: 18px; }
 /* #1122/#1128: bound the row height contributed by the path column.
  * `max-height` on a <td> is widely ignored by browsers (table layout
  * overrides it), so use `height` — table cells respect `height` as
  * min-height, locking the row to a single line of chip content
  * regardless of hop count. */
+/* #1668 M3 r1 (tufte #4): preserve PATH column width after the table body
+ * font bump (12 -> 13) widened sibling columns and squeezed PATH chips
+ * from 7-9 visible chars down to 3-4. Reserve enough room for two
+ * abbreviated 7-char chips + arrow. .path-hops already uses 11px font, so
+ * no chip-level font change is needed here. */
+.data-table td.col-path, .data-table th.col-path { min-width: 140px; }
 .data-table td.col-path { height: 28px; line-height: 22px; overflow: hidden; }
 
 /* === Modal === */
@@ -1384,10 +1584,10 @@ body.scroll-locked { overflow: hidden; }
   resize: vertical; margin-bottom: 12px;
 }
 .modal .btn-primary {
-  background: var(--accent); color: #fff; border: none; padding: 8px 20px;
+  background: var(--accent-strong); color: var(--text-on-accent); border: none; padding: 8px 20px;
   border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600;
 }
-.modal .btn-primary:hover { background: var(--accent-hover); }
+.modal .btn-primary:hover { background: var(--palette-blue-700, #1d4ed8); }
 .modal .btn-close {
   background: none; border: 1px solid var(--border); padding: 8px 16px;
   border-radius: 6px; cursor: pointer; margin-left: 8px; font-size: 14px;
@@ -1595,7 +1795,7 @@ button.ch-item.selected { background: var(--selected-bg); }
 .ch-item-body { flex: 1; min-width: 0; }
 .ch-item-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 2px; }
 .ch-item-name { font-weight: 600; font-size: 14px; }
-.ch-item-time { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+.ch-item-time { font-size: 12px; font-weight: var(--fw-medium); color: var(--text-muted); white-space: nowrap; } /* #1668 M3 — was 11px/400 */
 .ch-unread-badge {
   display: inline-block;
   min-width: 18px;
@@ -1632,9 +1832,9 @@ button.ch-item.selected { background: var(--selected-bg); }
 button.ch-item:hover .ch-icon-btn { opacity: 1; }
 .ch-icon-btn:hover, .ch-icon-btn:focus { opacity: 1 !important; outline: none; }
 .ch-remove-btn:hover, .ch-remove-btn:focus { background: #8b3838; color: white; }
-.ch-share-btn:hover,  .ch-share-btn:focus  { color: var(--accent, #3b82f6); }
-.ch-user-badge { font-size: 12px; margin-left: 2px; opacity: 0.85; flex-shrink: 0; }
-.ch-item-preview { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ch-share-btn:hover,  .ch-share-btn:focus  { color: var(--link-color, #3b82f6); }
+.ch-user-badge { font-size: 12px; font-weight: var(--fw-medium); margin-left: 2px; opacity: 0.85; flex-shrink: 0; } /* #1668 M3 r1 — chip floor, mirror row chips (adv #2) */
+.ch-item-preview { font-size: 13px; font-weight: var(--fw-medium); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } /* #1668 M3 — was 12px/400 */
 
 .ch-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
 
@@ -1678,10 +1878,10 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   font-size: 14px; line-height: 1.5; word-break: break-word; display: inline-block; max-width: 100%;
   border: 1px solid var(--border);
 }
-.ch-mention { color: var(--accent); font-weight: 600; }
+.ch-mention { color: var(--link-color); font-weight: 600; }
 .ch-encrypted-text { font-size: 11px; color: var(--text-muted); }
 .ch-msg-meta { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
-.ch-analyze-link { color: var(--accent); text-decoration: none; margin-left: 8px; }
+.ch-analyze-link { color: var(--link-color); text-decoration: none; margin-left: 8px; }
 .ch-analyze-link:hover { text-decoration: underline; }
 .ch-scroll-btn {
   position: absolute; bottom: 16px; right: 24px; background: var(--accent); color: #fff;
@@ -1732,7 +1932,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 .ch-node-label { display: block; font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .3px; margin-bottom: 2px; }
 .ch-node-adverts { margin-top: 12px; }
 .ch-node-advert { font-size: 12px; color: var(--text-muted); padding: 4px 0; border-bottom: 1px solid var(--border); }
-.ch-node-link { display: inline-block; margin-top: 12px; color: var(--accent); text-decoration: none; font-size: 13px; }
+.ch-node-link { display: inline-block; margin-top: 12px; color: var(--link-color); text-decoration: none; font-size: 13px; }
 .ch-node-link:hover { text-decoration: underline; }
 
 /* === Nodes Page === */
@@ -1835,7 +2035,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 }
 /* #829: explicit color so text stays readable when inherited color matches card-bg */
 .advert-info { font-size: 12px; line-height: 1.5; color: var(--text); }
-.advert-info a { color: var(--accent); }
+.advert-info a { color: var(--link-color); }
 
 /* === Traces Page === */
 .traces-page { padding: 16px; max-width: var(--trace-max-width, 95vw); margin: 0 auto; }
@@ -1910,7 +2110,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
 /* === Observers Page === */
-.observers-page { padding: 20px; max-width: 1200px; margin: 0 auto; }
+.observers-page { padding: 20px; margin: 0 auto; }
 .obs-summary { display: flex; gap: 20px; margin-bottom: 16px; flex-wrap: wrap; }
 .obs-stat { display: flex; align-items: center; gap: 6px; font-size: 14px; color: var(--text-muted); }
 /* #1562 — "Last updated: X ago" pill on the observers-page header.
@@ -1940,7 +2140,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 [data-theme="dark"] .trace-search input,
 [data-theme="dark"] .mc-jump-btn,
 [data-theme="dark"] .filter-bar .btn { background: var(--input-bg); color: var(--text); border-color: var(--border); }
-[data-theme="dark"] .filter-bar .btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+[data-theme="dark"] .filter-bar .btn.active { background: var(--accent-strong); color: var(--text-on-accent); border-color: var(--accent-strong); }
 [data-theme="dark"] .ch-item.selected,
 [data-theme="dark"] .data-table tbody tr.selected { background: var(--selected-bg); }
 [data-theme="dark"] .tl-bar-container { background: #334155; }
@@ -1970,7 +2170,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   border-bottom: 1px solid var(--border); transition: background .1s;
 }
 .search-result-item:hover { background: var(--row-hover); }
-.search-result-type { font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--accent); margin-right: 8px; }
+.search-result-type { font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--link-color); margin-right: 8px; }
 .search-no-results { padding: 20px; text-align: center; color: var(--text-muted); font-size: 14px; }
 
 /* === Loading States & Transitions (M16) === */
@@ -2007,8 +2207,8 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 .data-table tbody tr.new-row { animation: row-flash 800ms ease-out; }
 
 .data-table th.sortable { cursor: pointer; user-select: none; }
-.data-table th.sortable:hover { color: var(--accent); }
-.data-table th.sort-active { color: var(--accent); }
+.data-table th.sortable:hover { color: var(--link-color); }
+.data-table th.sort-active { color: var(--link-color); }
 .data-table th .sort-arrow { font-size: 10px; margin-left: 4px; opacity: 0.7; }
 .data-table tbody tr { border-left: 3px solid transparent; transition: border-color 0.15s, background 0.15s; }
 .data-table tbody tr:hover { border-left-color: var(--accent); }
@@ -2220,18 +2420,44 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
   #chList .ch-share-btn { font-size: 0; }
   #chList .ch-share-btn .ph-icon, #chList .ch-share-btn svg { font-size: 13px; }
   #chList .ch-remove-btn { font-size: 12px; padding: 2px 6px; }
-  /* Hide the analytics-style time on mobile rows to free width for the name. */
-  #chList .ch-item-time { font-size: 10px; }
+  /* Mobile-narrow timestamp — #1668 M3 chip floor (12px+500 carries from base) */
+  #chList .ch-item-time { font-size: 12px; }
 
   /* Empty state must not dominate. */
   .ch-empty { padding: 12px; font-size: 13px; max-height: 30vh; }
 
-  /* Tables: smaller text for mobile */
-  .data-table { font-size: 11px; min-width: 0; }
+  /* Tables: smaller text for mobile — #1668 M3 chip floor (12px+500) */
+  .data-table { font-size: 12px; min-width: 0; }
   .data-table td { padding: 5px 4px; max-width: 100px; }
   .data-table th { padding: 5px 4px; font-size: 10px; }
   .data-table .col-time { min-width: 64px; }
   .panel-left { overflow-x: auto; }
+
+  /* #1770: packets-view virtual-scroller assumes constant row height
+     (VSCROLL_ROW_HEIGHT). The base rule at ~L1097 sets
+     `.data-table td.col-details { white-space: normal; word-break: break-word }`
+     which lets the "Details" cell wrap on narrow viewports, producing
+     variable row heights → visible jitter when scrolling past ~900px on
+     iOS. Quick-fix (S path): clamp the cell to a single line on mobile.
+     The proper L-path fix (per-row measurement) tracks separately.
+
+     v2 (#1805 follow-up): the clamp lives on an INNER `.col-details-clip`
+     wrapper, not the `<td>` itself. Reason: with `white-space: nowrap` on
+     the td and `table-layout: auto`, the cell's min-content becomes the
+     full single-line text width, blowing past the `max-width: 100px`
+     mobile hint. Rows then grow wider than the 360px viewport — which
+     breaks `test-gestures-1062-e2e.js` (a)/(h) because the swipe coords
+     fall outside the viewport and `elementFromPoint` no longer hits the
+     row. Inline-block + fixed `max-width` on the clip caps the column's
+     preferred width so the row stays viewport-bounded and gestures work. */
+  .data-table td.col-details > .col-details-clip {
+    display: inline-block;
+    max-width: 140px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: bottom;
+  }
 
   /* Filters: collapse on mobile */
   .filter-bar { flex-direction: row; flex-wrap: wrap; gap: 4px; }
@@ -2306,7 +2532,7 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 
 /* === Grouped Packet Rows === */
 .group-header { cursor: pointer; font-weight: 600; }
-.group-header td:first-child::before { content: '▶ '; font-size: 10px; color: var(--accent); transition: transform 0.15s; display: inline-block; }
+.group-header td:first-child::before { content: '▶ '; font-size: 10px; color: var(--link-color); transition: transform 0.15s; display: inline-block; }
 .group-header.expanded td:first-child::before { content: '▼ '; }
 .group-header:hover { background: var(--row-hover); }
 .group-child { font-size: 12px; }
@@ -2453,7 +2679,7 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .ch-key-input:focus {
   outline: 2px solid var(--accent, #3b82f6);
   outline-offset: -1px;
-  border-color: var(--accent, #3b82f6);
+  border-color: var(--link-color, #3b82f6);
 }
 .ch-key-input::placeholder { color: var(--text-muted); }
 .ch-key-input-wrap { margin-bottom: 4px; }
@@ -2485,7 +2711,7 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
   border-radius: 6px;
   flex: 0 0 auto;
 }
-.ch-analytics-link:hover { color: var(--accent); }
+.ch-analytics-link:hover { color: var(--link-color); }
 .ch-add-status--loading { color: var(--text-muted); }
 .ch-add-status--success { color: var(--success, #22c55e); }
 .ch-add-status--warn { color: var(--warning, #eab308); }
@@ -2557,8 +2783,8 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .analytics-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .analytics-table th { text-align: left; padding: 8px; border-bottom: 2px solid var(--border); font-size: 12px; text-transform: uppercase; color: var(--text-muted); }
 .analytics-table th.sortable { cursor: pointer; user-select: none; }
-.analytics-table th.sortable:hover { color: var(--accent); }
-.analytics-table th.sort-active { color: var(--accent); }
+.analytics-table th.sortable:hover { color: var(--link-color); }
+.analytics-table th.sort-active { color: var(--link-color); }
 .analytics-table th .sort-arrow { font-size: 10px; margin-left: 4px; opacity: 0.7; }
 .analytics-table td { padding: 8px; border-bottom: 1px solid var(--border); }
 .analytics-table .ch-section-row { background: var(--card-bg); }
@@ -2580,10 +2806,23 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .hash-bar-fill { height: 100%; border-radius: 4px; transition: width .3s; }
 .hash-cell.hash-active:hover { outline: 2px solid var(--accent); outline-offset: -2px; }
 .hash-cell.hash-selected { outline: 2px solid var(--accent); outline-offset: -2px; box-shadow: 0 0 6px var(--accent); }
-.hash-cell-empty  { background: var(--card-bg); color: var(--text-muted); }
-.hash-cell-taken  { background: var(--status-green); color: #fff; }
-.hash-cell-possible { background: var(--status-yellow); color: #fff; }
-.hash-cell-collision { color: #fff; }
+.hash-cell-empty  { background: var(--card-bg); color: var(--text-muted); font-size: 12px; font-weight: 500; }
+/* #1668-M4 r1: hash-cell semantic bgs carve out darker shades than the
+   --status-green / --status-yellow tokens so #fff text passes WCAG AA.
+   The status tokens themselves stay light (operator semantic "good"/"warn"
+   against page bg). Cell bgs need their own contrast budget vs #fff fg.
+   taken:    #22c55e (2.28:1) -> #15803d (green-700, 5.02:1)
+   possible: #eab308 (1.92:1) -> #854d0e (yellow-800, 6.85:1)
+   See test-issue-1668-m4-per-route.js hash-cell contrast block. */
+.hash-cell-taken    { background: #15803d; color: #fff; font-size: 12px; font-weight: 700; }
+.hash-cell-possible { background: #854d0e; color: #fff; font-size: 12px; font-weight: 700; }
+.hash-cell-collision { color: #fff; font-size: 12px; font-weight: 700; }
+/* #1668-M4 — per-route carve-outs.
+   Hash-grid cells use a SEMANTIC bg palette (green=taken, yellow=possible,
+   red-orange=collision). M2/M3 didn't fix these because the BG is the
+   encoding. We don't flatten it — instead we bump the TEXT weight to 600+
+   so 12px white-on-color clears AA (was 11px/400, M1 ~302 violations). */
+.hash-cell { font-size: 12px; font-weight: 600; }
 /* #1473 — First-byte 0x00 / 0xFF pubkeys are avoided by the MeshCore
    firmware keygen convention (NOT a protocol-level rejection):
    https://github.com/meshcore-dev/MeshCore/blob/8ede7641/examples/simple_repeater/main.cpp#L83
@@ -2609,19 +2848,23 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
   border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); padding: 8px 12px;
   font-size: 12px; min-width: 160px; max-width: 260px; pointer-events: none;
 }
-.hash-matrix-tooltip-hex { font-family: var(--mono); font-size: 13px; font-weight: 700; margin-bottom: 4px; color: var(--accent); }
+.hash-matrix-tooltip-hex { font-family: var(--mono); font-size: 13px; font-weight: 700; margin-bottom: 4px; color: var(--link-color); }
 .hash-matrix-tooltip-status { color: var(--text-muted); font-size: 11px; }
 .hash-matrix-tooltip-nodes { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
 .hash-byte-selector { display: flex; gap: 4px; }
 .hash-byte-btn { padding: 4px 12px; border-radius: 20px; border: 1px solid var(--border); background: var(--card-bg); color: var(--text-muted); font-size: 12px; font-weight: 600; cursor: pointer; transition: background .15s, color .15s; }
 .hash-byte-btn:hover { background: var(--border); color: var(--text); }
-.hash-byte-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.hash-byte-btn.active { background: var(--accent-strong); color: var(--text-on-accent); border-color: var(--accent-strong); }
 .hash-bar-value { min-width: 120px; text-align: right; font-size: 13px; font-weight: 600; }
-.badge-hash-1 { background: #ef444420; color: var(--status-red); }
-.badge-hash-2 { background: #22c55e20; color: var(--status-green); }
-.badge-success { background: #22c55e20; color: var(--status-green); }
-.badge-danger { background: #ef444420; color: var(--status-red); }
-.badge-hash-3 { background: #3b82f620; color: var(--accent); }
+/* #1668 M5 — was translucent-fg-on-tinted-bg (e.g. #ef4444 on #ef444420
+   stacked over surface ≈ 2-4:1, BLOCKER). Solid -700 hue with white text
+   preserves semantic encoding (red/green/blue) AND clears AA both themes:
+   #fff/#b91c1c=6.47, #fff/#15803d=5.02, #fff/#1d4ed8=6.70. */
+.badge-hash-1 { background: var(--palette-red-700, #b91c1c); color: var(--palette-gray-50, #f9fafb); }
+.badge-hash-2 { background: var(--palette-green-700, #15803d); color: var(--palette-gray-50, #f9fafb); }
+.badge-success { background: var(--palette-green-700, #15803d); color: var(--palette-gray-50, #f9fafb); }
+.badge-danger { background: var(--palette-red-700, #b91c1c); color: var(--palette-gray-50, #f9fafb); }
+.badge-hash-3 { background: var(--palette-blue-700, #1d4ed8); color: var(--palette-gray-50, #f9fafb); }
 .timeline-legend { display: flex; gap: 16px; justify-content: center; margin-top: 8px; font-size: 12px; }
 .legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
 .timeline-chart svg { display: block; }
@@ -2632,19 +2875,20 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 }
 .clickable-row { cursor: pointer; }
 .clickable-row:hover { background: var(--hover-bg, rgba(0,0,0,.04)); }
-.analytics-link { color: var(--accent); text-decoration: none; font-weight: 600; }
+.analytics-link { color: var(--link-color); text-decoration: none; font-weight: 600; }
 .analytics-link:hover { text-decoration: underline; }
 
 /* Analytics v2 */
 .analytics-tabs { display: flex; gap: 4px; margin-top: 12px; flex-wrap: wrap; }
-.tab-btn { padding: 6px 14px; border: 1px solid var(--border); border-radius: 6px; background: var(--card-bg); color: var(--text); cursor: pointer; font-size: 13px; transition: all .15s; }
+.tab-btn { padding: 6px 14px; border: 1px solid var(--border); border-radius: 6px; background: var(--card-bg); color: var(--text); cursor: pointer; font-size: 13px; font-weight: var(--fw-medium); transition: all .15s; } /* #1668 M3 — 13px + 500 floor */
 .tab-btn:hover { background: var(--hover-bg, rgba(0,0,0,.04)); }
-.tab-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* #1668 M2 — active tab was #fff on --accent (2.75:1 BLOCKER). */
+.tab-btn.active { background: var(--accent-strong); color: var(--text-on-accent); border-color: var(--accent-strong); }
 .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 240px)); gap: 12px; margin-bottom: 16px; }
 .stat-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px; text-align: center; }
 .stat-value { font-size: 24px; font-weight: 700; color: var(--text); }
-.stat-label { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
-.stat-detail { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.stat-label { font-size: 12px; font-weight: var(--fw-medium); color: var(--text-muted); margin-top: 2px; } /* #1668 M3 — added 500 weight */
+.stat-detail { font-size: 12px; font-weight: var(--fw-medium); color: var(--text-muted); margin-top: 2px; } /* #1668 M3 r1 — was 11px/400, below chip floor (adv #3) */
 .stat-spark { margin-top: 6px; display: flex; justify-content: center; }
 /* #1058 — Analytics rows: fluid + auto-stacking via CSS Grid `auto-fit`.
    Cards stack automatically when the row can't fit two columns at the
@@ -2662,8 +2906,8 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .rf-stats { display: flex; gap: 16px; flex-wrap: wrap; padding-top: 8px; font-size: 13px; }
 .payload-bars { display: flex; flex-direction: column; gap: 6px; }
 .payload-bar-row { display: flex; align-items: center; gap: 8px; }
-.payload-bar-label { min-width: 100px; font-size: 12px; display: flex; align-items: center; gap: 4px; }
-.payload-bar-value { min-width: 100px; text-align: right; font-size: 12px; }
+.payload-bar-label { min-width: 100px; font-size: 12px; font-weight: var(--fw-medium); display: flex; align-items: center; gap: 4px; } /* #1668 M3 — added 500 weight */
+.payload-bar-value { min-width: 100px; text-align: right; font-size: 12px; font-weight: var(--fw-medium); } /* #1668 M3 r1 — match .payload-bar-label weight (adv #1) */
 .repeater-list { display: flex; flex-direction: column; gap: 4px; }
 .repeater-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
 .repeater-name { min-width: 140px; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2733,7 +2977,8 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
   transition: background 0.1s;
 }
 .node-filter-option:hover { background: var(--surface-2, rgba(255,255,255,0.08)); }
-.node-filter-option.node-filter-active { background: var(--accent); color: #fff; }
+/* .node-filter-option.node-filter-active — #1719 round-1 polish: bg/color
+   consolidated into the .btn-active-accent rule. */
 
 /* Hide low-value columns on mobile */
 @media (max-width: 640px) {
@@ -2742,7 +2987,7 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 
 /* Clickable hop links */
 .hop-link {
-  color: var(--accent, #3b82f6);
+  color: var(--link-color, #3b82f6);
   text-decoration: none;
   cursor: pointer;
   transition: color 0.15s;
@@ -2804,11 +3049,16 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .hop-conflict-name { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hop-conflict-dist { font-size: 11px; color: var(--text-muted); font-family: var(--mono); white-space: nowrap; }
 .hop-conflict-pk { font-size: 10px; color: var(--text-muted); font-family: var(--mono); }
-.hop-unreliable { opacity: 0.85; }
+/* #1668 M5 — was opacity:0.85; dropped fg #f9fafb on accent-strong
+   #2563eb to 4.45:1 (BLOCKER). The adjacent .hop-unreliable-btn (status
+   yellow warning glyph) is the redundant non-color signal that this hop
+   is dubious — opacity haze was over-encoding it. Remove the haze; the
+   warning icon stays as the visual marker. */
+.hop-unreliable { font-style: italic; }
 .hop-unreliable-btn { background: none; border: none; color: var(--status-yellow, #f59e0b); font-size: 13px;
   cursor: help; vertical-align: middle; margin-left: 2px; padding: 0 2px; line-height: 1; }
 .hop-global-fallback { border-bottom: 1px dashed var(--status-red); }
-.hop-current { font-weight: 700 !important; color: var(--accent) !important; }
+.hop-current { font-weight: 700 !important; color: var(--link-color) !important; }
 
 /* Self-loop subpath rows */
 .subpath-selfloop { opacity: 0.6; }
@@ -2826,8 +3076,22 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 .subpath-meta { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em; }
 .subpath-section { margin: 16px 0; }
 .subpath-section h5 { margin: 0 0 6px; font-size: 0.9em; }
-.subpath-selected { background: var(--accent, #3b82f6) !important; color: #fff; }
-.subpath-selected .hop-prefix { color: rgba(255,255,255,0.6); }
+/* #1705 — was background:var(--accent) (#4a9eff) + color:#fff = 2.75:1, and
+   the muted hop-prefix line at rgba(255,255,255,0.6) composited over that
+   accent to 1.87:1 (hard BLOCKER). Pin the row to --accent-strong
+   (#2563eb, palette-blue-600) with --text-on-accent (#f9fafb): primary
+   text 4.95:1, hop-prefix at --text-on-accent (full alpha) on the same
+   bg = 4.95:1 — clears WCAG AA (≥4.5:1). The hop-prefix used to be
+   visually "muted" via 60% alpha white; we drop the alpha-muting because
+   no other token in either theme composites to ≥4.5:1 on this background.
+   Trade-off accepted: the prefix and primary line are now equal-weight
+   visually — the previous secondary styling was itself the source of the
+   1.87:1 BLOCKER, so visual hierarchy here is recovered via type/weight,
+   not color.
+   #1719 polish r1: !important on color also, to consolidate with
+   .btn-active-accent override pattern. */
+.subpath-selected { background: var(--accent-strong) !important; color: var(--text-on-accent) !important; }
+.subpath-selected .hop-prefix { color: var(--text-on-accent); }
 tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 
 /* Hour distribution chart */
@@ -2882,7 +3146,7 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 /* Subpath jump nav */
 .subpath-jump-nav { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; font-size: 0.9em; flex-wrap: wrap; }
 .subpath-jump-nav span { color: var(--text-muted); }
-.subpath-jump-nav a { padding: 4px 12px; border-radius: 4px; background: var(--accent, #3b82f6); color: #fff; text-decoration: none; font-size: 0.85em; }
+.subpath-jump-nav a { padding: 4px 12px; border-radius: 4px; text-decoration: none; font-size: 0.85em; }
 .subpath-jump-nav a:hover { opacity: 0.8; }
 
 /* Route patterns table breathing room */
@@ -3101,7 +3365,8 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 .analytics-heatmap-label { font-size: 10px; color: var(--text-muted); display: flex; align-items: center; }
 .analytics-time-range { display: flex; gap: 8px; margin-bottom: 16px; }
 .analytics-time-range button { padding: 4px 12px; border-radius: 4px; border: 1px solid var(--border); background: var(--card-bg); color: var(--text); cursor: pointer; font-size: 12px; }
-.analytics-time-range button.active { background: var(--accent); color: white; border-color: var(--accent); }
+/* .analytics-time-range button.active — #1719 round-1 polish: bg/color
+   consolidated into the .btn-active-accent rule. */
 .analytics-peer-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .analytics-peer-table th { text-align: left; padding: 6px 8px; border-bottom: 2px solid var(--border); color: var(--text-muted); font-size: 11px; text-transform: uppercase; }
 .analytics-peer-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
@@ -3176,10 +3441,13 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
   flex-shrink: 0;
 }
 .region-pill:hover { border-color: var(--accent); color: var(--accent); }
+/* #1668 M5 — was bg:var(--accent)(#4a9eff) + #fff = 2.75:1 BLOCKER on both themes.
+   Bumped to --accent-strong (#2563eb) + --text-on-accent for 4.83:1 AA pass.
+   Same M2 token pair used for .skip-link / .hop-named / .filter-bar .btn.active. */
 button.region-pill-active {
-  background: var(--accent); color: #fff; border-color: var(--accent);
+  background: var(--accent-strong); color: var(--text-on-accent); border-color: var(--accent-strong);
 }
-button.region-pill-active:hover { opacity: 0.85; color: #fff; }
+button.region-pill-active:hover { opacity: 0.85; color: var(--text-on-accent); }
 .region-filter-label {
   font-size: 12px; font-weight: 600; color: var(--text-muted); align-self: center;
   margin-right: 2px; user-select: none; white-space: nowrap; flex-shrink: 0;
@@ -3247,7 +3515,7 @@ button.region-pill-active:hover { opacity: 0.85; color: #fff; }
 }
 .multi-select-item:hover { background: var(--row-hover, #f5f5f5); }
 
-.chan-tag { background: var(--accent, #3b82f6); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 0.9em; font-weight: 600; }
+.chan-tag { background: var(--accent-strong, #2563eb); color: var(--text-on-accent, #f9fafb); padding: 2px 8px; border-radius: 4px; font-size: 0.9em; font-weight: 600; }
 
 /* Matrix mode hex animation */
 .matrix-char { background: none !important; border: none !important; }
@@ -3502,7 +3770,7 @@ button.region-pill-active:hover { opacity: 0.85; color: #fff; }
   color: var(--text-muted);
   margin: 0 0 var(--space-md);
 }
-.compare-breadcrumbs a { color: var(--accent); text-decoration: none; }
+.compare-breadcrumbs a { color: var(--link-color); text-decoration: none; }
 .compare-breadcrumbs a:hover { text-decoration: underline; }
 
 .compare-controls {
@@ -3546,11 +3814,14 @@ button.region-pill-active:hover { opacity: 0.85; color: #fff; }
 }
 .compare-select:focus { border-color: var(--accent); outline: none; }
 .compare-vs {
-  font-size: 10px; font-weight: 700; color: var(--text-muted);
+  /* #1668 M5 — was font-size:10px+color:var(--text-muted)+opacity:0.7
+     → composite color #8c929b on white = 3.13:1 (BLOCKER). Removed the
+     opacity haze AND bumped from text-muted to text (full theme color)
+     so the 'vs' lives in the same readable band as adjacent labels. */
+  font-size: 10px; font-weight: 700; color: var(--text);
   text-transform: uppercase; letter-spacing: 1.2px;
   padding: 0 4px;
   align-self: center;
-  opacity: 0.7;
 }
 /* The Compare CTA was removed in #1646 — comparison auto-runs when
  * both observers are chosen. The legacy .compare-btn touch-target
@@ -3861,7 +4132,27 @@ button.region-pill-active:hover { opacity: 0.85; color: #fff; }
   cursor: pointer; font-size: 12px; transition: background 0.15s;
 }
 .rf-range-btn:hover { background: var(--bg-hover, #333); }
-.rf-range-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* #1719 — consolidated active-button accent: was background:var(--accent)
+   (#4a9eff) + color:#fff = 2.75:1 (BLOCKER × N selectors). All four
+   recurring sites (.rf-range-btn.active, .clock-filter-btn.active,
+   .subpath-jump-nav a, inline ptCheckBtn / ptGenBtn) now route through
+   the shared `.btn-active-accent` style or this same token pair so a
+   future regression is fixable in one place. --accent-strong
+   (#2563eb) + --text-on-accent (#f9fafb) = 8.59:1 (AA pass). */
+.btn-active-accent,
+.rf-range-btn.active,
+.clock-filter-btn.active,
+.subpath-jump-nav a,
+/* #1719 round-1 polish: three additional active-state surfaces
+   consolidated here. Their inline `background:var(--accent); color:#fff`
+   rules (2.75:1) are removed below — they now inherit this token pair. */
+.node-filter-option.node-filter-active,
+.subpath-selected,
+.analytics-time-range button.active {
+  background: var(--accent-strong);
+  color: var(--text-on-accent);
+  border-color: var(--accent-strong);
+}
 .rf-custom-inputs { display: inline-flex; gap: 4px; align-items: center; margin-left: 8px; }
 .rf-datetime {
   padding: 3px 6px; border: 1px solid var(--border); border-radius: 4px;
@@ -4110,12 +4401,12 @@ th.sort-active { color: var(--accent, #60a5fa); }
 .sort-arrow { font-size: 0.75em; opacity: 0.8; }
 
 /* #690 — Clock Skew badges & fleet table */
-.skew-badge { display: inline-block; font-size: 10px; padding: 1px 5px; border-radius: 3px; margin-left: 4px; font-weight: 600; white-space: nowrap; }
+.skew-badge { display: inline-block; font-size: 12px; padding: 1px 6px; border-radius: 3px; margin-left: 4px; font-weight: var(--fw-semibold); white-space: nowrap; } /* #1668 M3 — was 10px */
 .skew-badge--ok { background: var(--status-green); color: #fff; }
 .skew-badge--warning { background: var(--status-yellow); color: #000; }
 .skew-badge--critical { background: var(--status-orange); color: #fff; }
 .skew-badge--absurd { background: var(--status-purple); color: #fff; }
-.skew-badge--no_clock { background: var(--text-muted); color: #fff; }
+.skew-badge--no_clock { background: var(--skew-badge-no-clock-bg); color: #fff; }
 .skew-badge--bimodal_clock { background: var(--status-amber-light); color: var(--status-amber-text); border: 1px solid var(--status-amber); }
 
 .skew-detail-section { padding: 10px 16px; margin-bottom: 8px; }
@@ -4129,7 +4420,6 @@ th.sort-active { color: var(--accent, #60a5fa); }
 .clock-fleet-row--no_clock { background: color-mix(in srgb, var(--text-muted) 10%, transparent); }
 
 .clock-filter-btn { font-size: 12px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--card-bg, #fff); color: var(--text); cursor: pointer; margin-right: 4px; }
-.clock-filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 
 /* === Path Inspector (issue #944) === */
 .path-inspector-page { padding: 16px; max-width: 900px; margin: 0 auto; }
@@ -4415,10 +4705,10 @@ body[data-cb-preset="achromat"] {
 
 /* === #1034 PR1: Channel Add modal + sectioned sidebar === */
 .ch-add-channel-btn {
-  background: var(--accent, #2563eb); color: #fff; border: none;
+  background: var(--accent-strong, #2563eb); color: var(--text-on-accent, #f9fafb); border: none;
   padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600;
 }
-.ch-add-channel-btn:hover { background: var(--accent-hover, #1d4ed8); }
+.ch-add-channel-btn:hover { background: var(--palette-blue-700, #1d4ed8); }
 
 .ch-modal-overlay { z-index: 1100; }
 .ch-modal-overlay.hidden { display: none; }
@@ -5208,3 +5498,60 @@ body.embed #app.app-fixed {
   min-width: 1.6em;
   font-weight: 600;
 }
+
+/* ============================================================
+ * warmup-banner.js (#1660) — global server warm-up status pill.
+ * a11y: role="status" live region in JS; CSS makes it visible.
+ * All colors via CSS variables — customizer-safe.
+ * ============================================================ */
+.warmup-banner {
+  position: sticky;
+  top: 0;
+  z-index: 9000;
+  background: var(--warn-bg, #fef3c7);
+  color: var(--warn-text, #92400e);
+  border-bottom: 1px solid var(--warning, #eab308);
+  font-size: 0.9rem;
+  line-height: 1.4;
+  transition: opacity 0.4s ease, max-height 0.4s ease;
+  opacity: 1;
+  max-height: 240px;
+  overflow: hidden;
+}
+.warmup-banner--hidden {
+  opacity: 0;
+  max-height: 0;
+  border-bottom-width: 0;
+  pointer-events: none;
+}
+.warmup-banner__inner {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 0.4rem 1rem;
+}
+.warmup-banner__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.warmup-banner__item {
+  margin: 0;
+  padding: 0.1rem 0;
+}
+
+/* ============================================================
+ * #1715 — Neighbor-graph role swatches (`#ngRoleChecks` labels).
+ *
+ * Replaces inline `style="color:#..."` spans (which bypassed the
+ * theme tokens entirely and produced different contrast results
+ * on light vs dark) with class-based DOM. The `--role-*` tokens
+ * are defined per-theme in :root + [data-theme="dark"] above and
+ * clear WCAG AA ≥4.5:1 against #ffffff (light) and #1a1a2e (dark).
+ * Never reintroduce inline color hex on these swatches.
+ * ============================================================ */
+.role-swatch        { color: var(--text, inherit); }
+.role-swatch--repeater  { color: var(--role-repeater); }
+.role-swatch--companion { color: var(--role-companion); }
+.role-swatch--room      { color: var(--role-room); }
+.role-swatch--sensor    { color: var(--role-sensor); }
+.role-swatch--observer  { color: var(--role-observer); }

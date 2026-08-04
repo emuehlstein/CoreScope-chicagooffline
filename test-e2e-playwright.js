@@ -513,6 +513,114 @@ async function run() {
     assert(rowsAfter.length > 0, 'No packets after filtering');
   });
 
+  // Test (#1791): "Group Data" (payload_type=6) appears in the message-type
+  // filter checklist and selecting it narrows the table to type-6 rows only.
+  await test('Packets type filter includes Group Data (#1791)', async () => {
+    // Selector shared across assertion + interaction; keep in one place.
+    const TYPE_6_CHECKBOX_SEL = '#typeMenu input[data-type-id="6"]';
+    // Wide time window so the seeded GRP_DATA fixture row is included.
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto(`${BASE}/#/packets`, { waitUntil: 'domcontentloaded' });
+    await page.evaluate(() => {
+      localStorage.setItem('meshcore-time-window', '525600');
+      localStorage.removeItem('meshcore-type-filter');
+    });
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForSelector('[data-loaded="true"]', { timeout: 15000 });
+    await page.waitForSelector('table tbody tr:not([id^=vscroll])', { timeout: 15000 });
+
+    // Open the type multi-select menu.
+    const typeTrigger = await page.$('#typeTrigger');
+    assert(typeTrigger, 'Type filter trigger (#typeTrigger) not found');
+    await typeTrigger.click();
+    await page.waitForSelector('#typeMenu.open', { timeout: 5000 });
+
+    // Assert the Group Data checkbox exists (regression: was missing in #1791).
+    const grpDataCheckbox = await page.$(TYPE_6_CHECKBOX_SEL);
+    assert(grpDataCheckbox, '#1791: "Group Data" (data-type-id="6") checkbox missing from type filter menu');
+    const grpDataLabel = await page.$eval(TYPE_6_CHECKBOX_SEL, el => (el.parentElement && el.parentElement.textContent || '').trim());
+    // Strict equality: the rendered label must be exactly "Group Data"
+    // (no casing/whitespace drift) to guard against silent renames.
+    assert(grpDataLabel === 'Group Data', `#1791: checkbox for type 6 should be labeled exactly "Group Data", got "${grpDataLabel}"`);
+
+    // Select only Group Data and verify the table narrows to type-6 rows.
+    await grpDataCheckbox.click();
+    // Filter is applied via renderTableRows synchronously; allow a frame for DOM swap.
+    await page.waitForFunction(() => {
+      const rows = document.querySelectorAll('#pktBody tr:not([id^=vscroll])');
+      if (rows.length === 0) return false;
+      // Every visible row should show the Group Data badge.
+      return Array.from(rows).every(r => {
+        const badge = r.querySelector('.col-type .badge');
+        return badge && /Group Data/i.test(badge.textContent || '');
+      });
+    }, { timeout: 5000 });
+
+    const badgeTexts = await page.$$eval('#pktBody tr:not([id^=vscroll]) .col-type .badge', els => els.map(e => e.textContent.trim()));
+    assert(badgeTexts.length > 0, '#1791: expected at least one Group Data row after filter');
+    const nonGrp = badgeTexts.filter(t => !/Group Data/i.test(t));
+    assert(nonGrp.length === 0, `#1791: type filter should yield only Group Data rows, found other types: ${nonGrp.join(',')}`);
+
+    // Cleanup: close the open #typeMenu, clear all localStorage keys this
+    // test set, and reload so the in-memory `selectedTypes` Set is reset
+    // for subsequent tests (clearing localStorage alone leaks state).
+    await typeTrigger.click();
+    await page.waitForSelector('#typeMenu:not(.open)', { timeout: 5000 }).catch(() => {});
+    await page.evaluate(() => {
+      localStorage.removeItem('meshcore-type-filter');
+      localStorage.removeItem('meshcore-time-window');
+    });
+    await page.reload({ waitUntil: 'load' });
+  });
+
+  // Test (#1798): The Packets-page type checklist must include the three
+  // firmware payload types currently missing from `typeMap` in `public/packets.js`:
+  //   10 — Multipart
+  //   11 — Control
+  //   15 — Raw Custom
+  // Other surfaces (`packet-filter.js`, `live.js`, `map.js`) already know about
+  // these three types; only the Packets checklist UI omits them. This regression
+  // test renders the checklist and asserts each new `data-type-id` checkbox is
+  // present with the expected label.
+  await test('Packets type filter includes Multipart/Control/Raw Custom (#1798)', async () => {
+    const EXPECTED = [
+      { id: '10', label: 'Multipart' },
+      { id: '11', label: 'Control' },
+      { id: '15', label: 'Raw Custom' },
+    ];
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto(`${BASE}/#/packets`, { waitUntil: 'domcontentloaded' });
+    await page.evaluate(() => {
+      localStorage.setItem('meshcore-time-window', '525600');
+      localStorage.removeItem('meshcore-type-filter');
+    });
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForSelector('[data-loaded="true"]', { timeout: 15000 });
+
+    // Open the type multi-select menu.
+    const typeTrigger = await page.$('#typeTrigger');
+    assert(typeTrigger, 'Type filter trigger (#typeTrigger) not found');
+    await typeTrigger.click();
+    await page.waitForSelector('#typeMenu.open', { timeout: 5000 });
+
+    for (const { id, label } of EXPECTED) {
+      const sel = `#typeMenu input[data-type-id="${id}"]`;
+      const cb = await page.$(sel);
+      assert(cb, `#1798: checkbox for data-type-id="${id}" (${label}) missing from type filter menu`);
+      const rendered = await page.$eval(sel, el => (el.parentElement && el.parentElement.textContent || '').trim());
+      assert(rendered === label, `#1798: checkbox for type ${id} should be labeled exactly "${label}", got "${rendered}"`);
+    }
+
+    // Cleanup: close menu and reset state for subsequent tests.
+    await typeTrigger.click();
+    await page.waitForSelector('#typeMenu:not(.open)', { timeout: 5000 }).catch(() => {});
+    await page.evaluate(() => {
+      localStorage.removeItem('meshcore-type-filter');
+      localStorage.removeItem('meshcore-time-window');
+    });
+    await page.reload({ waitUntil: 'load' });
+  });
+
   await test('Packets initial fetch honors persisted time window', async () => {
     // Set persisted time window to 60 min and reload so the IIFE reads it
     await page.evaluate(() => localStorage.setItem('meshcore-time-window', '60'));
@@ -3404,28 +3512,29 @@ async function run() {
     }
   });
 
-  await test('#1528 .vcr-scope-btn.active background tracks --accent-bg (token swap, not blue literal)', async () => {
+  await test('#1528 .vcr-scope-btn.active background tracks --accent-strong (token swap, not blue literal)', async () => {
+    // M4 #1668 swapped this rule from --accent-bg → --accent-strong to clear an
+    // AA contrast BLOCKER (2.98:1 on the wash). Both background and border now
+    // consume --accent-strong, so the test overrides that single token and
+    // asserts both properties follow it. Intent is unchanged: prove the rule
+    // tracks a token, not a hardcoded rgba(59,130,246,...) literal.
     await page.goto(`${BASE}/#/live`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('.vcr-scope-btn.active', { timeout: 8000 });
     const result = await page.evaluate(() => {
       const el = document.querySelector('.vcr-scope-btn.active');
-      // Override --accent-bg with a clearly non-blue sentinel so we can detect
-      // whether the rule actually consumes the token (good) or a hardcoded
-      // rgba(59,130,246,...) literal (bad — the theming illusion this fix targets).
-      // Use !important so we beat any customizer-injected :root override.
-      document.documentElement.style.setProperty('--accent-bg', 'rgb(255, 0, 0)', 'important');
-      document.documentElement.style.setProperty('--accent-border', 'rgb(0, 200, 0)', 'important');
+      // Override --accent-strong with a clearly non-blue sentinel. Use !important
+      // so we beat any customizer-injected :root override.
+      document.documentElement.style.setProperty('--accent-strong', 'rgb(255, 0, 0)', 'important');
       const bg = window.getComputedStyle(el).backgroundColor;
       const border = window.getComputedStyle(el).borderColor;
-      document.documentElement.style.removeProperty('--accent-bg');
-      document.documentElement.style.removeProperty('--accent-border');
+      document.documentElement.style.removeProperty('--accent-strong');
       return { bg, border };
     });
-    // Background should reflect our sentinel red, not blue.
+    // Both background and border should reflect our sentinel red, not blue.
     assert(/^rgb\(255,\s*0,\s*0\)/.test(result.bg),
-      `.vcr-scope-btn.active bg should track --accent-bg, got ${result.bg}`);
-    assert(/^rgb\(0,\s*200,\s*0\)/.test(result.border),
-      `.vcr-scope-btn.active border should track --accent-border, got ${result.border}`);
+      `.vcr-scope-btn.active bg should track --accent-strong, got ${result.bg}`);
+    assert(/^rgb\(255,\s*0,\s*0\)/.test(result.border),
+      `.vcr-scope-btn.active border should track --accent-strong, got ${result.border}`);
   });
 
   await browser.close();

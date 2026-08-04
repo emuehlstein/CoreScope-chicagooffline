@@ -88,6 +88,15 @@ func Apply(rw *sql.DB, logf Logger) error {
 	if err := ensureObserverCanRelaySeenColumn(rw, logf); err != nil {
 		return fmt.Errorf("ensure observers.can_relay_seen: %w", err)
 	}
+	// #1690: denormalized last_seen on transmissions so cold-load filters
+	// on effective recency rather than first-ever first_seen. The column
+	// add + index creation are cheap (single ALTER, indexed INTEGER
+	// column); the *backfill* from observations is potentially expensive
+	// and runs via RunAsyncMigration from the ingestor (see
+	// cmd/ingestor/db.go OpenStore).
+	if err := ensureTransmissionsLastSeenColumn(rw, logf); err != nil {
+		return fmt.Errorf("ensure transmissions.last_seen: %w", err)
+	}
 	return nil
 }
 
@@ -126,6 +135,10 @@ func AssertReady(ro *sql.DB) error {
 	mustCol("nodes", "foreign_advert")
 	mustCol("inactive_nodes", "foreign_advert")
 	mustCol("transmissions", "from_pubkey")
+	// #1690: denormalized recency axis for cold-load. Owned by ingestor
+	// (cmd/ingestor/db.go OpenStore: ALTER + index + async backfill);
+	// server reads it to filter the hot-window query.
+	mustCol("transmissions", "last_seen")
 	// #1321: server's detectSchema PRAGMA-detects these and caches a
 	// boolean. To kill the startup race they're owned + asserted here.
 	mustCol("transmissions", "scope_name")
@@ -584,5 +597,51 @@ func ensureObserverCanRelaySeenColumn(rw *sql.DB, logf Logger) error {
 		return err
 	}
 	logf("[dbschema] added can_relay_seen column to observers")
+	return nil
+}
+
+// ensureTransmissionsLastSeenColumn adds transmissions.last_seen (#1690),
+// the denormalized "most recent observation timestamp" column the cold-load
+// path filters on. Without it, hot-window queries that match
+// `first_seen >= cutoff` exclude long-lived hashes whose hashes were first
+// inserted weeks ago but are still active — see the issue for the full
+// 0.3%-of-DB-loaded post-mortem.
+//
+// The backfill from `MAX(observations.timestamp) GROUP BY transmission_id`
+// is potentially expensive (1.9M+ obs rows in prod) and runs as a separate
+// async migration scheduled by cmd/ingestor/db.go::OpenStore via
+// Store.RunAsyncMigration.
+func ensureTransmissionsLastSeenColumn(rw *sql.DB, logf Logger) error {
+	if err := ensureMigrationsTable(rw); err != nil {
+		return err
+	}
+	has, err := TableHasColumn(rw, "transmissions", "last_seen")
+	if err != nil {
+		return err
+	}
+	if !has {
+		// PREFLIGHT: async=true reason="single-column ALTER TABLE on transmissions; DEFAULT 0 is a constant so SQLite does a metadata-only schema rewrite (no row scan) — cheap at any scale"
+		if _, err := rw.Exec(`ALTER TABLE transmissions ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("alter transmissions add last_seen: %w", err)
+		}
+		logf("[dbschema] added last_seen column to transmissions (#1690)")
+	}
+	// #1740 step (a): create the PARTIAL index first. Scans only rows with
+	// last_seen=0 — i.e. the un-backfilled hot subset the chunked backfill
+	// MAX(id) lookup walks. Degenerates to near-empty once the backfill
+	// converges, so it stops competing for page cache.
+	//
+	// PREFLIGHT: async=false reason="partial index on `WHERE last_seen=0`; subset is bounded by un-backfilled rows (≤0 in steady state, ≤ingest-rate during ops) — cheap at any scale even on a 1.9M-row prod table"
+	if _, err := rw.Exec(`CREATE INDEX IF NOT EXISTS idx_tx_last_seen_zero ON transmissions(id) WHERE last_seen=0`); err != nil {
+		return fmt.Errorf("create idx_tx_last_seen_zero: %w", err)
+	}
+	// #1740 step (b): gated DROP of the legacy full index. Only runs AFTER
+	// step (a) succeeded (sequential — we're past the CREATE above). The
+	// DROP is a metadata-only schema rewrite in SQLite; no row scan.
+	//
+	// PREFLIGHT: async=false reason="DROP INDEX is metadata-only in SQLite (no row scan, no rewrite); safe inline at any DB size"
+	if _, err := rw.Exec(`DROP INDEX IF EXISTS idx_tx_last_seen`); err != nil {
+		return fmt.Errorf("drop legacy idx_tx_last_seen: %w", err)
+	}
 	return nil
 }

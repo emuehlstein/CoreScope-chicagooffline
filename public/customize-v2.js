@@ -245,7 +245,7 @@
       nodeColors: { repeater: '#ff0000', companion: '#0066ff', room: '#009900', sensor: '#cc8800', observer: '#9933ff' },
       typeColors: {
         ADVERT: '#009900', GRP_TXT: '#0066ff', TXT_MSG: '#cc8800', ACK: '#666666',
-        REQUEST: '#9933ff', RESPONSE: '#0099cc', TRACE: '#cc0066', PATH: '#009999', ANON_REQ: '#cc3355'
+        REQ: '#9933ff', RESPONSE: '#0099cc', TRACE: '#cc0066', PATH: '#009999', ANON_REQ: '#cc3355'
       }
     },
     midnight: {
@@ -328,19 +328,35 @@
   };
   var NODE_EMOJI = { repeater: 'ph:diamond', companion: 'ph:circle-fill', room: 'ph:square-fill', sensor: 'ph:triangle', observer: 'ph:star-fill' };
 
-  var TYPE_LABELS = {
-    ADVERT: 'Advertisement', GRP_TXT: 'Channel Message', TXT_MSG: 'Direct Message', ACK: 'Acknowledgment',
-    REQUEST: 'Request', RESPONSE: 'Response', TRACE: 'Traceroute', PATH: 'Path', ANON_REQ: 'Anonymous Request'
-  };
+  // PR #1804 r1 item 3 (tufte3): consume canonical PayloadLabels shorts so
+  // the v2 customizer matches every other surface. Defensive literal
+  // fallback mirrors packets.js.
+  var TYPE_LABELS = (function () {
+    var FALLBACK = {
+      ADVERT: 'Advert', GRP_TXT: 'Channel Msg', TXT_MSG: 'Direct Msg', ACK: 'ACK',
+      REQ: 'Request', RESPONSE: 'Response', TRACE: 'Trace', PATH: 'Path',
+      ANON_REQ: 'Anon Req'
+    };
+    var PL = window.PayloadLabels;
+    if (!PL || !PL.SHORT_BY_ID) {
+      console.error('customize-v2.js: window.PayloadLabels missing — using inline TYPE_LABELS fallback.');
+      return FALLBACK;
+    }
+    var out = {};
+    for (var k in FALLBACK) {
+      out[k] = (PL[k] && PL[k].short) || FALLBACK[k];
+    }
+    return out;
+  })();
   var TYPE_HINTS = {
     ADVERT: 'Node advertisements', GRP_TXT: 'Group/channel messages', TXT_MSG: 'Direct messages',
-    ACK: 'Acknowledgments', REQUEST: 'Requests', RESPONSE: 'Responses',
+    ACK: 'Acknowledgments', REQ: 'Requests', RESPONSE: 'Responses',
     TRACE: 'Traceroute', PATH: 'Path packets', ANON_REQ: 'Encrypted anonymous requests'
   };
   // #1648 M5: defaults use 'ph:<name>' tokens. renderConfigGlyph() below
   // accepts both new ph tokens AND legacy emoji strings (back-compat).
   var TYPE_EMOJI = {
-    ADVERT: 'ph:broadcast', GRP_TXT: 'ph:chat-circle', TXT_MSG: 'ph:envelope', ACK: 'ph:check', REQUEST: 'ph:question',
+    ADVERT: 'ph:broadcast', GRP_TXT: 'ph:chat-circle', TXT_MSG: 'ph:envelope', ACK: 'ph:check', REQ: 'ph:question',
     RESPONSE: 'ph:envelope-simple', TRACE: 'ph:magnifying-glass', PATH: 'ph:path', ANON_REQ: 'ph:lock'
   };
 
@@ -710,8 +726,12 @@
     var tc = effectiveConfig.typeColors;
     if (tc) {
       for (var type in tc) {
-        root.setProperty('--type-' + type.toLowerCase(), tc[type]);
-        if (window.TYPE_COLORS && type in window.TYPE_COLORS) window.TYPE_COLORS[type] = tc[type];
+        // #1799 r1 item 6: legacy stored configs use 'REQUEST'; canonical
+        // key is 'REQ'. Migrate at read time so operator color choices
+        // survive the rename.
+        var canon = (type === 'REQUEST') ? 'REQ' : type;
+        root.setProperty('--type-' + canon.toLowerCase(), tc[type]);
+        if (window.TYPE_COLORS && canon in window.TYPE_COLORS) window.TYPE_COLORS[canon] = tc[type];
       }
       if (window.syncBadgeColors) window.syncBadgeColors();
     }
@@ -1123,7 +1143,7 @@
       '.cust-tab{padding:8px 10px;cursor:pointer;border:none;background:none;color:var(--text-muted);font-size:12px;font-weight:500;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;flex:1;text-align:center}',
       '.cust-tab-text{font-size:10px;display:block}',
       '.cust-tab:hover{color:var(--text)}',
-      '.cust-tab.active{color:var(--accent);border-bottom-color:var(--accent)}',
+      '.cust-tab.active{color:var(--link-color);border-bottom-color:var(--accent)}',
       '.cust-tab .cv2-tab-badge{font-size:9px;background:var(--accent);color:#fff;border-radius:8px;padding:0 4px;margin-left:2px}',
       '.cust-panel{display:none;padding:12px 16px}',
       '.cust-panel.active{display:block}',
@@ -1137,7 +1157,7 @@
       '.cust-hint{font-size:10px;color:var(--text-muted);margin-top:1px;line-height:1.2}',
       '.cust-color-row input[type="color"]{width:40px;height:32px;border:1px solid var(--border);border-radius:6px;cursor:pointer;padding:2px;background:var(--input-bg)}',
       '.cust-color-row .cust-hex{font-family:var(--mono);font-size:12px;color:var(--text-muted);min-width:70px}',
-      '.cv2-override-dot{color:var(--accent);cursor:pointer;font-size:10px;margin-left:4px;vertical-align:middle;title:"Reset to server default"}',
+      '.cv2-override-dot{color:var(--link-color);cursor:pointer;font-size:10px;margin-left:4px;vertical-align:middle;title:"Reset to server default"}',
       '.cv2-override-dot:hover{color:var(--status-red)}',
       '.cust-node-dot{display:inline-block;width:16px;height:16px;border-radius:50%;vertical-align:middle}',
       '.cust-preview-img{max-width:200px;max-height:60px;margin-top:6px;border-radius:6px;border:1px solid var(--border)}',
@@ -1153,7 +1173,7 @@
       '.cust-list-btn:hover{background:var(--surface-3)}',
       '.cust-list-btn.danger{color:#ef4444}',
       '.cust-list-btn.danger:hover{background:#fef2f2}',
-      '.cust-add-btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:1px dashed var(--border);border-radius:6px;background:none;color:var(--accent);cursor:pointer;font-size:13px;margin-top:4px}',
+      '.cust-add-btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:1px dashed var(--border);border-radius:6px;background:none;color:var(--link-color);cursor:pointer;font-size:13px;margin-top:4px}',
       '.cust-add-btn:hover{background:var(--hover-bg)}',
       '.cust-export-btns{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}',
       '.cust-export-btns button{padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500}',
@@ -1567,8 +1587,29 @@
       '<p style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Re-show first-visit gesture discoverability hints (swipe rows, swipe tabs, edge-swipe drawer, pull-to-refresh).</p>' +
       '<button type="button" class="cust-dl-btn" data-cv2-reset-hints data-reset-gesture-hints>↺ Reset gesture hints</button>' +
       _renderChannelsShowEncryptedToggle() +
+      _renderHide1ByteHopsToggle() +
       _renderTileProviderSelector() +
     '</div>';
+  }
+
+  // ── #1633 Hide 1-byte path hops toggle ──
+  // Writes localStorage["meshcore-hide-1byte-hops"]. Default OFF: key is
+  // removed (not "false") so MC_getHide1ByteHops cleanly returns false.
+  // Fires `mc-hide-1byte-hops-changed`; map.js + packets.js subscribe and
+  // re-render in place (PR #1689 r1 adv #4). Analytics + route-view rebuild
+  // on next navigation — they don't need live wiring because they re-render
+  // on tab activation.
+  function _renderHide1ByteHopsToggle() {
+    var on = false;
+    try { on = localStorage.getItem('meshcore-hide-1byte-hops') === 'true'; } catch (_e) {}
+    return '<p class="cust-section-title" style="font-size:14px;margin:16px 0 8px">Path Display</p>' +
+      '<p class="cust-hint" style="font-size:12px;color:var(--text-muted);margin-bottom:8px">1-byte path-hash prefixes (firmware default) collide ~8-way at ~2k relays — many polylines and route-pattern rows they produce are visual noise. Hide them globally without changing what\'s stored.</p>' +
+      '<div class="cust-field" style="display:flex;align-items:center;gap:8px">' +
+        '<input type="checkbox" id="cv2-hide-1byte-hops" data-cv2-hide-1byte-hops' +
+          (on ? ' checked' : '') +
+          ' style="width:16px;height:16px;cursor:pointer">' +
+        '<label for="cv2-hide-1byte-hops" style="cursor:pointer;margin:0">Hide short (1-byte) path-hash hops</label>' +
+      '</div>';
   }
 
   // ── #1454 Show-encrypted-channels toggle ──
@@ -2084,7 +2125,7 @@
       '</details>' +
       '<p class="cust-section-title" style="margin-top:20px">Tools</p>' +
       '<p style="font-size:12px;color:var(--text-muted);margin-bottom:10px">Server-side configuration helpers.</p>' +
-      '<a href="/geofilter-builder.html" target="_blank" style="display:inline-block;padding:7px 14px;background:var(--surface-1);border:1px solid var(--border);border-radius:6px;color:var(--accent);font-size:13px;text-decoration:none;font-weight:500"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> GeoFilter Builder →</a>' +
+      '<a href="/geofilter-builder.html" target="_blank" style="display:inline-block;padding:7px 14px;background:var(--surface-1);border:1px solid var(--border);border-radius:6px;color:var(--link-color);font-size:13px;text-decoration:none;font-weight:500"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> GeoFilter Builder →</a>' +
       '<p style="font-size:11px;color:var(--text-muted);margin-top:6px">Draw a polygon on the map to generate a <code style="font-family:var(--mono)">geo_filter</code> block for <code style="font-family:var(--mono)">config.json</code>.</p>' +
     '</div>';
   }
@@ -2244,6 +2285,23 @@
         window.dispatchEvent(new CustomEvent('mc-channels-show-encrypted-changed', {
           detail: { value: on }
         }));
+      });
+    });
+
+    // #1633 Hide-1-byte-path-hops checkbox — persists + fires
+    // mc-hide-1byte-hops-changed; consumers re-render or rely on the next
+    // navigation refresh (analytics tab, packets list).
+    container.querySelectorAll('[data-cv2-hide-1byte-hops]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var on = !!cb.checked;
+        if (typeof window.MC_setHide1ByteHops === 'function') {
+          window.MC_setHide1ByteHops(on);
+        } else {
+          try {
+            if (on) localStorage.setItem('meshcore-hide-1byte-hops', 'true');
+            else localStorage.removeItem('meshcore-hide-1byte-hops');
+          } catch (_e) {}
+        }
       });
     });
 
@@ -2661,7 +2719,9 @@
     }
     if (earlyOverrides.typeColors && window.TYPE_COLORS) {
       for (var type in earlyOverrides.typeColors) {
-        if (type in window.TYPE_COLORS) window.TYPE_COLORS[type] = earlyOverrides.typeColors[type];
+        // #1799 r1 item 6: REQUEST → REQ migration (see comment above).
+        var canon = (type === 'REQUEST') ? 'REQ' : type;
+        if (canon in window.TYPE_COLORS) window.TYPE_COLORS[canon] = earlyOverrides.typeColors[type];
       }
       if (window.syncBadgeColors) window.syncBadgeColors();
     }
@@ -2725,6 +2785,7 @@
       STORAGE_KEY,                 // 'cs-theme-overrides'
       'meshcore-cb-preset',        // #1361 CB preset id
       'channels-show-encrypted',   // #1454 encrypted-channel toggle
+      'meshcore-hide-1byte-hops',  // #1633 hide 1-byte path hops toggle
       'mc-dark-tile-provider'      // #1430 dark-tile provider pick
     ];
     for (var i = 0; i < CUSTOMIZER_LS_KEYS.length; i++) {

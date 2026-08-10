@@ -68,18 +68,19 @@ type Store struct {
 	path  string // filesystem path to the SQLite DB (used to resolve queue dirs)
 	Stats DBStats
 
-	stmtGetTxByHash            *sql.Stmt
-	stmtInsertTransmission     *sql.Stmt
-	stmtUpdateTxFirstSeen      *sql.Stmt
-	stmtBumpTxLastSeen         *sql.Stmt
-	stmtInsertObservation      *sql.Stmt
-	stmtUpsertNode             *sql.Stmt
-	stmtIncrementAdvertCount   *sql.Stmt
-	stmtUpsertObserver         *sql.Stmt
-	stmtGetObserverRowid       *sql.Stmt
-	stmtUpdateObserverLastSeen *sql.Stmt
-	stmtUpdateNodeTelemetry    *sql.Stmt
-	stmtUpsertMetrics          *sql.Stmt
+	stmtGetTxByHash             *sql.Stmt
+	stmtInsertTransmission      *sql.Stmt
+	stmtUpdateTxFirstSeen       *sql.Stmt
+	stmtBumpTxLastSeen          *sql.Stmt
+	stmtInsertObservation       *sql.Stmt
+	stmtUpsertNode              *sql.Stmt
+	stmtIncrementAdvertCount    *sql.Stmt
+	stmtUpsertObserver          *sql.Stmt
+	stmtUpsertObserverNeighbors *sql.Stmt
+	stmtGetObserverRowid        *sql.Stmt
+	stmtUpdateObserverLastSeen  *sql.Stmt
+	stmtUpdateNodeTelemetry     *sql.Stmt
+	stmtUpsertMetrics           *sql.Stmt
 
 	sampleIntervalSec int
 	backfillWg        sync.WaitGroup
@@ -226,7 +227,11 @@ func applySchema(db *sql.DB) error {
 			clock_skew_count_24h INTEGER DEFAULT 0,
 			clock_last_naive_at TEXT DEFAULT NULL,
 			can_relay INTEGER DEFAULT 1,
-			can_relay_seen INTEGER DEFAULT 0
+			can_relay_seen INTEGER DEFAULT 0,
+			neighbors_last_report_at TEXT DEFAULT NULL,
+			neighbors_count INTEGER DEFAULT NULL,
+			neighbors_total INTEGER DEFAULT NULL,
+			neighbors_truncated INTEGER DEFAULT 0
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen);
@@ -667,6 +672,35 @@ func applySchema(db *sql.DB) error {
 		log.Println("[migration] observers.clock_naive columns added")
 	}
 
+	// Migration: add MQTT neighbor-report columns to observers.
+	//
+	// These are populated ONLY from the firmware's dedicated
+	// meshcore/<iata>/<observer>/neighbors topic — they are deliberately
+	// NOT derived from neighbor_edges, which is inferred from observation
+	// co-reception and would conflate "we computed this topology" with
+	// "this observer reported its own neighbor table".
+	//
+	// All nullable / default-NULL so observers that have never sent a
+	// neighbors report stay distinguishable from ones reporting zero
+	// neighbors (same tri-state rationale as can_relay, #1290).
+	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'observers_neighbor_reports_v1'")
+	if row.Scan(&migDone) != nil {
+		log.Println("[migration] Adding neighbor-report columns to observers...")
+		// Each ALTER is independent — ignore "duplicate column" so reruns are safe.
+		for _, stmt := range []string{
+			`ALTER TABLE observers ADD COLUMN neighbors_last_report_at TEXT DEFAULT NULL`,
+			`ALTER TABLE observers ADD COLUMN neighbors_count INTEGER DEFAULT NULL`,
+			`ALTER TABLE observers ADD COLUMN neighbors_total INTEGER DEFAULT NULL`,
+			`ALTER TABLE observers ADD COLUMN neighbors_truncated INTEGER DEFAULT 0`,
+		} {
+			if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("neighbor_reports migration: %w", err)
+			}
+		}
+		db.Exec(`INSERT INTO _migrations (name) VALUES ('observers_neighbor_reports_v1')`)
+		log.Println("[migration] observers neighbor-report columns added")
+	}
+
 	// Migration: backfill observations.path_json from raw_hex (#888)
 	// NOTE: This runs ASYNC via BackfillPathJSONAsync() to avoid blocking MQTT startup.
 	// See staging outage where ~502K rows blocked ingest for 15+ hours.
@@ -836,6 +870,29 @@ func (s *Store) prepareStatements() error {
 			noise_floor = COALESCE(?, noise_floor),
 			can_relay = COALESCE(?, can_relay),
 			can_relay_seen = CASE WHEN ? IS NULL THEN can_relay_seen ELSE 1 END
+	`)
+	if err != nil {
+		return err
+	}
+
+	// Neighbor-report upsert. Separate from stmtUpsertObserver on purpose:
+	// the neighbors topic is its own publication with its own cadence
+	// (firmware default 24h), so folding it into the /status upsert would
+	// mean every status message had to pass NULLs for these columns and
+	// packet_count would be incremented by a neighbors report.
+	//
+	// INSERT branch covers the case where a neighbors report is the first
+	// thing we ever hear from an observer. packet_count stays 0 there —
+	// a neighbors report is not a packet observation.
+	s.stmtUpsertObserverNeighbors, err = s.db.Prepare(`
+		INSERT INTO observers (id, iata, first_seen, packet_count, neighbors_last_report_at, neighbors_count, neighbors_total, neighbors_truncated)
+		VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			iata = COALESCE(NULLIF(?, ''), iata),
+			neighbors_last_report_at = ?,
+			neighbors_count = ?,
+			neighbors_total = ?,
+			neighbors_truncated = ?
 	`)
 	if err != nil {
 		return err
@@ -1152,6 +1209,45 @@ func (s *Store) UpsertObserverAt(id, name, iata string, meta *ObserverMeta, last
 
 	// Reactivate if this observer was previously marked inactive
 	s.db.Exec(`UPDATE observers SET inactive = 0 WHERE id = ? AND inactive = 1`, id)
+	return nil
+}
+
+// UpsertObserverNeighborReport records an observer-reported neighbor table
+// from the meshcore/<iata>/<observer>/neighbors topic.
+//
+// Deliberately does NOT touch last_seen or packet_count: a neighbors report
+// is observer self-metadata on its own (24h-default) cadence, not a packet
+// observation, and letting it bump last_seen would make a silent observer
+// look alive once a day. It also does not reactivate an inactive observer,
+// for the same reason.
+//
+// report must be non-nil; a zero-neighbor report is valid and meaningful
+// ("reporting, currently hears nobody") and is stored as count 0, which is
+// distinct from NULL ("never reported").
+func (s *Store) UpsertObserverNeighborReport(id, iata string, report *NeighborReport) error {
+	if report == nil {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	normalizedIATA := strings.TrimSpace(strings.ToUpper(iata))
+
+	var total interface{}
+	if report.Total != nil {
+		total = *report.Total
+	}
+	truncated := 0
+	if report.Truncated {
+		truncated = 1
+	}
+
+	_, err := s.stmtUpsertObserverNeighbors.Exec(
+		id, normalizedIATA, now, now, report.Count, total, truncated,
+		normalizedIATA, now, report.Count, total, truncated,
+	)
+	if err != nil {
+		s.Stats.WriteErrors.Add(1)
+		return err
+	}
 	return nil
 }
 

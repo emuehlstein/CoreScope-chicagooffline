@@ -595,6 +595,30 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		return
 	}
 
+	// Neighbors topic: meshcore/<region>/<observer_id>/neighbors
+	//
+	// Observer-reported neighbor table, published on its own cadence
+	// (firmware default: every 24h, gated on mqtt.neighbors). This is the
+	// authoritative "who is actually reporting neighbors" signal and is
+	// deliberately kept distinct from neighbor_edges, which is INFERRED
+	// from observation co-reception by neighbor_builder.go.
+	//
+	// Like /status, the per-source IATA filter does not gate this: it is
+	// observer self-metadata, not packet ingestion.
+	if len(parts) >= 4 && parts[3] == "neighbors" {
+		observerID := parts[2]
+		report := extractNeighborReport(msg)
+		if report == nil {
+			// Malformed / unrecognized payload shape — don't write a
+			// report timestamp we can't substantiate.
+			return
+		}
+		if err := store.UpsertObserverNeighborReport(observerID, parts[1], report); err != nil {
+			log.Printf("MQTT [%s] observer neighbors error: %v", tag, err)
+		}
+		return
+	}
+
 	// Status topic: meshcore/<region>/<observer_id>/status
 	// Per-source IATA filter does NOT apply here — observer metadata (noise_floor, battery, etc.)
 	// is region-independent and should be accepted from all observers regardless of
@@ -1081,6 +1105,69 @@ func stripUnitSuffix(s string) string {
 		}
 	}
 	return s
+}
+
+// NeighborReport is a parsed observer-reported neighbor table from the
+// meshcore/<iata>/<observer>/neighbors topic.
+//
+// Count is the number of entries actually present in this message.
+// Total is the observer's own reported table size (total_neighbors), which
+// can exceed Count when the firmware truncates the payload to fit MTU.
+// Total is nil when the firmware did not send the field.
+type NeighborReport struct {
+	Count     int
+	Total     *int
+	Truncated bool
+}
+
+// extractNeighborReport parses a neighbors-topic payload.
+//
+// Returns nil when the payload has no recognizable neighbors array, so the
+// caller can avoid recording a report timestamp it cannot substantiate. A
+// well-formed report of zero neighbors IS valid and returns Count=0 — that
+// is meaningfully different from "never reported".
+//
+// Firmware shape (MQTTPayloadBuilder.cpp): top-level "neighbors" array of
+// {pubkey, snr, heard_secs_ago, scopes, status}, plus optional
+// total_neighbors / queried_neighbors / truncated.
+func extractNeighborReport(msg map[string]interface{}) *NeighborReport {
+	raw, ok := msg["neighbors"]
+	if !ok {
+		return nil
+	}
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	report := &NeighborReport{Count: len(arr)}
+
+	if v := msg["total_neighbors"]; v != nil {
+		if f, ok := toFloat64(v); ok {
+			iv := int(math.Round(f))
+			// Guard against a nonsense total below the entries we can see.
+			if iv >= report.Count {
+				report.Total = &iv
+			}
+		}
+	}
+
+	switch t := msg["truncated"].(type) {
+	case bool:
+		report.Truncated = t
+	case string:
+		report.Truncated = strings.EqualFold(strings.TrimSpace(t), "true")
+	default:
+		if f, ok := toFloat64(msg["truncated"]); ok {
+			report.Truncated = f != 0
+		}
+	}
+	// A total larger than what arrived is truncation regardless of the flag.
+	if report.Total != nil && *report.Total > report.Count {
+		report.Truncated = true
+	}
+
+	return report
 }
 
 // extractObserverMeta extracts hardware metadata from an MQTT status message.

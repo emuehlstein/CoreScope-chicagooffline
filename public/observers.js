@@ -340,6 +340,64 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
     return h > 0 ? `${h}h ${m}m` : `${m}m`;
   }
 
+  // Renders the observer-reported MQTT neighbor table cell.
+  //
+  // Tri-state, mirroring the can_relay badge rationale (#1290):
+  //   never reported            → em-dash (blank), NOT "0"
+  //   reported, hears nobody    → "0" + freshness
+  //   reported N                → "N" (+ "of TOTAL" when truncated) + freshness
+  //
+  // Freshness matters more than the raw count here: firmware publishes on a
+  // 24h default interval, so a stale report is the interesting failure mode
+  // (node stopped reporting) and is visually flagged past 48h.
+  function renderNeighborsCell(o) {
+    if (!o || !o.neighbors_last_report_at) {
+      return '<span class="text-muted" title="No neighbors report received. Either mqtt.neighbors is off, the firmware predates the feature, or the first report (24h default interval) has not landed yet.">—</span>';
+    }
+    const ts = new Date(o.neighbors_last_report_at).getTime();
+    const count = (o.neighbors_count != null) ? o.neighbors_count : null;
+    const total = (o.neighbors_total != null) ? o.neighbors_total : null;
+
+    let label;
+    if (count == null && total == null) {
+      label = '✓';
+    } else if (o.neighbors_truncated && total != null && count != null && total > count) {
+      label = `${count} of ${total}`;
+    } else {
+      label = String(total != null ? total : count);
+    }
+
+    let ageStr = '';
+    let stale = false;
+    if (!isNaN(ts)) {
+      const ms = Date.now() - ts;
+      stale = ms > 172800000; // 48h = 2 missed 24h intervals
+      const h = Math.floor(ms / 3600000);
+      if (h < 1) ageStr = `${Math.max(0, Math.floor(ms / 60000))}m`;
+      else if (h < 48) ageStr = `${h}h`;
+      else ageStr = `${Math.floor(h / 24)}d`;
+    }
+
+    const title = escapeHtml(
+      `Observer-reported neighbor table (mqtt.neighbors)`
+      + (total != null ? ` — reported ${total} neighbor(s)` : '')
+      + (o.neighbors_truncated ? `, payload truncated to ${count} entries` : '')
+      + (isNaN(ts) ? '' : `. Last report ${new Date(o.neighbors_last_report_at).toISOString()}`)
+      + (stale ? '. STALE: no report in over 48h (expected every 24h).' : '')
+    );
+
+    // `.text-muted` is the only muted text class in style.css; there is no
+    // `.text-warn`. For the stale case reuse the amber treatment already
+    // defined for .badge-listener so the cell tracks the active palette
+    // instead of hardcoding a hex.
+    const ageHtml = ageStr
+      ? (stale
+          ? ` <span style="font-size:11px;color:var(--transport-badge-fg,#d97706);font-weight:700">${escapeHtml(ageStr)}</span>`
+          : ` <span class="text-muted" style="font-size:11px">${escapeHtml(ageStr)}</span>`)
+      : '';
+    return `<span title="${title}">${escapeHtml(label)}${ageHtml}</span>`;
+  }
+
   function sparkBar(count, max) {
     if (max === 0) return `<span class="text-muted">0/hr</span>`;
     const pct = Math.min(100, Math.round((count / max) * 100));
@@ -384,7 +442,7 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
         <caption class="sr-only">Observer status and statistics</caption>
         <thead><tr>
           <th scope="col" data-priority="1" data-sort-key="status" data-type="numeric">Status</th><th scope="col" data-priority="1" data-sort-key="name">Name</th><th scope="col" data-priority="3" data-sort-key="region">Region</th><th scope="col" data-priority="2" data-sort-key="last_seen" data-type="numeric">Last Status</th><th scope="col" data-priority="2" data-sort-key="last_packet_at" data-type="numeric">Last Packet</th>
-          <th scope="col" data-priority="3" data-sort-key="packet_health" data-type="numeric">Packet Health</th><th scope="col" data-priority="4" data-sort-key="packet_count" data-type="numeric">Total Packets</th><th scope="col" data-priority="3" data-sort-key="packets_hour" data-type="numeric">Packets/Hour</th><th scope="col" data-priority="4" data-sort-key="clock_offset" data-type="numeric">Clock Offset</th><th scope="col" data-priority="4" data-sort-key="uptime" data-type="numeric">Uptime</th><th scope="col" data-priority="4" data-sort-key="firmware">Firmware</th><th scope="col" data-priority="4" data-sort-key="client_version">Client</th>
+          <th scope="col" data-priority="3" data-sort-key="packet_health" data-type="numeric">Packet Health</th><th scope="col" data-priority="4" data-sort-key="packet_count" data-type="numeric">Total Packets</th><th scope="col" data-priority="3" data-sort-key="packets_hour" data-type="numeric">Packets/Hour</th><th scope="col" data-priority="4" data-sort-key="clock_offset" data-type="numeric">Clock Offset</th><th scope="col" data-priority="4" data-sort-key="uptime" data-type="numeric">Uptime</th><th scope="col" data-priority="4" data-sort-key="neighbors" data-type="numeric" title="Observer-reported MQTT neighbor table (mqtt.neighbors). Blank = this observer has never published a neighbors report.">Neighbors</th><th scope="col" data-priority="4" data-sort-key="firmware">Firmware</th><th scope="col" data-priority="4" data-sort-key="client_version">Client</th>
           <th scope="col" data-priority="1" class="col-compare-select" style="width:32px"><span class="sr-only">Select for compare</span></th>
         </tr></thead>
         <tbody>${filtered.map(o => {
@@ -403,6 +461,13 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
           const _uptimeMs    = _firstSeenMs ? (Date.now() - _firstSeenMs) : '';
           const _skewSec = (obsSkewMap[o.id] && obsSkewMap[o.id].samples)
             ? Math.abs(Number(obsSkewMap[o.id].offsetSec) || 0)
+            : '';
+          // Neighbors sort key: reported table size (prefer the observer's own
+          // total over the possibly-truncated entry count). '' ⇒ NaN ⇒ the
+          // never-reported rows sort last instead of masquerading as zero.
+          const _neighborsSort = o.neighbors_last_report_at
+            ? (o.neighbors_total != null ? o.neighbors_total
+               : (o.neighbors_count != null ? o.neighbors_count : 0))
             : '';
           // #1641 r1 finding #1: Packet Health sortable rank must differ
           // from Last Packet — use the health bucket, not the timestamp.
@@ -426,6 +491,7 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
               return renderSkewBadge(sev, sk.offsetSec) + ' <span class="text-muted" title="Computed from ' + sk.samples + ' multi-observer packets. Positive = observer ahead of consensus.">(' + sk.samples + ')</span>';
             })()}</td>
             <td data-value="${_uptimeMs}">${uptimeStr(o.first_seen)}</td>
+            <td data-testid="obs-cell-neighbors" data-value="${_neighborsSort}" class="mono">${renderNeighborsCell(o)}</td>
             <td data-testid="obs-cell-firmware" data-value="${escapeHtml(String(o.firmware || ''))}" class="mono"${o.firmware ? ` title="${escapeHtml(String(o.firmware))}"` : ''}>${o.firmware ? escapeHtml(truncateBuildSuffix(String(o.firmware))) : '<span class="text-muted">—</span>'}</td>
             <td data-testid="obs-cell-client-version" data-value="${escapeHtml(String(o.client_version || ''))}" class="mono"${o.client_version ? ` title="${escapeHtml(String(o.client_version))}"` : ''}>${o.client_version ? escapeHtml(String(o.client_version)) : '<span class="text-muted">—</span>'}</td>
             <td class="col-compare-select" onclick="event.stopPropagation()" style="text-align:center">

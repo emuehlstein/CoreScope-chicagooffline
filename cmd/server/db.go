@@ -20,7 +20,9 @@ import (
 // routeTypeTransport covers TRANSPORT_FLOOD (0) and TRANSPORT_DIRECT (3) —
 // the only route types that carry transport_code_1 (transport-level scope).
 // Per firmware/docs/packet_format.md § Route Types:
-//   0 = TRANSPORT_FLOOD, 1 = FLOOD, 2 = DIRECT, 3 = TRANSPORT_DIRECT.
+//
+//	0 = TRANSPORT_FLOOD, 1 = FLOOD, 2 = DIRECT, 3 = TRANSPORT_DIRECT.
+//
 // Routes 1 (FLOOD) and 2 (DIRECT) never carry a scope by protocol — they are
 // inherently unscoped and are counted separately in GetScopeStats (#1838).
 const routeTypeTransportSQL = "route_type IN (0, 3)"
@@ -32,11 +34,11 @@ const routeTypeNonTransportSQL = "route_type IN (1, 2)"
 
 // DB wraps a read-only connection to the MeshCore SQLite database.
 type DB struct {
-	conn             *sql.DB
-	path             string // filesystem path to the database file
-	isV3             bool   // v3 schema: observer_idx in observations (vs observer_id in v2)
-	hasResolvedPath  bool   // observations table has resolved_path column
-	hasObsRawHex     bool   // observations table has raw_hex column (#881)
+	conn                *sql.DB
+	path                string // filesystem path to the database file
+	isV3                bool   // v3 schema: observer_idx in observations (vs observer_id in v2)
+	hasResolvedPath     bool   // observations table has resolved_path column
+	hasObsRawHex        bool   // observations table has raw_hex column (#881)
 	hasScopeName        bool   // transmissions.scope_name column exists (#899)
 	hasDefaultScope     bool   // nodes.default_scope column exists (#899)
 	hasMultibyteSupCols bool   // nodes/inactive_nodes have multibyte_sup/multibyte_evidence (#903)
@@ -229,7 +231,7 @@ func (db *DB) scanTransmissionRow(rows *sql.Rows) map[string]interface{} {
 
 // Node represents a row from the nodes table.
 type Node struct {
-	PublicKey     string   `json:"public_key"`
+	PublicKey    string   `json:"public_key"`
 	Name         *string  `json:"name"`
 	Role         *string  `json:"role"`
 	Lat          *float64 `json:"lat"`
@@ -272,6 +274,21 @@ type Observer struct {
 	// repeaters). The ingestor sets can_relay_seen=1 only when it has
 	// an explicit value; the read layer returns nil when seen=0.
 	CanRelay *bool `json:"can_relay,omitempty"`
+	// Observer-reported neighbor table, from the firmware's dedicated
+	// meshcore/<iata>/<observer>/neighbors publication (fork feature).
+	//
+	// NOT derived from neighbor_edges — that table is INFERRED from
+	// observation co-reception by the ingestor's neighbor_builder and would
+	// conflate computed topology with a self-reported neighbor table.
+	//
+	// NeighborsLastReportAt == nil means "never reported", which is
+	// deliberately distinct from a report of zero neighbors
+	// (NeighborsCount == 0). NeighborsTotal exceeds NeighborsCount when the
+	// firmware truncated the payload to fit MTU.
+	NeighborsLastReportAt *string `json:"neighbors_last_report_at,omitempty"`
+	NeighborsCount        *int    `json:"neighbors_count,omitempty"`
+	NeighborsTotal        *int    `json:"neighbors_total,omitempty"`
+	NeighborsTruncated    bool    `json:"neighbors_truncated,omitempty"`
 }
 
 // Transmission represents a row from the transmissions table.
@@ -480,20 +497,20 @@ func (db *DB) GetAllRoleCounts() map[string]int {
 
 // PacketQuery holds filter params for packet listing.
 type PacketQuery struct {
-	Limit    int
-	Offset   int
-	Type     *int
-	Route    *int
-	Observer string
-	Hash     string
-	Since    string
-	Until    string
-	Region   string
-	Area     string   // area key; filters by transmitting node's GPS position
-	Node     string
-	Channel  string // channel_hash filter (#812). Plain names like "#test"/"public" or "enc_<HEX>" for encrypted
-	Order               string // ASC or DESC
-	ExpandObservations  bool   // when true, include observation sub-maps in txToMap output
+	Limit              int
+	Offset             int
+	Type               *int
+	Route              *int
+	Observer           string
+	Hash               string
+	Since              string
+	Until              string
+	Region             string
+	Area               string // area key; filters by transmitting node's GPS position
+	Node               string
+	Channel            string // channel_hash filter (#812). Plain names like "#test"/"public" or "enc_<HEX>" for encrypted
+	Order              string // ASC or DESC
+	ExpandObservations bool   // when true, include observation sub-maps in txToMap output
 }
 
 // PacketResult wraps paginated packet list.
@@ -813,7 +830,6 @@ func (db *DB) resolveNodePubkey(nodeIDOrName string) string {
 	return pk
 }
 
-
 // GetTransmissionByID fetches from transmissions table with observer data.
 func (db *DB) GetTransmissionByID(id int) (map[string]interface{}, error) {
 	selectCols, observerJoin := db.transmissionBaseSQL()
@@ -859,7 +875,6 @@ func (db *DB) GetObservationsForHash(hash string) []map[string]interface{} {
 	obsByTx := db.getObservationsForTransmissions([]int{txID})
 	return obsByTx[txID]
 }
-
 
 // GetNodes returns filtered, paginated node list.
 func (db *DB) GetNodes(limit, offset int, role, search, before, lastHeard, sortBy, region string) ([]map[string]interface{}, int, map[string]int, error) {
@@ -1040,7 +1055,6 @@ func (db *DB) GetNodeByPubkey(pubkey string) (map[string]interface{}, error) {
 	return nil, nil
 }
 
-
 // GetRecentTransmissionsForNode returns recent transmissions originated by a
 // node, identified by exact pubkey match on the indexed from_pubkey column
 // (#1143). The legacy `name` substring fallback was removed: it produced
@@ -1183,10 +1197,31 @@ func (db *DB) GetObservers() ([]Observer, error) {
 	if hasCol, _ := dbschema.TableHasColumn(db.conn, "observers", "can_relay_seen"); hasCol {
 		canRelaySeenClause = "COALESCE(can_relay_seen, 0)"
 	}
+	// Observer-reported neighbor tables (meshcore/<iata>/<observer>/neighbors).
+	// Same probe-and-fall-back approach as can_relay: pre-migration DBs and
+	// older test fixtures lack these columns entirely. NULL is meaningful
+	// here ("never reported"), so the fallbacks select NULL rather than 0.
+	neighborsAtClause := "NULL"
+	neighborsCountClause := "NULL"
+	neighborsTotalClause := "NULL"
+	neighborsTruncClause := "0"
+	if hasCol, _ := dbschema.TableHasColumn(db.conn, "observers", "neighbors_last_report_at"); hasCol {
+		neighborsAtClause = "neighbors_last_report_at"
+	}
+	if hasCol, _ := dbschema.TableHasColumn(db.conn, "observers", "neighbors_count"); hasCol {
+		neighborsCountClause = "neighbors_count"
+	}
+	if hasCol, _ := dbschema.TableHasColumn(db.conn, "observers", "neighbors_total"); hasCol {
+		neighborsTotalClause = "neighbors_total"
+	}
+	if hasCol, _ := dbschema.TableHasColumn(db.conn, "observers", "neighbors_truncated"); hasCol {
+		neighborsTruncClause = "COALESCE(neighbors_truncated, 0)"
+	}
 	rows, err := db.conn.Query(`SELECT id, name, iata, last_seen, first_seen, packet_count,
 		model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor, last_packet_at,
 		clock_skew_seconds, clock_skew_count_24h, clock_last_naive_at,
-		` + canRelayClause + `, ` + canRelaySeenClause + `
+		` + canRelayClause + `, ` + canRelaySeenClause + `,
+		` + neighborsAtClause + `, ` + neighborsCountClause + `, ` + neighborsTotalClause + `, ` + neighborsTruncClause + `
 		FROM observers WHERE inactive IS NULL OR inactive = 0 ORDER BY last_seen DESC`)
 	if err != nil {
 		return nil, err
@@ -1200,14 +1235,34 @@ func (db *DB) GetObservers() ([]Observer, error) {
 		var clockSkewCount sql.NullInt64
 		var noiseFloor sql.NullFloat64
 		var canRelay, canRelaySeen int
+		var neighborsAt sql.NullString
+		var neighborsCount, neighborsTotal sql.NullInt64
+		var neighborsTrunc int
 		if err := rows.Scan(&o.ID, &o.Name, &o.IATA, &o.LastSeen, &o.FirstSeen, &o.PacketCount,
 			&o.Model, &o.Firmware, &o.ClientVersion, &o.Radio, &batteryMv, &uptimeSecs, &noiseFloor, &o.LastPacketAt,
-			&clockSkewSec, &clockSkewCount, &o.ClockLastNaiveAt, &canRelay, &canRelaySeen); err != nil {
+			&clockSkewSec, &clockSkewCount, &o.ClockLastNaiveAt, &canRelay, &canRelaySeen,
+			&neighborsAt, &neighborsCount, &neighborsTotal, &neighborsTrunc); err != nil {
 			continue
 		}
 		if canRelaySeen != 0 {
 			b := canRelay != 0
 			o.CanRelay = &b
+		}
+		// neighbors_last_report_at is the tri-state sentinel: NULL means the
+		// observer has never published a neighbors report, which the UI must
+		// render differently from a report of zero neighbors.
+		if neighborsAt.Valid && neighborsAt.String != "" {
+			v := neighborsAt.String
+			o.NeighborsLastReportAt = &v
+			if neighborsCount.Valid {
+				c := int(neighborsCount.Int64)
+				o.NeighborsCount = &c
+			}
+			if neighborsTotal.Valid {
+				t := int(neighborsTotal.Int64)
+				o.NeighborsTotal = &t
+			}
+			o.NeighborsTruncated = neighborsTrunc != 0
 		}
 		if batteryMv.Valid {
 			v := int(batteryMv.Int64)
@@ -1412,7 +1467,6 @@ func (db *DB) GetDistinctIATAs() ([]string, error) {
 	}
 	return codes, nil
 }
-
 
 // GetNetworkStatus returns overall network health status.
 func (db *DB) GetNetworkStatus(healthThresholds HealthThresholds) (map[string]interface{}, error) {
@@ -1881,8 +1935,8 @@ func (db *DB) GetChannelMessages(channelHash string, limit, offset int, region .
 	defer rows.Close()
 
 	type msg struct {
-		Data       map[string]interface{}
-		Repeats    int
+		Data        map[string]interface{}
+		Repeats     int
 		LatestEpoch int64 // max observation timestamp (unix seconds) — issue #1366
 	}
 	msgMap := make(map[int]*msg, len(pageIDs))
@@ -1996,8 +2050,6 @@ func (db *DB) GetChannelMessages(channelHash string, limit, offset int, region .
 
 	return messages, total, nil
 }
-
-
 
 // GetNewTransmissionsSince returns new transmissions after a given ID for WebSocket polling.
 func (db *DB) GetNewTransmissionsSince(lastID int, limit int) ([]map[string]interface{}, error) {
@@ -2788,7 +2840,7 @@ func (db *DB) GetScopeStats(window string) (*ScopeStatsResponse, error) {
 			COALESCE(SUM(CASE WHEN scope_name IS NULL THEN 1 ELSE 0 END), 0) AS unscoped,
 			COALESCE(SUM(CASE WHEN scope_name = '' THEN 1 ELSE 0 END), 0) AS unknown_scope
 		FROM transmissions
-		WHERE ` + routeTypeTransportSQL + ` AND first_seen >= ?
+		WHERE `+routeTypeTransportSQL+` AND first_seen >= ?
 	`, since)
 	if err := row.Scan(
 		&resp.Summary.TransportTotal,
@@ -2816,7 +2868,7 @@ func (db *DB) GetScopeStats(window string) (*ScopeStatsResponse, error) {
 	rows, err := db.conn.Query(`
 		SELECT scope_name, COUNT(*) AS cnt
 		FROM transmissions
-		WHERE ` + routeTypeTransportSQL + ` AND scope_name IS NOT NULL AND scope_name != '' AND first_seen >= ?
+		WHERE `+routeTypeTransportSQL+` AND scope_name IS NOT NULL AND scope_name != '' AND first_seen >= ?
 		GROUP BY scope_name
 		ORDER BY cnt DESC
 	`, since)
@@ -2843,7 +2895,7 @@ func (db *DB) GetScopeStats(window string) (*ScopeStatsResponse, error) {
 			COUNT(scope_name) AS scoped,
 			SUM(CASE WHEN scope_name IS NULL THEN 1 ELSE 0 END) AS unscoped
 		FROM transmissions
-		WHERE ` + routeTypeTransportSQL + ` AND first_seen >= ?
+		WHERE `+routeTypeTransportSQL+` AND first_seen >= ?
 		GROUP BY bucket
 		ORDER BY bucket
 	`, bucketExpr)

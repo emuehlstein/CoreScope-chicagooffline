@@ -946,6 +946,15 @@ type ObserverResp struct {
 	// field). UI tri-state badge renders nothing when nil so legacy
 	// rows don't masquerade as confirmed repeaters (PR #1624 MAJOR-2).
 	CanRelay *bool `json:"can_relay,omitempty"`
+	// Observer self-reported neighbor table (fork feature), from
+	// meshcore/<iata>/<observer>/neighbors. Mirrors db.Observer:
+	// nil NeighborsLastReportAt = never reported, which the UI must
+	// render differently from a report of zero neighbors (count==0).
+	// NOT derived from neighbor_edges (that table is inferred).
+	NeighborsLastReportAt *string `json:"neighbors_last_report_at,omitempty"`
+	NeighborsCount        *int    `json:"neighbors_count,omitempty"`
+	NeighborsTotal        *int    `json:"neighbors_total,omitempty"`
+	NeighborsTruncated    bool    `json:"neighbors_truncated,omitempty"`
 }
 
 type ObserverListResponse struct {

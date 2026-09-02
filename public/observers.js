@@ -358,13 +358,16 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
     const count = (o.neighbors_count != null) ? o.neighbors_count : null;
     const total = (o.neighbors_total != null) ? o.neighbors_total : null;
 
-    let label;
+    // #1648 M1 forbids emoji / misc-icon codepoints in this file, so the
+    // "report received, no count" case uses the Phosphor sprite instead of a
+    // bare check glyph. The wrapping span carries the descriptive title.
+    let labelHtml;
     if (count == null && total == null) {
-      label = '✓';
+      labelHtml = '<svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-check"></use></svg>';
     } else if (o.neighbors_truncated && total != null && count != null && total > count) {
-      label = `${count} of ${total}`;
+      labelHtml = escapeHtml(`${count} of ${total}`);
     } else {
-      label = String(total != null ? total : count);
+      labelHtml = escapeHtml(String(total != null ? total : count));
     }
 
     let ageStr = '';
@@ -395,7 +398,7 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
           ? ` <span style="font-size:11px;color:var(--transport-badge-fg,#d97706);font-weight:700">${escapeHtml(ageStr)}</span>`
           : ` <span class="text-muted" style="font-size:11px">${escapeHtml(ageStr)}</span>`)
       : '';
-    return `<span title="${title}">${escapeHtml(label)}${ageHtml}</span>`;
+    return `<span title="${title}">${labelHtml}${ageHtml}</span>`;
   }
 
   function sparkBar(count, max) {

@@ -40,7 +40,31 @@
 
   function _isDarkMode() { return _isDark; }
 
-  function _cartoUrl()      { return _isDarkMode() ? URLS.cartoDark : URLS.cartoLight; }
+  // CARTO began requiring an API key in 2026-08 (upstream #1919 / #1926):
+  // unauthenticated tiles still come back 200 but every one is stamped
+  // "API KEY REQUIRED". map.js and live.js on this branch drive the basemap
+  // through CO_BASEMAP instead of the upstream tile registry, so the key has to
+  // be resolved HERE too — otherwise _getCartoKey() never fires on the surfaces
+  // this deployment actually renders and the map quietly stays watermarked.
+  //
+  // Same convention as roles.js: MC_tileUrlById(id, fallback) applies both
+  // `tiles.providers.carto.domain` and the `?key=` query param, and hands back
+  // the fallback when the registry is missing or the carto provider is disabled.
+  //
+  // Resolved lazily on every call, never at parse time: index.html loads
+  // map-layers.js (line ~67) BEFORE map-tile-providers.js (line ~194), and the
+  // key itself only arrives with the async /api/config fetch.
+  function _resolveCarto(id, fallback) {
+    return (typeof window.MC_tileUrlById === 'function')
+      ? window.MC_tileUrlById(id, fallback)
+      : fallback;
+  }
+
+  function _cartoUrl() {
+    return _isDarkMode()
+      ? _resolveCarto('carto-dark',  URLS.cartoDark)
+      : _resolveCarto('carto-light', URLS.cartoLight);
+  }
   function _hillshadeUrl()  { return _isDarkMode() ? URLS.hillshadeDark : URLS.hillshadeLight; }
 
   function _removeLayers() {
@@ -122,6 +146,19 @@
     var saved = parseFloat(localStorage.getItem('co-hillshade-opacity'));
     if (!isNaN(saved) && saved >= 0 && saved <= 1) HILLSHADE_OPACITY = saved;
   } catch (_) {}
+
+  // The tile registry is rebuilt once /api/config lands (roles.js calls
+  // MC_initTileRegistry(true), which dispatches this event). That normally
+  // happens AFTER map.js/live.js have already called init(), so the first paint
+  // is built from the keyless fallbacks. Re-point the Carto base layer when the
+  // real config shows up, or the watermark would persist for the page lifetime.
+  //
+  // Only the base layer is Carto-derived: 'satellite' is Esri and the hillshade
+  // overlay is served from tiles.chicagooffline.com — neither takes a key.
+  window.addEventListener('mc-tile-provider-changed', function () {
+    if (!_map || _mode === 'satellite') return;
+    if (_baseLayer) _baseLayer.setUrl(_cartoUrl());
+  });
 
   window.CO_BASEMAP = {
     init: init, setMode: setMode, onThemeChange: onThemeChange, getMode: getMode,

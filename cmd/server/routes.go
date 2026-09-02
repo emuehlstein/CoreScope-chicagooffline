@@ -437,6 +437,7 @@ func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Customizer != nil && s.cfg.Customizer.DisabledTabs != nil {
 		disabledTabs = s.cfg.Customizer.DisabledTabs
 	}
+	pathTrust := s.cfg.GetPathTrust()
 	writeJSON(w, ClientConfigResponse{
 		Roles:               s.cfg.Roles,
 		HealthThresholds:    s.cfg.GetHealthThresholds().ToClientMs(),
@@ -457,6 +458,7 @@ func (s *Server) handleConfigClient(w http.ResponseWriter, r *http.Request) {
 		Tiles:               s.cfg.Tiles,
 		Customizer:          CustomizerClientConfig{DisabledTabs: disabledTabs},
 		ClientRxCoverage:    s.cfg.ClientRxCoverageEnabled(),
+		PathTrust:           &pathTrust,
 	})
 }
 
@@ -1625,6 +1627,16 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 	// #1143: GetRecentTransmissionsForNode no longer accepts a name fallback;
 	// attribution is strict exact-match on the indexed from_pubkey column.
 	recentAdverts, _ := s.db.GetRecentTransmissionsForNode(pubkey, 20)
+
+	// Windowed flood-advert count (7d): only the mesh-wide-airtime advert kind,
+	// separated from zero-hop adverts so a nearby observer hearing a node's
+	// cheap local adverts does not inflate the number. Consumed by the ArcScope
+	// repeater advisor to rate advert hygiene.
+	if n, err := s.db.CountFloodAdvertsForNode(pubkey, 7*24, floodAdvertRowCap); err == nil {
+		node["flood_advert_count_7d"] = n
+	} else {
+		log.Printf("WARN CountFloodAdvertsForNode(%s): %v", pubkey, err)
+	}
 
 	writeJSON(w, NodeDetailResponse{
 		Node:          node,
@@ -2838,13 +2850,26 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// #1828 Phase A: aggregate builders extracted into observer_analytics.go.
+	// Single snapshot under RLock (#1481 P0-2), then five composable helpers
+	// off the snapshot. No behavior change; JSON output is byte-identical.
 	since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
 	s.store.mu.RLock()
 	obsList := s.store.byObserver[id]
-	// #1481 P0-2: snapshot pointer slice and release RLock immediately —
-	// don't iterate + json-decode + time-parse under the lock.
 	obsSnapshot := make([]*StoreObs, len(obsList))
 	copy(obsSnapshot, obsList)
+	// #1830: also resolve each referenced transmission's *StoreTx under
+	// this same RLock. s.store.byTxID is guarded by s.store.mu (writes
+	// from ingest/eviction); reading it after RUnlock — as the loop below
+	// used to via s.store.byTxID[...] and enrichObs() — races with those
+	// writers. Keyed by TransmissionID (not by observation index) since
+	// multiple observations can share one transmission.
+	txByID := make(map[int]*StoreTx, len(obsSnapshot))
+	for _, obs := range obsSnapshot {
+		if _, ok := txByID[obs.TransmissionID]; !ok {
+			txByID[obs.TransmissionID] = s.store.byTxID[obs.TransmissionID]
+		}
+	}
 	s.store.mu.RUnlock()
 	filtered := make([]*StoreObs, 0, len(obsSnapshot))
 	for _, obs := range obsSnapshot {
@@ -2858,109 +2883,12 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 	}
 	sort.Slice(filtered, func(i, j int) bool { return filtered[i].Timestamp > filtered[j].Timestamp })
 
-	bucketDur := 24 * time.Hour
-	if days <= 1 {
-		bucketDur = time.Hour
-	} else if days <= 7 {
-		bucketDur = 4 * time.Hour
-	}
-	formatLabel := func(t time.Time) string {
-		if days <= 1 {
-			return t.UTC().Format("15:04")
-		}
-		if days <= 7 {
-			return t.UTC().Format("Mon 15:04")
-		}
-		return t.UTC().Format("Jan 02")
-	}
-
-	packetTypes := map[string]int{}
-	timelineCounts := map[int64]int{}
-	nodeBucketSets := map[int64]map[string]struct{}{}
-	snrBuckets := map[int]*SnrDistributionEntry{}
-	recentPackets := make([]map[string]interface{}, 0, 20)
-
-	for i, obs := range filtered {
-		ts, ok := obs.ParsedTime()
-		if !ok {
-			continue
-		}
-		bucketStart := ts.UTC().Truncate(bucketDur).Unix()
-		timelineCounts[bucketStart]++
-		if nodeBucketSets[bucketStart] == nil {
-			nodeBucketSets[bucketStart] = map[string]struct{}{}
-		}
-
-		enriched := s.store.enrichObs(obs)
-		if pt, ok := enriched["payload_type"].(int); ok {
-			packetTypes[strconv.Itoa(pt)]++
-		}
-		if decodedRaw, ok := enriched["decoded_json"].(string); ok && decodedRaw != "" {
-			var decoded map[string]interface{}
-			if json.Unmarshal([]byte(decodedRaw), &decoded) == nil {
-				for _, k := range []string{"pubKey", "srcHash", "destHash"} {
-					if v, ok := decoded[k].(string); ok && v != "" {
-						nodeBucketSets[bucketStart][v] = struct{}{}
-					}
-				}
-			}
-		}
-		for _, hop := range parsePathJSON(obs.PathJSON) {
-			if hop != "" {
-				nodeBucketSets[bucketStart][hop] = struct{}{}
-			}
-		}
-		if obs.SNR != nil {
-			bucket := int(*obs.SNR) / 2 * 2
-			if *obs.SNR < 0 && int(*obs.SNR) != bucket {
-				bucket -= 2
-			}
-			if snrBuckets[bucket] == nil {
-				snrBuckets[bucket] = &SnrDistributionEntry{Range: fmt.Sprintf("%d to %d", bucket, bucket+2)}
-			}
-			snrBuckets[bucket].Count++
-		}
-		if i < 20 {
-			recentPackets = append(recentPackets, enriched)
-		}
-	}
-	// #1481 P0-2: RLock was released earlier after snapshotting the
-	// observation pointer slice; no Unlock needed here.
-
-	buildTimeline := func(counts map[int64]int) []TimeBucket {
-		keys := make([]int64, 0, len(counts))
-		for k := range counts {
-			keys = append(keys, k)
-		}
-		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-		out := make([]TimeBucket, 0, len(keys))
-		for _, k := range keys {
-			lbl := formatLabel(time.Unix(k, 0))
-			out = append(out, TimeBucket{Label: &lbl, Count: counts[k]})
-		}
-		return out
-	}
-
-	nodeCounts := make(map[int64]int, len(nodeBucketSets))
-	for k, nodes := range nodeBucketSets {
-		nodeCounts[k] = len(nodes)
-	}
-	snrKeys := make([]int, 0, len(snrBuckets))
-	for k := range snrBuckets {
-		snrKeys = append(snrKeys, k)
-	}
-	sort.Ints(snrKeys)
-	snrDistribution := make([]SnrDistributionEntry, 0, len(snrKeys))
-	for _, k := range snrKeys {
-		snrDistribution = append(snrDistribution, *snrBuckets[k])
-	}
-
 	writeJSON(w, ObserverAnalyticsResponse{
-		Timeline:        buildTimeline(timelineCounts),
-		PacketTypes:     packetTypes,
-		NodesTimeline:   buildTimeline(nodeCounts),
-		SnrDistribution: snrDistribution,
-		RecentPackets:   recentPackets,
+		Timeline:        buildTimeline(filtered, days),
+		PacketTypes:     buildPacketTypes(filtered, txByID),
+		NodesTimeline:   buildNodesTimeline(filtered, days, txByID),
+		SnrDistribution: buildSnrDistribution(filtered),
+		RecentPackets:   buildRecentPackets(s.store, filtered, 20, txByID),
 	})
 }
 
@@ -3048,8 +2976,7 @@ func (s *Server) handleAudioLabBuckets(w http.ResponseWriter, r *http.Request) {
 			}
 			typeName := "UNKNOWN"
 			if tx.DecodedJSON != "" {
-				var d map[string]interface{}
-				if err := json.Unmarshal([]byte(tx.DecodedJSON), &d); err == nil {
+				if d := tx.ParsedDecoded(); d != nil {
 					if t, ok := d["type"].(string); ok && t != "" {
 						typeName = t
 					}

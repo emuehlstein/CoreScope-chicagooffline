@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -44,11 +45,60 @@ type DB struct {
 	hasMultibyteSupCols bool   // nodes/inactive_nodes have multibyte_sup/multibyte_evidence (#903)
 	hasLastSeen         bool   // transmissions.last_seen column exists (#1690)
 
-	// Channel list cache (60s TTL) — avoids repeated GROUP BY scans (#762)
-	channelsCacheMu  sync.Mutex
-	channelsCacheKey string
-	channelsCacheRes []map[string]interface{}
-	channelsCacheExp time.Time
+	// Channel list caches, keyed by region param — avoids repeated GROUP BY
+	// scans (#762). Keyed per-region (not a single slot) so mixed-region
+	// traffic doesn't evict and re-run the query on every request.
+	channelsCacheMu sync.Mutex
+	channelsCache   map[string]channelsCacheEntry
+
+	encChannelsCacheMu sync.Mutex
+	encChannelsCache   map[string]channelsCacheEntry
+
+	// Channel messages cache, keyed by hash+limit+offset+region. Unlike
+	// GetChannels, this previously had no cache at all — every page
+	// view/poll re-ran the full paginated query.
+	msgCacheMu sync.Mutex
+	msgCache   map[string]channelMessagesCacheEntry
+
+	// Prepared statements for frequently-called queries.
+	// Prepared once at initDB time, reused across all requests.
+	stmtCountTransmissions  *sql.Stmt
+	stmtCountObservations   *sql.Stmt
+	stmtCountNodesActive    *sql.Stmt // WHERE last_seen > ?
+	stmtCountNodesAll       *sql.Stmt
+	stmtCountObservers      *sql.Stmt
+	stmtCountObsLastHour    *sql.Stmt // WHERE timestamp > ?
+	stmtCountObsLastDay     *sql.Stmt // WHERE timestamp > ?
+	stmtNodeLookup          *sql.Stmt // WHERE public_key = ? OR name = ?
+	stmtTxByHash            *sql.Stmt // WHERE hash = ?
+	stmtCountNodesByRole    *sql.Stmt // WHERE role = ? AND last_seen > ?
+	stmtCountNodesByRoleAll *sql.Stmt // WHERE role = ?
+	stmtMaxTxID             *sql.Stmt // COALESCE(MAX(id), 0) FROM transmissions
+	stmtMaxObsID            *sql.Stmt // COALESCE(MAX(id), 0) FROM observations
+}
+
+// channelsCacheTTL is shared by the GetChannels and GetEncryptedChannels
+// caches — both are cheap to keep fresh at the same cadence as before.
+const channelsCacheTTL = 60 * time.Second
+
+// msgCacheTTL is shorter than channelsCacheTTL: channel message pages are
+// polled more aggressively (e.g. an open channel view) and staleness is
+// more visible to users than in the channel list.
+const msgCacheTTL = 10 * time.Second
+
+// maxCacheEntries bounds a keyed cache's size. Region/pagination keys are
+// low-cardinality in practice; this is a defensive reset, not a real LRU.
+const maxCacheEntries = 256
+
+type channelsCacheEntry struct {
+	res []map[string]interface{}
+	exp time.Time
+}
+
+type channelMessagesCacheEntry struct {
+	msgs  []map[string]interface{}
+	total int
+	exp   time.Time
 }
 
 // OpenDB opens a read-only SQLite connection with WAL mode.
@@ -65,87 +115,164 @@ func OpenDB(path string) (*DB, error) {
 		return nil, fmt.Errorf("ping failed: %w", err)
 	}
 	d := &DB{conn: conn, path: path}
-	d.detectSchema()
+	// Detect the on-disk schema on a single pinned connection and fail loudly if
+	// it cannot be probed. A swallowed detection failure would silently cache the
+	// wrong schema mode (isV3=false against a v3 DB) for the entire process
+	// lifetime, breaking every read path until a manual restart (#1901). Aborting
+	// here lets the supervisor restart us, which clears any transient cause (e.g.
+	// a WAL recovery racing the read-only open).
+	ctx := context.Background()
+	sc, err := conn.Conn(ctx)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("schema detection: acquire connection: %w", err)
+	}
+	derr := d.detectSchema(ctx, sc)
+	_ = sc.Close()
+	if derr != nil {
+		conn.Close()
+		return nil, fmt.Errorf("schema detection failed: %w", derr)
+	}
+	// Statements are prepared after schema detection so they can never be
+	// compiled against a schema mode that turned out to be wrong (#1901).
+	if err := d.prepareStatements(); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("prepare statements: %w", err)
+	}
 	return d, nil
 }
 
-func (db *DB) Close() error {
-	// Checkpoint WAL before closing to release lock cleanly for new processes
-	if _, err := db.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		log.Printf("[db] WAL checkpoint error: %v", err)
-	} else {
-		log.Println("[db] WAL checkpoint complete")
+// stmtQueryRow returns a QueryRow-like helper that uses the prepared statement
+// when non-nil (production), or falls back to a direct db.conn.QueryRow query
+// when the statement is nil (test DBs that skip prepareStatements).
+func (db *DB) stmtQueryRow(stmt *sql.Stmt, fallbackSQL string, args ...interface{}) *sql.Row {
+	if stmt != nil {
+		return stmt.QueryRow(args...)
 	}
+	return db.conn.QueryRow(fallbackSQL, args...)
+}
+
+// prepareStatements creates prepared statements for frequently-called queries.
+// SQLite compiles and caches the query plan once, avoiding re-parsing per request.
+func (db *DB) prepareStatements() error {
+	var err error
+	prepare := func(query string) *sql.Stmt {
+		if err != nil {
+			return nil
+		}
+		var s *sql.Stmt
+		s, err = db.conn.Prepare(query)
+		return s
+	}
+
+	db.stmtCountTransmissions = prepare("SELECT COUNT(*) FROM transmissions")
+	db.stmtCountObservations = prepare("SELECT COUNT(*) FROM observations")
+	db.stmtCountNodesActive = prepare("SELECT COUNT(*) FROM nodes WHERE last_seen > ?")
+	db.stmtCountNodesAll = prepare("SELECT COUNT(*) FROM nodes")
+	db.stmtCountObservers = prepare("SELECT COUNT(*) FROM observers WHERE inactive IS NULL OR inactive = 0")
+	db.stmtCountObsLastHour = prepare("SELECT COUNT(*) FROM observations WHERE timestamp > ?")
+	db.stmtCountObsLastDay = prepare("SELECT COUNT(*) FROM observations WHERE timestamp > ?")
+	db.stmtNodeLookup = prepare("SELECT public_key FROM nodes WHERE public_key = ? OR name = ? LIMIT 1")
+	db.stmtTxByHash = prepare("SELECT id FROM transmissions WHERE hash = ?")
+	db.stmtCountNodesByRole = prepare("SELECT COUNT(*) FROM nodes WHERE role = ? AND last_seen > ?")
+	db.stmtCountNodesByRoleAll = prepare("SELECT COUNT(*) FROM nodes WHERE role = ?")
+	db.stmtMaxTxID = prepare("SELECT COALESCE(MAX(id), 0) FROM transmissions")
+	db.stmtMaxObsID = prepare("SELECT COALESCE(MAX(id), 0) FROM observations")
+	return err
+}
+
+func (db *DB) Close() error {
+	// Close prepared statements
+	closers := []*sql.Stmt{
+		db.stmtCountTransmissions, db.stmtCountObservations,
+		db.stmtCountNodesActive, db.stmtCountNodesAll, db.stmtCountObservers,
+		db.stmtCountObsLastHour, db.stmtCountObsLastDay,
+		db.stmtNodeLookup, db.stmtTxByHash,
+		db.stmtCountNodesByRole, db.stmtCountNodesByRoleAll,
+		db.stmtMaxTxID, db.stmtMaxObsID,
+	}
+	for _, s := range closers {
+		if s != nil {
+			s.Close()
+		}
+	}
+	// No WAL checkpoint here. The connection is opened read-only (mode=ro in
+	// OpenDB), so PRAGMA wal_checkpoint(TRUNCATE) always fails with "disk I/O
+	// error (778)" on it. Attempting it emitted a misleading storage-fault line
+	// on every shutdown that wasted incident investigation time (#1901); the
+	// ingestor (the writer) owns checkpointing.
 	return db.conn.Close()
 }
 
-// detectSchema checks if the observations table uses v3 schema (observer_idx).
-func (db *DB) detectSchema() {
-	rows, err := db.conn.Query("PRAGMA table_info(observations)")
+// detectSchema probes the on-disk schema and sets the capability flags.
+//
+// It returns an error if any probe query fails. Previously these failures were
+// swallowed with a bare return, leaving isV3 (and the feature flags) at their
+// zero value for the whole process lifetime: a single transient failure of the
+// first PRAGMA silently ran v2 SQL against a v3 database until the process was
+// restarted (#1901). Detection is now all-or-nothing — on any probe error the
+// caller aborts startup so the supervisor can retry.
+func (db *DB) detectSchema(ctx context.Context, q rowQuerier) error {
+	obs, err := schemaColumns(ctx, q, "observations")
 	if err != nil {
-		return
+		return fmt.Errorf("probe observations: %w", err)
+	}
+	db.isV3 = obs["observer_idx"]
+	db.hasResolvedPath = obs["resolved_path"]
+	db.hasObsRawHex = obs["raw_hex"]
+
+	tx, err := schemaColumns(ctx, q, "transmissions")
+	if err != nil {
+		return fmt.Errorf("probe transmissions: %w", err)
+	}
+	db.hasScopeName = tx["scope_name"]
+	db.hasLastSeen = tx["last_seen"]
+
+	nodes, err := schemaColumns(ctx, q, "nodes")
+	if err != nil {
+		return fmt.Errorf("probe nodes: %w", err)
+	}
+	db.hasDefaultScope = nodes["default_scope"]
+	db.hasMultibyteSupCols = nodes["multibyte_sup"]
+
+	if db.isV3 {
+		log.Printf("[db] schema mode: v3 (observer_idx)")
+	} else {
+		log.Printf("[db] schema mode: v2 (observer_id)")
+	}
+	return nil
+}
+
+// rowQuerier is satisfied by both *sql.DB and *sql.Conn. detectSchema takes it
+// so it can run against a single pinned connection (see OpenDB) and be
+// unit-tested with an injected probe failure (#1901).
+type rowQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// schemaColumns returns the set of column names present on the given table via
+// PRAGMA table_info. Unlike the previous inline scans, a query or scan error is
+// returned rather than swallowed (#1901). The table name is a trusted literal
+// supplied by the caller, not user input.
+func schemaColumns(ctx context.Context, q rowQuerier, table string) (map[string]bool, error) {
+	rows, err := q.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
+	cols := make(map[string]bool)
 	for rows.Next() {
 		var cid int
-		var colName string
-		var colType sql.NullString
-		var notNull, pk int
+		var name string
+		var ctype sql.NullString
+		var notnull, pk int
 		var dflt sql.NullString
-		if rows.Scan(&cid, &colName, &colType, &notNull, &dflt, &pk) == nil {
-			if colName == "observer_idx" {
-				db.isV3 = true
-			}
-			if colName == "resolved_path" {
-				db.hasResolvedPath = true
-			}
-			if colName == "raw_hex" {
-				db.hasObsRawHex = true
-			}
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return nil, err
 		}
+		cols[name] = true
 	}
-
-	txRows, err := db.conn.Query("PRAGMA table_info(transmissions)")
-	if err != nil {
-		return
-	}
-	defer txRows.Close()
-	for txRows.Next() {
-		var cid int
-		var colName string
-		var colType sql.NullString
-		var notNull, pk int
-		var dflt sql.NullString
-		if txRows.Scan(&cid, &colName, &colType, &notNull, &dflt, &pk) == nil {
-			if colName == "scope_name" {
-				db.hasScopeName = true
-			}
-			if colName == "last_seen" {
-				db.hasLastSeen = true
-			}
-		}
-	}
-
-	nodeRows, err := db.conn.Query("PRAGMA table_info(nodes)")
-	if err != nil {
-		return
-	}
-	defer nodeRows.Close()
-	for nodeRows.Next() {
-		var cid int
-		var colName string
-		var colType sql.NullString
-		var notNull, pk int
-		var dflt sql.NullString
-		if nodeRows.Scan(&cid, &colName, &colType, &notNull, &dflt, &pk) == nil {
-			switch colName {
-			case "default_scope":
-				db.hasDefaultScope = true
-			case "multibyte_sup":
-				db.hasMultibyteSupCols = true
-			}
-		}
-	}
+	return cols, rows.Err()
 }
 
 // nodeSelectCols returns the SELECT column list for nodes queries.
@@ -339,24 +466,24 @@ type Stats struct {
 // GetStats returns aggregate counts (matches Node.js db.getStats shape).
 func (db *DB) GetStats() (*Stats, error) {
 	s := &Stats{}
-	err := db.conn.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&s.TotalTransmissions)
+	err := db.stmtQueryRow(db.stmtCountTransmissions, "SELECT COUNT(*) FROM transmissions").Scan(&s.TotalTransmissions)
 	if err != nil {
 		return nil, err
 	}
 	s.TotalPackets = s.TotalTransmissions
 
-	db.conn.QueryRow("SELECT COUNT(*) FROM observations").Scan(&s.TotalObservations)
+	db.stmtQueryRow(db.stmtCountObservations, "SELECT COUNT(*) FROM observations").Scan(&s.TotalObservations)
 	// Node.js uses 7-day active nodes for totalNodes
 	sevenDaysAgo := time.Now().Add(-7 * 24 * time.Hour).Format(time.RFC3339)
-	db.conn.QueryRow("SELECT COUNT(*) FROM nodes WHERE last_seen > ?", sevenDaysAgo).Scan(&s.TotalNodes)
-	db.conn.QueryRow("SELECT COUNT(*) FROM nodes").Scan(&s.TotalNodesAllTime)
-	db.conn.QueryRow("SELECT COUNT(*) FROM observers WHERE inactive IS NULL OR inactive = 0").Scan(&s.TotalObservers)
+	db.stmtQueryRow(db.stmtCountNodesActive, "SELECT COUNT(*) FROM nodes WHERE last_seen > ?", sevenDaysAgo).Scan(&s.TotalNodes)
+	db.stmtQueryRow(db.stmtCountNodesAll, "SELECT COUNT(*) FROM nodes").Scan(&s.TotalNodesAllTime)
+	db.stmtQueryRow(db.stmtCountObservers, "SELECT COUNT(*) FROM observers WHERE inactive IS NULL OR inactive = 0").Scan(&s.TotalObservers)
 
 	oneHourAgo := time.Now().Add(-1 * time.Hour).Unix()
-	db.conn.QueryRow("SELECT COUNT(*) FROM observations WHERE timestamp > ?", oneHourAgo).Scan(&s.PacketsLastHour)
+	db.stmtQueryRow(db.stmtCountObsLastHour, "SELECT COUNT(*) FROM observations WHERE timestamp > ?", oneHourAgo).Scan(&s.PacketsLastHour)
 
 	oneDayAgo := time.Now().Add(-24 * time.Hour).Unix()
-	db.conn.QueryRow("SELECT COUNT(*) FROM observations WHERE timestamp > ?", oneDayAgo).Scan(&s.PacketsLast24h)
+	db.stmtQueryRow(db.stmtCountObsLastDay, "SELECT COUNT(*) FROM observations WHERE timestamp > ?", oneDayAgo).Scan(&s.PacketsLast24h)
 
 	return s, nil
 }
@@ -478,7 +605,7 @@ func (db *DB) GetRoleCounts() map[string]int {
 	counts := map[string]int{}
 	for _, role := range []string{"repeater", "room", "companion", "sensor"} {
 		var c int
-		db.conn.QueryRow("SELECT COUNT(*) FROM nodes WHERE role = ? AND last_seen > ?", role, sevenDaysAgo).Scan(&c)
+		db.stmtQueryRow(db.stmtCountNodesByRole, "SELECT COUNT(*) FROM nodes WHERE role = ? AND last_seen > ?", role, sevenDaysAgo).Scan(&c)
 		counts[role+"s"] = c
 	}
 	return counts
@@ -489,7 +616,7 @@ func (db *DB) GetAllRoleCounts() map[string]int {
 	counts := map[string]int{}
 	for _, role := range []string{"repeater", "room", "companion", "sensor"} {
 		var c int
-		db.conn.QueryRow("SELECT COUNT(*) FROM nodes WHERE role = ?", role).Scan(&c)
+		db.stmtQueryRow(db.stmtCountNodesByRoleAll, "SELECT COUNT(*) FROM nodes WHERE role = ?", role).Scan(&c)
 		counts[role+"s"] = c
 	}
 	return counts
@@ -539,7 +666,7 @@ func (db *DB) QueryPackets(q PacketQuery) (*PacketResult, error) {
 	// Count transmissions (not observations)
 	var total int
 	if len(where) == 0 {
-		db.conn.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&total)
+		db.stmtQueryRow(db.stmtCountTransmissions, "SELECT COUNT(*) FROM transmissions").Scan(&total)
 	} else {
 		countSQL := fmt.Sprintf("SELECT COUNT(*) FROM transmissions t %s", w)
 		db.conn.QueryRow(countSQL, args...).Scan(&total)
@@ -591,7 +718,7 @@ func (db *DB) QueryGroupedPackets(q PacketQuery) (*PacketResult, error) {
 	// Count total transmissions (fast — queries transmissions directly, not a VIEW)
 	var total int
 	if len(where) == 0 {
-		db.conn.QueryRow("SELECT COUNT(*) FROM transmissions").Scan(&total)
+		db.stmtQueryRow(db.stmtCountTransmissions, "SELECT COUNT(*) FROM transmissions").Scan(&total)
 	} else {
 		db.conn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM transmissions t %s", w), args...).Scan(&total)
 	}
@@ -601,6 +728,13 @@ func (db *DB) QueryGroupedPackets(q PacketQuery) (*PacketResult, error) {
 	// codes across all observers of the transmission, with empty/NULL IATAs
 	// excluded. Frontend needs this on the DEFAULT COLLAPSED VIEW (where
 	// p._children is empty), so we compute it server-side.
+	//
+	// scope_name lives on the transmission row, so appending it as the last
+	// selected column is safe for both query shapes.
+	scopeNameCol := ""
+	if db.hasScopeName {
+		scopeNameCol = ", t.scope_name"
+	}
 	var querySQL string
 	if db.isV3 {
 		querySQL = fmt.Sprintf(`SELECT t.hash, t.first_seen, t.raw_hex, t.decoded_json, t.payload_type, t.route_type,
@@ -609,7 +743,7 @@ func (db *DB) QueryGroupedPackets(q PacketQuery) (*PacketResult, error) {
 			COALESCE((SELECT MAX(strftime('%%Y-%%m-%%dT%%H:%%M:%%fZ', oi.timestamp, 'unixepoch')) FROM observations oi WHERE oi.transmission_id = t.id), t.first_seen) AS latest,
 			obs.id AS observer_id, obs.name AS observer_name, COALESCE(obs.iata, '') AS observer_iata,
 			o.snr, o.rssi, o.path_json,
-			COALESCE((SELECT GROUP_CONCAT(DISTINCT obi.iata) FROM observations oi JOIN observers obi ON obi.rowid = oi.observer_idx WHERE oi.transmission_id = t.id AND obi.iata IS NOT NULL AND obi.iata != ''), '') AS distinct_iatas
+			COALESCE((SELECT GROUP_CONCAT(DISTINCT obi.iata) FROM observations oi JOIN observers obi ON obi.rowid = oi.observer_idx WHERE oi.transmission_id = t.id AND obi.iata IS NOT NULL AND obi.iata != ''), '') AS distinct_iatas`+scopeNameCol+`
 		FROM transmissions t
 		LEFT JOIN observations o ON o.id = (
 			SELECT id FROM observations WHERE transmission_id = t.id
@@ -624,7 +758,7 @@ func (db *DB) QueryGroupedPackets(q PacketQuery) (*PacketResult, error) {
 			COALESCE((SELECT MAX(oi.timestamp) FROM observations oi WHERE oi.transmission_id = t.id), t.first_seen) AS latest,
 			o.observer_id, o.observer_name, COALESCE(obs2.iata, '') AS observer_iata,
 			o.snr, o.rssi, o.path_json,
-			COALESCE((SELECT GROUP_CONCAT(DISTINCT obi.iata) FROM observations oi JOIN observers obi ON obi.id = oi.observer_id WHERE oi.transmission_id = t.id AND obi.iata IS NOT NULL AND obi.iata != ''), '') AS distinct_iatas
+			COALESCE((SELECT GROUP_CONCAT(DISTINCT obi.iata) FROM observations oi JOIN observers obi ON obi.id = oi.observer_id WHERE oi.transmission_id = t.id AND obi.iata IS NOT NULL AND obi.iata != ''), '') AS distinct_iatas`+scopeNameCol+`
 		FROM transmissions t
 		LEFT JOIN observations o ON o.id = (
 			SELECT id FROM observations WHERE transmission_id = t.id
@@ -650,10 +784,15 @@ func (db *DB) QueryGroupedPackets(q PacketQuery) (*PacketResult, error) {
 		var payloadType, routeType sql.NullInt64
 		var count, observerCount int
 		var snr, rssi sql.NullFloat64
+		var scopeName sql.NullString
 
-		if err := rows.Scan(&hash, &firstSeen, &rawHex, &decodedJSON, &payloadType, &routeType,
+		scanArgs := []interface{}{&hash, &firstSeen, &rawHex, &decodedJSON, &payloadType, &routeType,
 			&count, &observerCount, &latest,
-			&observerID, &observerName, &observerIATA, &snr, &rssi, &pathJSON, &distinctIatasCSV); err != nil {
+			&observerID, &observerName, &observerIATA, &snr, &rssi, &pathJSON, &distinctIatasCSV}
+		if db.hasScopeName {
+			scanArgs = append(scanArgs, &scopeName)
+		}
+		if err := rows.Scan(scanArgs...); err != nil {
 			continue
 		}
 
@@ -675,6 +814,7 @@ func (db *DB) QueryGroupedPackets(q PacketQuery) (*PacketResult, error) {
 			"decoded_json":      nullStr(decodedJSON),
 			"snr":               nullFloat(snr),
 			"rssi":              nullFloat(rssi),
+			"scope_name":        nullStr(scopeName),
 		})
 	}
 
@@ -823,7 +963,7 @@ func (db *DB) buildTransmissionWhere(q PacketQuery) ([]string, []interface{}) {
 
 func (db *DB) resolveNodePubkey(nodeIDOrName string) string {
 	var pk string
-	err := db.conn.QueryRow("SELECT public_key FROM nodes WHERE public_key = ? OR name = ? LIMIT 1", nodeIDOrName, nodeIDOrName).Scan(&pk)
+	err := db.stmtQueryRow(db.stmtNodeLookup, "SELECT public_key FROM nodes WHERE public_key = ? OR name = ? LIMIT 1", nodeIDOrName, nodeIDOrName).Scan(&pk)
 	if err != nil {
 		return nodeIDOrName
 	}
@@ -867,8 +1007,7 @@ func (db *DB) GetPacketByHash(hash string) (map[string]interface{}, error) {
 // when the in-memory PacketStore has pruned the entry but the DB still has it.
 func (db *DB) GetObservationsForHash(hash string) []map[string]interface{} {
 	var txID int
-	err := db.conn.QueryRow("SELECT id FROM transmissions WHERE hash = ?",
-		strings.ToLower(hash)).Scan(&txID)
+	err := db.stmtQueryRow(db.stmtTxByHash, "SELECT id FROM transmissions WHERE hash = ?", strings.ToLower(hash)).Scan(&txID)
 	if err != nil {
 		return nil
 	}
@@ -918,8 +1057,11 @@ func (db *DB) GetNodes(limit, offset int, role, search, before, lastHeard, sortB
 			if !db.isV3 {
 				joinCond = "obs.id = o.observer_id"
 			}
+			// #1143: from_pubkey is a dedicated, indexed column populated at
+			// ingest (and backfilled) for ADVERT rows specifically so pubkey
+			// lookups don't need to JSON_EXTRACT + parse decoded_json per row.
 			subq := fmt.Sprintf(`public_key IN (
-				SELECT DISTINCT JSON_EXTRACT(t.decoded_json, '$.pubKey')
+				SELECT DISTINCT t.from_pubkey
 				FROM transmissions t
 				JOIN observations o ON o.transmission_id = t.id
 				JOIN observers obs ON %s
@@ -1561,6 +1703,48 @@ func (db *DB) GetTraces(hash string) ([]map[string]interface{}, error) {
 	return traces, nil
 }
 
+// getChannelsCache returns the cached GetChannels result for key, if present
+// and unexpired.
+func (db *DB) getChannelsCache(key string) ([]map[string]interface{}, bool) {
+	db.channelsCacheMu.Lock()
+	defer db.channelsCacheMu.Unlock()
+	e, ok := db.channelsCache[key]
+	if !ok || time.Now().After(e.exp) {
+		return nil, false
+	}
+	return e.res, true
+}
+
+func (db *DB) setChannelsCache(key string, res []map[string]interface{}) {
+	db.channelsCacheMu.Lock()
+	defer db.channelsCacheMu.Unlock()
+	if db.channelsCache == nil || len(db.channelsCache) > maxCacheEntries {
+		db.channelsCache = make(map[string]channelsCacheEntry)
+	}
+	db.channelsCache[key] = channelsCacheEntry{res: res, exp: time.Now().Add(channelsCacheTTL)}
+}
+
+// getEncChannelsCache/setEncChannelsCache mirror getChannelsCache/
+// setChannelsCache for GetEncryptedChannels, which previously had no cache.
+func (db *DB) getEncChannelsCache(key string) ([]map[string]interface{}, bool) {
+	db.encChannelsCacheMu.Lock()
+	defer db.encChannelsCacheMu.Unlock()
+	e, ok := db.encChannelsCache[key]
+	if !ok || time.Now().After(e.exp) {
+		return nil, false
+	}
+	return e.res, true
+}
+
+func (db *DB) setEncChannelsCache(key string, res []map[string]interface{}) {
+	db.encChannelsCacheMu.Lock()
+	defer db.encChannelsCacheMu.Unlock()
+	if db.encChannelsCache == nil || len(db.encChannelsCache) > maxCacheEntries {
+		db.encChannelsCache = make(map[string]channelsCacheEntry)
+	}
+	db.encChannelsCache[key] = channelsCacheEntry{res: res, exp: time.Now().Add(channelsCacheTTL)}
+}
+
 // GetChannels returns channel list from GRP_TXT packets.
 // Queries transmissions directly (not a VIEW) to avoid observation-level
 // duplicates that could cause stale lastMessage when an older message has
@@ -1571,14 +1755,9 @@ func (db *DB) GetChannels(region ...string) ([]map[string]interface{}, error) {
 		regionParam = region[0]
 	}
 
-	// Check cache (60s TTL)
-	db.channelsCacheMu.Lock()
-	if db.channelsCacheRes != nil && db.channelsCacheKey == regionParam && time.Now().Before(db.channelsCacheExp) {
-		res := db.channelsCacheRes
-		db.channelsCacheMu.Unlock()
-		return res, nil
+	if cached, ok := db.getChannelsCache(regionParam); ok {
+		return cached, nil
 	}
-	db.channelsCacheMu.Unlock()
 
 	regionCodes := normalizeRegionCodes(regionParam)
 
@@ -1686,12 +1865,7 @@ func (db *DB) GetChannels(region ...string) ([]map[string]interface{}, error) {
 		})
 	}
 
-	// Store in cache (60s TTL)
-	db.channelsCacheMu.Lock()
-	db.channelsCacheRes = channels
-	db.channelsCacheKey = regionParam
-	db.channelsCacheExp = time.Now().Add(60 * time.Second)
-	db.channelsCacheMu.Unlock()
+	db.setChannelsCache(regionParam, channels)
 
 	return channels, nil
 }
@@ -1703,6 +1877,11 @@ func (db *DB) GetEncryptedChannels(region ...string) ([]map[string]interface{}, 
 	if len(region) > 0 {
 		regionParam = region[0]
 	}
+
+	if cached, ok := db.getEncChannelsCache(regionParam); ok {
+		return cached, nil
+	}
+
 	regionCodes := normalizeRegionCodes(regionParam)
 
 	var querySQL string
@@ -1779,7 +1958,33 @@ func (db *DB) GetEncryptedChannels(region ...string) ([]map[string]interface{}, 
 			"encrypted":    true,
 		})
 	}
+
+	db.setEncChannelsCache(regionParam, channels)
+
 	return channels, nil
+}
+
+// getMsgCache/setMsgCache cache GetChannelMessages results, keyed by
+// hash+limit+offset+region. GetChannelMessages previously had no cache at
+// all, so every page view/poll re-ran the full paginated query even though
+// polling the same page repeatedly is the common case.
+func (db *DB) getMsgCache(key string) ([]map[string]interface{}, int, bool) {
+	db.msgCacheMu.Lock()
+	defer db.msgCacheMu.Unlock()
+	e, ok := db.msgCache[key]
+	if !ok || time.Now().After(e.exp) {
+		return nil, 0, false
+	}
+	return e.msgs, e.total, true
+}
+
+func (db *DB) setMsgCache(key string, msgs []map[string]interface{}, total int) {
+	db.msgCacheMu.Lock()
+	defer db.msgCacheMu.Unlock()
+	if db.msgCache == nil || len(db.msgCache) > maxCacheEntries {
+		db.msgCache = make(map[string]channelMessagesCacheEntry)
+	}
+	db.msgCache[key] = channelMessagesCacheEntry{msgs: msgs, total: total, exp: time.Now().Add(msgCacheTTL)}
 }
 
 // GetChannelMessages returns messages for a specific channel.
@@ -1805,6 +2010,12 @@ func (db *DB) GetChannelMessages(channelHash string, limit, offset int, region .
 	if len(region) > 0 {
 		regionParam = region[0]
 	}
+
+	cacheKey := fmt.Sprintf("%s|%d|%d|%s", channelHash, limit, offset, regionParam)
+	if msgs, total, ok := db.getMsgCache(cacheKey); ok {
+		return msgs, total, nil
+	}
+
 	regionCodes := normalizeRegionCodes(regionParam)
 	regionArgs := make([]interface{}, 0, len(regionCodes))
 	regionPlaceholders := ""
@@ -1898,7 +2109,9 @@ func (db *DB) GetChannelMessages(channelHash string, limit, offset int, region .
 	idRows.Close()
 
 	if len(pageIDs) == 0 {
-		return []map[string]interface{}{}, total, nil
+		empty := []map[string]interface{}{}
+		db.setMsgCache(cacheKey, empty, total)
+		return empty, total, nil
 	}
 
 	// 3) Fetch observations for just this page of transmissions. We keep
@@ -2048,6 +2261,8 @@ func (db *DB) GetChannelMessages(channelHash string, limit, offset int, region .
 		messages = append(messages, e.data)
 	}
 
+	db.setMsgCache(cacheKey, messages, total)
+
 	return messages, total, nil
 }
 
@@ -2086,14 +2301,14 @@ func (db *DB) GetNewTransmissionsSince(lastID int, limit int) ([]map[string]inte
 // GetMaxTransmissionID returns the current max ID for polling.
 func (db *DB) GetMaxTransmissionID() int {
 	var maxID int
-	db.conn.QueryRow("SELECT COALESCE(MAX(id), 0) FROM transmissions").Scan(&maxID)
+	db.stmtQueryRow(db.stmtMaxTxID, "SELECT COALESCE(MAX(id), 0) FROM transmissions").Scan(&maxID)
 	return maxID
 }
 
 // GetMaxObservationID returns the current max observation ID for polling.
 func (db *DB) GetMaxObservationID() int {
 	var maxID int
-	db.conn.QueryRow("SELECT COALESCE(MAX(id), 0) FROM observations").Scan(&maxID)
+	db.stmtQueryRow(db.stmtMaxObsID, "SELECT COALESCE(MAX(id), 0) FROM observations").Scan(&maxID)
 	return maxID
 }
 
@@ -2343,6 +2558,17 @@ func nullStrVal(ns sql.NullString) string {
 		return ns.String
 	}
 	return ""
+}
+
+// nullStrPtr preserves the NULL/"" distinction that nullStrVal collapses.
+// transmissions.scope_name needs it: NULL means "not transport-scoped" while
+// "" means "transport-scoped, region unmatched" (#899).
+func nullStrPtr(ns sql.NullString) *string {
+	if !ns.Valid {
+		return nil
+	}
+	s := ns.String
+	return &s
 }
 
 func nilIfEmpty(s string) interface{} {
@@ -2689,17 +2915,6 @@ func (db *DB) GetMetricsSummary(since string) ([]MetricsSummaryRow, error) {
 
 // (PruneOldMetrics / RemoveStaleObservers removed in #1283 — see note
 // above the MetricsSample type. Ingestor owns these writes now.)
-
-// TouchNodeLastSeen updates last_seen for a node identified by full public key.
-// Only updates if the new timestamp is newer than the existing value (or NULL).
-// Returns nil even if no rows are affected (node doesn't exist).
-func (db *DB) TouchNodeLastSeen(pubkey string, timestamp string) error {
-	_, err := db.conn.Exec(
-		"UPDATE nodes SET last_seen = ? WHERE public_key = ? AND (last_seen IS NULL OR last_seen < ?)",
-		timestamp, pubkey, timestamp,
-	)
-	return err
-}
 
 // GetDroppedPackets returns recently dropped packets, newest first.
 func (db *DB) GetDroppedPackets(limit int, observerID, nodePubkey string) ([]map[string]interface{}, error) {

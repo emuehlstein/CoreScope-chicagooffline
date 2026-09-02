@@ -1427,45 +1427,6 @@ func (s *Store) UpsertObserverNeighborReport(id, iata string, report *NeighborRe
 	return nil
 }
 
-// UpsertObserverNeighborReport records an observer-reported neighbor table
-// from the meshcore/<iata>/<observer>/neighbors topic.
-//
-// Deliberately does NOT touch last_seen or packet_count: a neighbors report
-// is observer self-metadata on its own (24h-default) cadence, not a packet
-// observation, and letting it bump last_seen would make a silent observer
-// look alive once a day. It also does not reactivate an inactive observer,
-// for the same reason.
-//
-// report must be non-nil; a zero-neighbor report is valid and meaningful
-// ("reporting, currently hears nobody") and is stored as count 0, which is
-// distinct from NULL ("never reported").
-func (s *Store) UpsertObserverNeighborReport(id, iata string, report *NeighborReport) error {
-	if report == nil {
-		return nil
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	normalizedIATA := strings.TrimSpace(strings.ToUpper(iata))
-
-	var total interface{}
-	if report.Total != nil {
-		total = *report.Total
-	}
-	truncated := 0
-	if report.Truncated {
-		truncated = 1
-	}
-
-	_, err := s.stmtUpsertObserverNeighbors.Exec(
-		id, normalizedIATA, now, now, report.Count, total, truncated,
-		normalizedIATA, now, report.Count, total, truncated,
-	)
-	if err != nil {
-		s.Stats.WriteErrors.Add(1)
-		return err
-	}
-	return nil
-}
-
 // Close checkpoints the WAL and closes the database.
 func (s *Store) Close() error {
 	s.backfillWg.Wait()

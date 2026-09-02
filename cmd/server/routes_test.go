@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1031,8 +1032,43 @@ func TestObserverAnalytics(t *testing.T) {
 		if body["recentPackets"] == nil {
 			t.Error("expected recentPackets")
 		}
-		if recent, ok := body["recentPackets"].([]interface{}); !ok || len(recent) == 0 {
+		recent, ok := body["recentPackets"].([]interface{})
+		if !ok || len(recent) == 0 {
 			t.Errorf("expected non-empty recentPackets, got %v", body["recentPackets"])
+		}
+
+		// #1827: packetTypes must still reflect the real per-transmission
+		// payload_type after switching the hot loop from enrichObs() to a
+		// direct s.store.byTxID read. seedTestData gives obs1 three
+		// observations: tx1 (payload_type=4), tx2 (payload_type=5), tx3
+		// (payload_type=4) — i.e. counts {"4":2, "5":1}.
+		pt, ok := body["packetTypes"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected packetTypes to be an object, got %T", body["packetTypes"])
+		}
+		if pt["4"] != float64(2) {
+			t.Errorf("expected packetTypes[4]=2, got %v", pt["4"])
+		}
+		if pt["5"] != float64(1) {
+			t.Errorf("expected packetTypes[5]=1, got %v", pt["5"])
+		}
+
+		// recentPackets is still built via the unchanged enrichObs() path
+		// and should retain resolved_path for observations that have one
+		// (tx1's first observation, resolved via obs1).
+		foundResolved := false
+		for _, rp := range recent {
+			m, ok := rp.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if m["resolved_path"] != nil {
+				foundResolved = true
+				break
+			}
+		}
+		if !foundResolved {
+			t.Error("expected at least one recentPackets entry to carry resolved_path")
 		}
 	})
 
@@ -1055,6 +1091,67 @@ func TestObserverAnalytics(t *testing.T) {
 			t.Fatalf("expected 200, got %d", w.Code)
 		}
 	})
+}
+
+// TestObserverAnalytics_ConcurrentByTxIDMutation_1830 is the -race
+// regression requested in #1830: handleObserverAnalytics reads
+// s.store.byTxID (directly, and via enrichObsWithTx) for every observation
+// in the window. Before the #1830 fix those reads happened after the
+// snapshot RLock was released, racing with concurrent ingest/eviction
+// writers to that same map. This test hammers the endpoint concurrently
+// with goroutines that mutate byTxID exactly like ingest/eviction would,
+// and must pass under `go test -race`.
+func TestObserverAnalytics_ConcurrentByTxIDMutation_1830(t *testing.T) {
+	srv, router := setupTestServer(t)
+
+	stop := make(chan struct{})
+	var writers sync.WaitGroup
+	var readers sync.WaitGroup
+
+	// Writer goroutines: mutate byTxID under s.store.mu, like ingest
+	// (adds) and eviction (deletes) do in production. They run until
+	// stop is closed, which happens once all readers are done below.
+	for w := 0; w < 4; w++ {
+		writers.Add(1)
+		go func(base int) {
+			defer writers.Done()
+			n := 0
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				srv.store.mu.Lock()
+				id := base*100000 + n
+				srv.store.byTxID[id] = &StoreTx{ID: id, PayloadType: intPtr(4)}
+				delete(srv.store.byTxID, id-1)
+				srv.store.mu.Unlock()
+				n++
+			}
+		}(w)
+	}
+
+	// Reader goroutines: repeatedly hit the endpoint under test.
+	for r := 0; r < 8; r++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for i := 0; i < 50; i++ {
+				req := httptest.NewRequest("GET", "/api/observers/obs1/analytics", nil)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				if w.Code != 200 {
+					t.Errorf("expected 200, got %d", w.Code)
+					return
+				}
+			}
+		}()
+	}
+
+	readers.Wait()
+	close(stop)
+	writers.Wait()
 }
 
 func TestChannelMessages(t *testing.T) {
@@ -4180,6 +4277,11 @@ func TestHandleScopeStats(t *testing.T) {
 	}
 	srv.db.hasScopeName = true
 
+	// Clear seed transmissions so this test isolates scope-stats math.
+	if _, err := srv.db.conn.Exec(`DELETE FROM transmissions`); err != nil {
+		t.Fatalf("clear transmissions: %v", err)
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	// 2 scoped (known region), 1 unknown-scoped (empty string), 1 unscoped (NULL)
 	rows := []struct {
@@ -4191,6 +4293,8 @@ func TestHandleScopeStats(t *testing.T) {
 		{"h2", "#belgium", 3},
 		{"h3", "", 0},      // transport-scoped, no region match
 		{"h4_null", "", 0}, // will be inserted with NULL scope_name
+		{"h5_nt1", "", 1},  // non-transport FLOOD — inherently unscoped (#1838)
+		{"h6_nt2", "", 2},  // non-transport DIRECT — inherently unscoped (#1838)
 	}
 	for i, r := range rows {
 		var scopeArg interface{} = r.scope
@@ -4225,8 +4329,8 @@ func TestHandleScopeStats(t *testing.T) {
 	if resp.Summary.Scoped != 3 { // 2 named + 1 unknown-scoped (empty string, non-NULL)
 		t.Errorf("scoped = %d, want 3", resp.Summary.Scoped)
 	}
-	if resp.Summary.Unscoped != 1 {
-		t.Errorf("unscoped = %d, want 1", resp.Summary.Unscoped)
+	if resp.Summary.Unscoped != 3 { // 1 transport-null + 2 non-transport routes 1,2 (#1838)
+		t.Errorf("unscoped = %d, want 3", resp.Summary.Unscoped)
 	}
 	if resp.Summary.UnknownScope != 1 {
 		t.Errorf("unknownScope = %d, want 1", resp.Summary.UnknownScope)

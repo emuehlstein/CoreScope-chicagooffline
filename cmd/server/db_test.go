@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -2254,21 +2257,26 @@ func TestGetScopeStats(t *testing.T) {
 	db.conn.Exec(`INSERT INTO transmissions (hash, first_seen, route_type, scope_name) VALUES ('b', ?, 0, '')`, now)
 	// Transport unscoped (NULL)
 	db.conn.Exec(`INSERT INTO transmissions (hash, first_seen, route_type, scope_name) VALUES ('c', ?, 0, NULL)`, now)
-	// Non-transport (should not count)
+	// Non-transport FLOOD (route_type=1) — inherently unscoped per MeshCore protocol (#1838)
 	db.conn.Exec(`INSERT INTO transmissions (hash, first_seen, route_type, scope_name) VALUES ('d', ?, 1, NULL)`, now)
+	// Non-transport DIRECT (route_type=2) — inherently unscoped per MeshCore protocol (#1838)
+	db.conn.Exec(`INSERT INTO transmissions (hash, first_seen, route_type, scope_name) VALUES ('e', ?, 2, NULL)`, now)
 
 	stats, err := db.GetScopeStats("24h")
 	if err != nil {
 		t.Fatalf("GetScopeStats: %v", err)
 	}
+	// TransportTotal still counts only routes 0+3 (transport-code-carrying).
 	if stats.Summary.TransportTotal != 3 {
 		t.Errorf("TransportTotal = %d, want 3", stats.Summary.TransportTotal)
 	}
 	if stats.Summary.Scoped != 2 {
 		t.Errorf("Scoped = %d, want 2", stats.Summary.Scoped)
 	}
-	if stats.Summary.Unscoped != 1 {
-		t.Errorf("Unscoped = %d, want 1", stats.Summary.Unscoped)
+	// Unscoped now folds in non-transport (routes 1+2) — see #1838.
+	// 1 transport-NULL + 2 non-transport (routes 1 and 2) = 3.
+	if stats.Summary.Unscoped != 3 {
+		t.Errorf("Unscoped = %d, want 3 (1 transport-null + 2 non-transport)", stats.Summary.Unscoped)
 	}
 	if stats.Summary.UnknownScope != 1 {
 		t.Errorf("UnknownScope = %d, want 1", stats.Summary.UnknownScope)
@@ -2321,4 +2329,99 @@ func TestLoadIndexesRelayHopsFromResolvedPath(t *testing.T) {
 	if store.byNode[relayPubkey][0].Hash != "relaytest0001hash" {
 		t.Errorf("relay byNode entry has wrong hash: %s", store.byNode[relayPubkey][0].Hash)
 	}
+}
+
+// failingQuerier wraps a real *sql.DB but forces the PRAGMA probe for a chosen
+// table to fail, so the #1901 fail-loud path can be exercised deterministically.
+type failingQuerier struct {
+	real   *sql.DB
+	failOn string // if the query text contains this substring, return err
+	err    error
+}
+
+func (f *failingQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if f.failOn != "" && strings.Contains(query, f.failOn) {
+		return nil, f.err
+	}
+	return f.real.QueryContext(ctx, query, args...)
+}
+
+// TestDetectSchemaFailsLoudOnProbeError is the regression guard for #1901: a
+// probe-query failure must surface as an error so OpenDB can abort startup,
+// instead of being silently swallowed and leaving the server in v2 mode against
+// a v3 database for the whole process lifetime.
+func TestDetectSchemaFailsLoudOnProbeError(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "v3.db")
+	conn, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.SetMaxOpenConns(1)
+	// v3-shaped: observations carries observer_idx.
+	if _, err := conn.Exec(`CREATE TABLE observations (id INTEGER PRIMARY KEY, observer_idx INTEGER)`); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	conn.Exec(`CREATE TABLE transmissions (id INTEGER PRIMARY KEY)`)
+	conn.Exec(`CREATE TABLE nodes (public_key TEXT PRIMARY KEY)`)
+	conn.Close()
+
+	real, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer real.Close()
+
+	q := &failingQuerier{real: real, failOn: "table_info(observations)", err: errors.New("injected probe failure")}
+	db := &DB{}
+	if err := db.detectSchema(context.Background(), q); err == nil {
+		t.Fatal("detectSchema must return an error when a schema probe fails (#1901)")
+	}
+	if db.isV3 {
+		t.Error("isV3 must not be set when detection failed")
+	}
+}
+
+// TestDetectSchemaV3AndV2 verifies detection sets isV3 correctly for both schema
+// shapes via the real OpenDB path, and that both open cleanly.
+func TestDetectSchemaV3AndV2(t *testing.T) {
+	dir := t.TempDir()
+
+	v3 := filepath.Join(dir, "v3.db")
+	c, err := sql.Open("sqlite", v3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetMaxOpenConns(1)
+	c.Exec(`CREATE TABLE observations (id INTEGER PRIMARY KEY, observer_idx INTEGER)`)
+	c.Exec(`CREATE TABLE transmissions (id INTEGER PRIMARY KEY, hash TEXT)`)
+	c.Exec(`CREATE TABLE nodes (public_key TEXT PRIMARY KEY)`)
+	c.Close()
+	db, err := OpenDB(v3)
+	if err != nil {
+		t.Fatalf("OpenDB v3: %v", err)
+	}
+	if !db.isV3 {
+		t.Error("isV3 should be true when observations.observer_idx exists")
+	}
+	db.Close()
+
+	v2 := filepath.Join(dir, "v2.db")
+	c2, err := sql.Open("sqlite", v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2.SetMaxOpenConns(1)
+	c2.Exec(`CREATE TABLE observations (id INTEGER PRIMARY KEY, observer_id INTEGER)`)
+	c2.Exec(`CREATE TABLE transmissions (id INTEGER PRIMARY KEY, hash TEXT)`)
+	c2.Exec(`CREATE TABLE nodes (public_key TEXT PRIMARY KEY)`)
+	c2.Close()
+	db2, err := OpenDB(v2)
+	if err != nil {
+		t.Fatalf("OpenDB v2: %v", err)
+	}
+	if db2.isV3 {
+		t.Error("isV3 should be false when observations has no observer_idx")
+	}
+	db2.Close()
 }

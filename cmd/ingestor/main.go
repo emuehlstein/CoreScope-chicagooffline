@@ -101,8 +101,15 @@ func main() {
 		log.Printf("No channel keys loaded — GRP_TXT packets will not be decrypted")
 	}
 
-	regionKeys := loadRegionKeys(cfg)
-	store.BackfillDefaultScopeAsync(regionKeys)
+	regionSet := newRegionKeySet(cfg)
+	if cfg.AutoRegionKeysEnabled() {
+		// Fill the derived tier before the first packet is matched, so a
+		// restart does not spend a refresh interval naming nothing.
+		regionSet.refreshFromStore(store)
+	} else {
+		log.Printf("[regions] autoRegionKeys disabled — only the %d configured hashRegions key(s) are in force", len(regionSet.snapshot().all))
+	}
+	store.BackfillDefaultScopeAsync(regionSet)
 	store.BackfillTransportCodesAsync()
 
 	// Subscribe-early + buffer (#1608): the MQTT subscription is brought up
@@ -181,7 +188,7 @@ func main() {
 			markReceiptForTag(tag, time.Now())
 			status.MarkPacket(time.Now())
 			ingestBuffer.Submit(func() {
-				handleMessage(store, tag, src, m, channelKeys, regionKeys, cfg)
+				handleMessage(store, tag, src, m, channelKeys, regionSet, cfg)
 			})
 		})
 
@@ -420,6 +427,22 @@ func main() {
 		}
 	}
 
+	// Derived region keys refresh on their own ticker rather than the daily
+	// retention one: declared-region answers arrive continuously (an observer
+	// report lands, a node is asked again), and waiting up to 24h to name a
+	// newly-discovered region would defeat the point of deriving them.
+	if cfg.AutoRegionKeysEnabled() {
+		interval := time.Duration(cfg.AutoRegionKeysRefreshMinutes()) * time.Minute
+		regionRefreshTicker := time.NewTicker(interval)
+		go func() {
+			for range regionRefreshTicker.C {
+				regionSet.refreshFromStore(store)
+				logScopeMatchCounters()
+			}
+		}()
+		log.Printf("[regions] auto-derived region keys enabled: refreshing every %v, cap %d", interval, cfg.AutoRegionKeysMaxDerived())
+	}
+
 	// Hourly WAL checkpoint to prevent unbounded WAL growth.
 	// TRUNCATE resets the WAL file to zero bytes when all frames are flushed;
 	// if the server's read connection holds frames, remaining pages stay in the
@@ -654,7 +677,7 @@ func buildForceReconnectFn(client mqtt.Client, tag string) func() {
 	}
 }
 
-func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionKeys map[string][]byte, cfg *Config) {
+func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionSet *regionKeySet, cfg *Config) {
 	// Liveness watchdog (#1212): record receipt before any processing so a
 	// slow handler still counts as "source is alive". Cheap atomic store.
 	markLivenessForTag(tag, time.Now())
@@ -698,7 +721,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		switch parts[3] {
 		case "packets":
 			if cfg.ClientRxCoverageEnabled() {
-				handleClientPacket(store, cfg, tag, parts[2], msg, channelKeys, regionKeys)
+				handleClientPacket(store, cfg, tag, parts[2], msg, channelKeys, regionSet)
 			}
 		case "rf":
 			if cfg.ClientRfSamplesEnabled() {
@@ -726,26 +749,30 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		return
 	}
 
-	// Neighbors topic: meshcore/<region>/<observer_id>/neighbors
-	//
-	// Observer-reported neighbor table, published on its own cadence
-	// (firmware default: every 24h, gated on mqtt.neighbors). This is the
-	// authoritative "who is actually reporting neighbors" signal and is
-	// deliberately kept distinct from neighbor_edges, which is INFERRED
-	// from observation co-reception by neighbor_builder.go.
+	// Neighbors report topic: meshcore/<region>/<observer_id>/neighbors.
+	// Two independent consumers of the same publication, kept deliberately
+	// separate:
+	//   - handleNeighborsReport (upstream #1865): parses `self` + each
+	//     zero-hop neighbor's OTA scope query result and records CONFIRMED
+	//     region scopes into nodes.configured_scope.
+	//   - extractNeighborReport/UpsertObserverNeighborReport (fork #2):
+	//     the authoritative "who is actually reporting neighbors" signal —
+	//     count/total/truncated bookkeeping on the observers table. Kept
+	//     distinct from neighbor_edges, which is INFERRED from observation
+	//     co-reception by neighbor_builder.go, and distinct from #1865's
+	//     scope-confirmation concern.
 	//
 	// Like /status, the per-source IATA filter does not gate this: it is
 	// observer self-metadata, not packet ingestion.
 	if len(parts) >= 4 && parts[3] == "neighbors" {
 		observerID := parts[2]
-		report := extractNeighborReport(msg)
-		if report == nil {
+		handleNeighborsReport(store, tag, observerID, msg)
+		if report := extractNeighborReport(msg); report != nil {
 			// Malformed / unrecognized payload shape — don't write a
 			// report timestamp we can't substantiate.
-			return
-		}
-		if err := store.UpsertObserverNeighborReport(observerID, parts[1], report); err != nil {
-			log.Printf("MQTT [%s] observer neighbors error: %v", tag, err)
+			if err := store.UpsertObserverNeighborReport(observerID, parts[1], report); err != nil {
+				log.Printf("MQTT [%s] observer neighbors error: %v", tag, err)
+			}
 		}
 		return
 	}
@@ -959,7 +986,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 				log.Printf("MQTT [%s] foreign advert: node=%s name=%s lat=%.4f lon=%.4f observer=%s",
 					tag, truncPK, sanitizeLogString(decoded.Payload.Name), lat, lon, sanitizeLogString(firstNonEmpty(mqttMsg.Origin, observerID)))
 			}
-			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionKeys)
+			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionSet)
 			pktData.Foreign = foreign
 			isNew, err := store.InsertTransmission(pktData)
 			if err != nil {
@@ -994,7 +1021,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		} else {
 			// Non-ADVERT packets: store normally (routing/channel messages from
 			// in-area observers are relevant regardless of relay hop origin).
-			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionKeys)
+			pktData := BuildPacketData(mqttMsg, decoded, observerID, region, regionSet)
 			if _, err := store.InsertTransmission(pktData); err != nil {
 				log.Printf("MQTT [%s] db insert error: %v", tag, err)
 			}
@@ -1711,12 +1738,25 @@ func loadRegionKeys(cfg *Config) map[string][]byte {
 	return keys
 }
 
-// matchScope performs one HMAC-SHA256 per configured region. Expected
-// len(regionKeys) ≤ 50; beyond that, consider a pre-indexed lookup table.
-func matchScope(regionKeys map[string][]byte, payloadType byte, payloadRaw []byte, code1 string) string {
+// matchingRegions returns every configured region whose derived code equals
+// the packet's code1, rather than the first one found.
+//
+// The distinction matters because code1 is two bytes: two configured regions
+// collide on a given payload with probability 1/65536, and at 159 keys on a
+// live instance that is roughly 0.25% of transport-scoped packets, hundreds a
+// week rather than a curiosity. Returning the first match made the stored
+// region name depend on Go's randomised map iteration order, so the same
+// packet could be named differently on two runs and neither answer was
+// evidence of anything.
+//
+// The cost is unchanged: this is the same single pass over the same keys, it
+// just does not stop early. There is no indexable shortcut, because code1 is
+// an HMAC over the payload and nothing here is payload-independent.
+func matchingRegions(regionKeys map[string][]byte, payloadType byte, payloadRaw []byte, code1 string) []string {
 	if code1 == "0000" || len(regionKeys) == 0 || len(payloadRaw) == 0 {
-		return ""
+		return nil
 	}
+	var matched []string
 	for name, key := range regionKeys {
 		mac := hmac.New(sha256.New, key)
 		mac.Write([]byte{payloadType})
@@ -1730,10 +1770,10 @@ func matchScope(regionKeys map[string][]byte, payloadType byte, payloadRaw []byt
 		}
 		codeBytes := [2]byte{byte(code & 0xFF), byte(code >> 8)}
 		if strings.ToUpper(hex.EncodeToString(codeBytes[:])) == code1 {
-			return name
+			matched = append(matched, name)
 		}
 	}
-	return ""
+	return matched
 }
 
 // Version info (set via ldflags)
@@ -1743,6 +1783,57 @@ func init() {
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		fmt.Println("corescope-ingestor", version)
 		os.Exit(0)
+	}
+}
+
+// handleNeighborsReport ingests an observer /neighbors report (#1865) and
+// records CONFIRMED region scopes into nodes.configured_scope:
+//   - the observer's own scopes from `self`, keyed by origin_id (the observer
+//     node pubkey), which need no OTA query and are always trusted; and
+//   - each neighbor whose OTA scope query returned status=="responded".
+//
+// Per the report contract: neighbors with any other status (e.g. "timeout")
+// are skipped — a failed query is NOT evidence the scopes were cleared — and a
+// missing neighbor is never a signal (the report is 10 KB-capped and truncates
+// by ordering, so absent != gone). Report pubkeys are uppercase; nodes.public_key
+// is lowercase hex, so keys are lowercased before the UPDATE. Unknown neighbors
+// are a no-op (the UPDATE matches no row) until a later advert creates the node.
+func handleNeighborsReport(store *Store, tag string, observerID string, msg map[string]interface{}) {
+	reportedAt, _ := msg["timestamp"].(string)
+
+	// self: the observer's own configured scopes.
+	originID, _ := msg["origin_id"].(string)
+	if originID == "" {
+		originID = observerID
+	}
+	originID = strings.ToLower(originID)
+	if self, ok := msg["self"].(map[string]interface{}); ok && originID != "" {
+		if sc, ok := self["scopes"].(string); ok {
+			if err := store.UpdateNodeConfiguredScope(originID, sc, reportedAt); err != nil {
+				log.Printf("MQTT [%s] neighbors self scope error: %v", tag, err)
+			}
+		}
+	}
+
+	// neighbors[]: only status=="responded" carries usable scope evidence.
+	neighbors, _ := msg["neighbors"].([]interface{})
+	for _, raw := range neighbors {
+		n, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if status, _ := n["status"].(string); status != "responded" {
+			continue
+		}
+		pubkey, _ := n["pubkey"].(string)
+		pubkey = strings.ToLower(pubkey)
+		if pubkey == "" {
+			continue
+		}
+		scopes, _ := n["scopes"].(string)
+		if err := store.UpdateNodeConfiguredScope(pubkey, scopes, reportedAt); err != nil {
+			log.Printf("MQTT [%s] neighbors scope error for %.8s: %v", tag, pubkey, err)
+		}
 	}
 }
 

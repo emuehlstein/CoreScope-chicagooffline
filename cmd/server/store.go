@@ -65,6 +65,9 @@ type StoreTx struct {
 	// Dedup map: "observerID|pathJSON" → true for O(1) duplicate checks
 	obsKeys     map[string]bool
 	observerSet map[string]bool // unique observer IDs (for UniqueObserverCount)
+	// accountedBytes is what trackedBytes was last charged for this tx
+	// (observations excluded). See rechargeTx.
+	accountedBytes int64
 }
 
 // StoreObs is a lean in-memory observation (no duplication of transmission fields).
@@ -221,8 +224,13 @@ type PacketStore struct {
 	recompObserversClockSkew *analyticsRecomputer
 	recompNodesClockSkew     *analyticsRecomputer
 	recompRetransmissions    *analyticsRecomputer
-	cacheHits                int64
-	cacheMisses              int64
+	recompDirectHeard        *analyticsRecomputer
+	// directHeardSnap holds the latest directHeardIndex published by
+	// recompDirectHeard. Separate from the recomputer's own cache so
+	// readers never touch analyticsRecomputerMu. See direct_heard.go.
+	directHeardSnap atomic.Value
+	cacheHits       int64
+	cacheMisses     int64
 	// Rate-limited invalidation (fixes #533: caches cleared faster than hit)
 	lastInvalidated time.Time
 	pendingInv      *cacheInvalidation // accumulated dirty flags during cooldown
@@ -922,7 +930,7 @@ func (s *PacketStore) Load() error {
 				s.byPayloadType[pt] = append(s.byPayloadType[pt], tx)
 			}
 			s.trackAdvertPubkey(tx)
-			s.trackedBytes += estimateStoreTxBytes(tx)
+			s.trackedBytes += rechargeTx(tx)
 		}
 
 		if obsID.Valid {
@@ -1006,6 +1014,7 @@ func (s *PacketStore) Load() error {
 	// now that pickBestObservation has propagated the best path.
 	for _, tx := range s.packets {
 		pickBestObservation(tx)
+		s.trackedBytes += rechargeTx(tx)
 		s.indexByNode(tx)
 	}
 
@@ -1244,7 +1253,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 			if txID > localMaxTxID {
 				localMaxTxID = txID
 			}
-			localTrackedBytes += estimateStoreTxBytes(tx)
+			localTrackedBytes += rechargeTx(tx)
 		}
 
 		if obsID.Valid {
@@ -1325,6 +1334,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 	// Pick best observation for each local packet before merging.
 	for _, tx := range localPackets {
 		pickBestObservation(tx)
+		localTrackedBytes += rechargeTx(tx)
 	}
 
 	if len(localPackets) == 0 {
@@ -1441,7 +1451,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 	// critical section. After this point the new state is fully visible;
 	// before it readers see the old slice (which is still fully indexed).
 	s.mu.Lock()
-	s.packets = append(localPackets, s.packets...)
+	s.packets = mergeChunkIntoPackets(localPackets, s.packets)
 	s.totalObs += localTotalObs
 	s.trackedBytes += localTrackedBytes
 	if localMaxTxID > s.maxTxID {
@@ -1683,6 +1693,19 @@ func pickBestObservation(tx *StoreTx) {
 	tx.PathJSON = best.PathJSON
 	tx.Direction = best.Direction
 	tx.pathParsed = false // invalidate cached parsed path
+}
+
+// rechargeTx re-estimates tx and returns the change since it was last charged,
+// for the caller to add to trackedBytes. A tx is first charged when it is
+// created, before its observations are merged, so its path costs (byPathHop,
+// spTxIndex) are unknown then: call this again once pickBestObservation has
+// set the path. Eviction subtracts accountedBytes, so the running total stays
+// consistent however often the path changed in between.
+func rechargeTx(tx *StoreTx) int64 {
+	est := estimateStoreTxBytes(tx)
+	d := est - tx.accountedBytes
+	tx.accountedBytes = est
+	return d
 }
 
 func pathLen(pathJSON string) int {
@@ -2813,7 +2836,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 				s.byPayloadType[pt] = append(s.byPayloadType[pt], tx)
 			}
 			s.trackAdvertPubkey(tx)
-			s.trackedBytes += estimateStoreTxBytes(tx)
+			s.trackedBytes += rechargeTx(tx)
 
 			if _, exists := broadcastTxs[r.txID]; !exists {
 				broadcastTxs[r.txID] = tx
@@ -2889,6 +2912,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	// Pick best observation for new transmissions
 	for _, tx := range broadcastTxs {
 		pickBestObservation(tx)
+		s.trackedBytes += rechargeTx(tx)
 	}
 
 	// Incrementally update precomputed subpath index with new transmissions
@@ -3280,6 +3304,7 @@ func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]
 	}
 	for _, tx := range updatedTxs {
 		pickBestObservation(tx)
+		s.trackedBytes += rechargeTx(tx)
 	}
 	pathHopMutated := false
 	for txID, tx := range updatedTxs {
@@ -4559,6 +4584,17 @@ const (
 
 	// Per subpath entry in spTxIndex: string key + slice append + pointer
 	perSubpathEntryBytes = 40
+
+	// ParsedDecoded caches json.Unmarshal of DecodedJSON as a
+	// map[string]interface{}: measured at about 4x the JSON length on a
+	// production heap profile. Analytics touch every tx, so it is charged
+	// up front rather than when the cache fills.
+	decodedCacheFactor = 4
+
+	// Per obs: the tx.obsKeys dedup entry ("observerID|pathJSON" key string
+	// plus bucket slot); the key is built by concatenation, so its bytes are
+	// a separate allocation from the obs fields.
+	obsKeyEntryBytes = 16 + indexEntryBytes + 1
 )
 
 // estimateStoreTxBytes returns the estimated memory cost of a StoreTx (excluding observations).
@@ -4567,6 +4603,7 @@ func estimateStoreTxBytes(tx *StoreTx) int64 {
 	base := int64(storeTxBaseBytes)
 	base += int64(len(tx.RawHex) + len(tx.Hash) + len(tx.DecodedJSON) + len(tx.PathJSON))
 	base += int64(numIndexesPerTx * indexEntryBytes)
+	base += int64(decodedCacheFactor * len(tx.DecodedJSON))
 
 	// Per-tx maps: obsKeys + observerSet
 	base += perTxMapsBytes
@@ -4591,13 +4628,15 @@ func estimateStoreTxBytesTypical(numObs int) int64 {
 	// Typical tx: ~64 byte hash, ~200 byte decoded JSON, ~40 byte path, 3 hops
 	base := int64(storeTxBaseBytes) + 64 + 200 + 40
 	base += int64(numIndexesPerTx * indexEntryBytes)
+	base += decodedCacheFactor * 200
 	base += perTxMapsBytes
 	hops := int64(3)
 	base += hops * perPathHopBytes
 	base += (hops * (hops - 1) / 2) * perSubpathEntryBytes
 	// Add observation costs
-	obsBase := int64(storeObsBaseBytes) + 30 + 30 + 60 // observer ID + name + path
+	obsBase := int64(storeObsBaseBytes) + 30 + 30 + 60 + 25 // observer ID + name + path + timestamp
 	obsBase += int64(numIndexesPerObs * indexEntryBytes)
+	obsBase += obsKeyEntryBytes + 30 + 60 // dedup key: observer ID + path
 	// No per-obs ResolvedPath overhead (#800)
 	base += int64(numObs) * obsBase
 	return base
@@ -4607,8 +4646,10 @@ func estimateStoreTxBytesTypical(numObs int) int64 {
 // ResolvedPath membership index overhead is tracked separately.
 func estimateStoreObsBytes(obs *StoreObs) int64 {
 	base := int64(storeObsBaseBytes)
-	base += int64(len(obs.PathJSON) + len(obs.ObserverID))
+	base += int64(len(obs.PathJSON) + len(obs.ObserverID) + len(obs.ObserverName) +
+		len(obs.ObserverIATA) + len(obs.Direction) + len(obs.RawHex) + len(obs.Timestamp))
 	base += int64(numIndexesPerObs * indexEntryBytes)
+	base += int64(obsKeyEntryBytes + len(obs.ObserverID) + len(obs.PathJSON))
 	// ResolvedPath field removed (#800) — no per-obs RP overhead
 	return base
 }
@@ -4665,7 +4706,7 @@ func (s *PacketStore) evictionCandidateTxIDs() []int {
 			memCutoff := cutoffIdx
 			for memCutoff < len(s.packets) && (s.trackedBytes-bytesToEvict) > lowWatermark {
 				tx := s.packets[memCutoff]
-				bytesToEvict += estimateStoreTxBytes(tx)
+				bytesToEvict += tx.accountedBytes
 				for _, obs := range tx.Observations {
 					bytesToEvict += estimateStoreObsBytes(obs)
 				}
@@ -4707,6 +4748,47 @@ func (s *PacketStore) EvictStale() int {
 	return s.evictStaleInternal(nil)
 }
 
+// mergeChunkIntoPackets merges a background chunk into the packet slice while
+// keeping the invariant s.packets is declared with: "sorted by first_seen ASC
+// (oldest first; newest at tail)". Retention eviction depends on it, walking
+// from the head and stopping at the first transmission inside the window, so a
+// slice that is out of order is silently under-evicted rather than noisily
+// wrong.
+//
+// The chunk cannot simply be put in front. Chunks are selected by last_seen,
+// so a transmission first heard weeks ago and heard again recently arrives in
+// a recent chunk carrying its old FirstSeen. On a production database 2071 of
+// the 236080 transmissions in a 14 day window have a first_seen more than a
+// day older than their last_seen, 1848 of them more than a week.
+//
+// Linear on purpose: this runs under s.mu once per chunk, and re-sorting the
+// whole slice there would mean sorting hundreds of thousands of packets while
+// ingest waits. The chunk itself is sorted first, which is the only
+// comparison sort involved and is bounded by one chunk. LoadChunked does its
+// own sort once at the end of the initial load; this keeps that invariant true
+// for every chunk merged afterwards.
+func mergeChunkIntoPackets(chunk, existing []*StoreTx) []*StoreTx {
+	less := func(i, j int) bool { return chunk[i].FirstSeen < chunk[j].FirstSeen }
+	if !sort.SliceIsSorted(chunk, less) {
+		sort.SliceStable(chunk, less)
+	}
+
+	out := make([]*StoreTx, 0, len(chunk)+len(existing))
+	i, j := 0, 0
+	for i < len(chunk) && j < len(existing) {
+		if chunk[i].FirstSeen <= existing[j].FirstSeen {
+			out = append(out, chunk[i])
+			i++
+		} else {
+			out = append(out, existing[j])
+			j++
+		}
+	}
+	out = append(out, chunk[i:]...)
+	out = append(out, existing[j:]...)
+	return out
+}
+
 func (s *PacketStore) evictStaleInternal(rpBatch map[int][]string) int {
 	if s.retentionHours <= 0 && s.maxMemoryMB <= 0 {
 		return 0
@@ -4734,7 +4816,7 @@ func (s *PacketStore) evictStaleInternal(rpBatch map[int][]string) int {
 			memCutoff := cutoffIdx
 			for memCutoff < len(s.packets) && (s.trackedBytes-bytesToEvict) > lowWatermark {
 				tx := s.packets[memCutoff]
-				bytesToEvict += estimateStoreTxBytes(tx)
+				bytesToEvict += tx.accountedBytes
 				for _, obs := range tx.Observations {
 					bytesToEvict += estimateStoreObsBytes(obs)
 				}
@@ -4779,7 +4861,7 @@ func (s *PacketStore) evictStaleInternal(rpBatch map[int][]string) int {
 		delete(s.byHash, tx.Hash)
 		delete(s.byTxID, tx.ID)
 		evictedTxIDs[tx.ID] = struct{}{}
-		evictedBytes += estimateStoreTxBytes(tx)
+		evictedBytes += tx.accountedBytes
 
 		for _, obs := range tx.Observations {
 			delete(s.byObsID, obs.ID)
@@ -9299,6 +9381,10 @@ func (s *PacketStore) GetBulkHealth(limit int, region, area string) []map[string
 		areaNodes = s.resolveAreaNodes(area)
 	}
 
+	// Loaded before s.mu so the lock order stays s.mu → analyticsRecomputerMu.
+	directHeard := s.loadDirectHeard()
+	nonRelaySet, seenSet := s.canRelaySets()
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -9378,11 +9464,10 @@ func (s *PacketStore) GetBulkHealth(limit int, region, area string) []map[string
 		var snrSum float64
 		var snrCount int
 		var lastHeard string
-		observerStats := map[string]*struct {
-			name                       string
-			snrSum, rssiSum            float64
-			snrCount, rssiCount, count int
-		}{}
+		// See GetNodeHealth: this set is "saw traffic involving the node",
+		// which is not "heard the node". Only the direct-RF rows below carry
+		// signal numbers.
+		relayObservers := map[string]struct{}{}
 		totalObservations := 0
 
 		for _, pkt := range packets {
@@ -9400,46 +9485,14 @@ func (s *PacketStore) GetBulkHealth(limit int, region, area string) []map[string
 			if lastHeard == "" || pkt.FirstSeen > lastHeard {
 				lastHeard = pkt.FirstSeen
 			}
-			obsID := pkt.ObserverID
-			if obsID != "" {
-				obs := observerStats[obsID]
-				if obs == nil {
-					obs = &struct {
-						name                       string
-						snrSum, rssiSum            float64
-						snrCount, rssiCount, count int
-					}{name: pkt.ObserverName}
-					observerStats[obsID] = obs
-				}
-				obs.count++
-				if pkt.SNR != nil {
-					obs.snrSum += *pkt.SNR
-					obs.snrCount++
-				}
-				if pkt.RSSI != nil {
-					obs.rssiSum += *pkt.RSSI
-					obs.rssiCount++
-				}
+			if pkt.ObserverID != "" {
+				relayObservers[pkt.ObserverID] = struct{}{}
 			}
 		}
 
-		observerRows := make([]map[string]interface{}, 0)
-		for id, o := range observerStats {
-			var avgSnr, avgRssi interface{}
-			if o.snrCount > 0 {
-				avgSnr = o.snrSum / float64(o.snrCount)
-			}
-			if o.rssiCount > 0 {
-				avgRssi = o.rssiSum / float64(o.rssiCount)
-			}
-			observerRows = append(observerRows, map[string]interface{}{
-				"observer_id": id, "observer_name": o.name,
-				"avgSnr": avgSnr, "avgRssi": avgRssi, "packetCount": o.count,
-			})
-		}
-		sort.Slice(observerRows, func(i, j int) bool {
-			return observerRows[i]["packetCount"].(int) > observerRows[j]["packetCount"].(int)
-		})
+		directByObs := directHeard[strings.ToLower(n.pk)]
+		observerRows := buildDirectObserverRows(directByObs, nonRelaySet, seenSet)
+		relayObserverCount := relayOnlyObserverCount(relayObservers, directByObs)
 
 		var avgSnr interface{}
 		if snrCount > 0 {
@@ -9464,7 +9517,8 @@ func (s *PacketStore) GetBulkHealth(limit int, region, area string) []map[string
 				"avgSnr":             avgSnr,
 				"lastHeard":          lhVal,
 			},
-			"observers": observerRows,
+			"observers":          observerRows,
+			"relayObserverCount": relayObserverCount,
 		})
 	}
 
@@ -9497,6 +9551,10 @@ func (s *PacketStore) GetNodeHealth(pubkey string) (map[string]interface{}, erro
 		}
 	}
 
+	// Loaded before taking s.mu so the lock order stays s.mu →
+	// analyticsRecomputerMu everywhere (computeDirectHeard takes s.mu).
+	directHeard := s.loadDirectHeard()
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -9510,11 +9568,12 @@ func (s *PacketStore) GetNodeHealth(pubkey string) (map[string]interface{}, erro
 	var lastHeard string
 	totalObservations := 0
 
-	observerStats := map[string]*struct {
-		name                       string
-		snrSum, rssiSum            float64
-		snrCount, rssiCount, count int
-	}{}
+	// Observers that saw traffic involving this node — as originator, as a
+	// destination, or as a resolved relay hop. Seeing a packet is not
+	// hearing the node: the SNR/RSSI on such a transmission belongs to
+	// whichever node last transmitted the copy this observer received. Only
+	// the direct-RF set below may carry signal numbers. See direct_heard.go.
+	relayObservers := map[string]struct{}{}
 
 	for _, pkt := range packets {
 		totalObservations += pkt.ObservationCount
@@ -9534,85 +9593,15 @@ func (s *PacketStore) GetNodeHealth(pubkey string) (map[string]interface{}, erro
 			totalHops += len(hops)
 			hopCount++
 		}
-		// Observer stats
-		obsID := pkt.ObserverID
-		if obsID != "" {
-			obs := observerStats[obsID]
-			if obs == nil {
-				obs = &struct {
-					name                       string
-					snrSum, rssiSum            float64
-					snrCount, rssiCount, count int
-				}{name: pkt.ObserverName}
-				observerStats[obsID] = obs
-			}
-			obs.count++
-			if pkt.SNR != nil {
-				obs.snrSum += *pkt.SNR
-				obs.snrCount++
-			}
-			if pkt.RSSI != nil {
-				obs.rssiSum += *pkt.RSSI
-				obs.rssiCount++
-			}
+		if pkt.ObserverID != "" {
+			relayObservers[pkt.ObserverID] = struct{}{}
 		}
 	}
 
-	observerRows := make([]map[string]interface{}, 0)
-	// Issue #1290: surface listener/repeater hint on node detail by
-	// looking up can_relay for each observer that heard this node.
-	// One-shot fetch of the non-relay set keeps this O(observers) on
-	// rare events; nil on error degrades to "neither badge" client-side.
-	// Issue #1290: keep this set lowercase to match the convention used
-	// by the resolver (cmd/server/store.go pm.nonRelay) and by
-	// GetNonRelayObserverPubkeys (which already returns LOWER(id)).
-	// Two case conventions on the same upstream string would be a
-	// latent regression waiting for any refactor that touches the
-	// observer-id normalization layer.
-	nonRelaySet := map[string]struct{}{}
-	// PR #1624 MAJOR-2: tri-state badge needs to distinguish "confirmed
-	// repeater" (seen=1, can_relay=1) from "unknown" (seen=0). Build
-	// the set of observers we have NO repeat-field record for so the
-	// badge is nil/omitted for them — matches nodes.js:679 tri-state.
-	seenSet := map[string]struct{}{}
-	if s.db != nil && s.db.conn != nil {
-		if pks, err := s.db.GetNonRelayObserverPubkeys(); err == nil {
-			for _, pk := range pks {
-				nonRelaySet[strings.ToLower(pk)] = struct{}{}
-			}
-		}
-		if pks, err := s.db.GetCanRelaySeenObserverPubkeys(); err == nil {
-			for _, pk := range pks {
-				seenSet[strings.ToLower(pk)] = struct{}{}
-			}
-		}
-	}
-	for id, o := range observerStats {
-		var avgSnr, avgRssi interface{}
-		if o.snrCount > 0 {
-			avgSnr = o.snrSum / float64(o.snrCount)
-		}
-		if o.rssiCount > 0 {
-			avgRssi = o.rssiSum / float64(o.rssiCount)
-		}
-		idLower := strings.ToLower(id)
-		var canRelay interface{} // nil = unknown (no repeat field ever)
-		if _, seen := seenSet[idLower]; seen {
-			if _, isListener := nonRelaySet[idLower]; isListener {
-				canRelay = false
-			} else {
-				canRelay = true
-			}
-		}
-		observerRows = append(observerRows, map[string]interface{}{
-			"observer_id": id, "observer_name": o.name,
-			"avgSnr": avgSnr, "avgRssi": avgRssi, "packetCount": o.count,
-			"can_relay": canRelay,
-		})
-	}
-	sort.Slice(observerRows, func(i, j int) bool {
-		return observerRows[i]["packetCount"].(int) > observerRows[j]["packetCount"].(int)
-	})
+	nonRelaySet, seenSet := s.canRelaySets()
+	directByObs := directHeard[strings.ToLower(pubkey)]
+	observerRows := buildDirectObserverRows(directByObs, nonRelaySet, seenSet)
+	relayObserverCount := relayOnlyObserverCount(relayObservers, directByObs)
 
 	var avgSnr interface{}
 	if snrCount > 0 {
@@ -9640,8 +9629,14 @@ func (s *PacketStore) GetNodeHealth(pubkey string) (map[string]interface{}, erro
 	}
 
 	return map[string]interface{}{
-		"node":      node,
+		"node": node,
+		// Direct-RF only: observers that received this node's own
+		// transmission off the air.
 		"observers": observerRows,
+		// Observers that saw traffic through this node without hearing it.
+		// The stats below count that relayed traffic too, so the card needs
+		// the number to stay consistent with them.
+		"relayObserverCount": relayObserverCount,
 		"stats": map[string]interface{}{
 			"totalTransmissions": len(packets),
 			"totalObservations":  totalObservations,

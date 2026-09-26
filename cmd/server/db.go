@@ -11,11 +11,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/meshcore-analyzer/dbschema"
 	"github.com/meshcore-analyzer/geofilter"
+	"golang.org/x/sync/singleflight"
 )
 
 // routeTypeTransport covers TRANSPORT_FLOOD (0) and TRANSPORT_DIRECT (3) —
@@ -43,18 +45,38 @@ type DB struct {
 	hasScopeName            bool   // transmissions.scope_name column exists (#899)
 	hasDefaultScope         bool   // nodes.default_scope column exists (#899)
 	hasConfiguredScope      bool   // nodes.configured_scope column exists (#1865)
-	hasDeclaredRegionsTable bool   // node_declared_regions table exists (#1975, optional second scope source)
+	hasDeclaredRegionsTable bool   // node_declared_regions table exists at startup (#1975); read via declaredRegionsTablePresent
 	hasMultibyteSupCols     bool   // nodes/inactive_nodes have multibyte_sup/multibyte_evidence (#903)
 	hasLastSeen             bool   // transmissions.last_seen column exists (#1690)
+
+	// declaredRegionsTableLate latches true once node_declared_regions is found
+	// after startup. The ingestor creates that table, and the two processes
+	// start together, so on the first run of a build that adds it the server's
+	// startup probe can lose the race. See declaredRegionsTablePresent.
+	declaredRegionsTableLate atomic.Bool
 
 	// Channel list caches, keyed by region param — avoids repeated GROUP BY
 	// scans (#762). Keyed per-region (not a single slot) so mixed-region
 	// traffic doesn't evict and re-run the query on every request.
 	channelsCacheMu sync.Mutex
 	channelsCache   map[string]channelsCacheEntry
+	// Collapses the TTL-boundary herd (same #1910 pattern as statsSF/
+	// regionMembershipSF): without this, every request that arrives while
+	// the cache is expired reruns the region-scoped GROUP BY scan itself.
+	// Measured live: a single cold request ran 3-5s, 5 concurrent requests
+	// for the same region ran ~8s each, all serialized against each other.
+	channelsSF singleflight.Group
+	// Test-only hook fired immediately before the real GetChannels query
+	// executes inside channelsSF's flight (i.e. once per coalesced miss,
+	// not once per caller). Nil in production. See db_singleflight_test.go.
+	channelsQueryHook func()
 
 	encChannelsCacheMu sync.Mutex
 	encChannelsCache   map[string]channelsCacheEntry
+	encChannelsSF      singleflight.Group
+	// Test-only hook, same contract as channelsQueryHook but for
+	// GetEncryptedChannels. Nil in production.
+	encChannelsQueryHook func()
 
 	// Channel messages cache, keyed by hash+limit+offset+region. Unlike
 	// GetChannels, this previously had no cache at all — every page
@@ -1044,6 +1066,56 @@ func (db *DB) GetObservationsForHash(hash string) []map[string]interface{} {
 	return obsByTx[txID]
 }
 
+// ObservationRawHexForHash returns the stored wire bytes per observation id for
+// one transmission, keyed by observations.id. Empty when the schema has no
+// observations.raw_hex column (#881 made it optional) or nothing is stored.
+//
+// Why this is read on demand instead of held in memory (#1999): the store
+// deliberately does not retain obs.RawHex. #881 measured ~98MB wasted on a
+// ~1.7M-observation store, because at the time the frames were believed to be
+// identical per transmission ("same content hash implies same frame"). They are
+// not: the firmware hashes payload and type independently of the relay path, so
+// observations of one transmission legitimately carry different bytes. Keeping
+// the memory saving and paying one query on the packet-detail path, which is a
+// single packet a human is looking at, is the trade this makes.
+//
+// Two indexed lookups, one query, regardless of how many observations the
+// transmission has: transmissions.hash via idx_transmissions_hash (the prepared
+// stmtTxByHash), then observations.transmission_id via
+// idx_observations_transmission_id.
+func (db *DB) ObservationRawHexForHash(hash string) map[int]string {
+	if db == nil || db.conn == nil || !db.hasObsRawHex || hash == "" {
+		return nil
+	}
+	var txID int
+	if err := db.stmtQueryRow(db.stmtTxByHash, "SELECT id FROM transmissions WHERE hash = ?",
+		strings.ToLower(hash)).Scan(&txID); err != nil {
+		return nil
+	}
+	rows, err := db.conn.Query(
+		`SELECT id, raw_hex FROM observations
+		 WHERE transmission_id = ? AND raw_hex IS NOT NULL AND raw_hex <> ''`, txID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make(map[int]string)
+	for rows.Next() {
+		var id int
+		var hx sql.NullString
+		if err := rows.Scan(&id, &hx); err != nil {
+			continue
+		}
+		if hx.Valid && hx.String != "" {
+			out[id] = hx.String
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil
+	}
+	return out
+}
+
 // GetNodes returns filtered, paginated node list.
 func (db *DB) GetNodes(limit, offset int, role, search, before, lastHeard, sortBy, region string) ([]map[string]interface{}, int, map[string]int, error) {
 	var where []string
@@ -1788,128 +1860,144 @@ func (db *DB) GetChannels(region ...string) ([]map[string]interface{}, error) {
 		return cached, nil
 	}
 
-	regionCodes := normalizeRegionCodes(regionParam)
-
-	var querySQL string
-	args := make([]interface{}, 0, len(regionCodes))
-
-	if len(regionCodes) > 0 {
-		placeholders := make([]string, len(regionCodes))
-		for i, code := range regionCodes {
-			placeholders[i] = "?"
-			args = append(args, code)
+	v, err, _ := db.channelsSF.Do(regionParam, func() (interface{}, error) {
+		// Double-check inside the flight: a previous winner may have stored a
+		// fresh result between this caller's read above and its arrival here.
+		if cached, ok := db.getChannelsCache(regionParam); ok {
+			return cached, nil
 		}
-		regionPlaceholder := strings.Join(placeholders, ",")
-		// #1899: the sample_json subquery is region-scoped too, so its placeholders
-		// appear FIRST in the statement (it sits in the SELECT list, ahead of the
-		// WHERE). Bind the codes twice, subquery set first.
-		args = append(append(make([]interface{}, 0, len(regionCodes)*2), args...), args...)
-		if db.isV3 {
-			querySQL = fmt.Sprintf(`SELECT t.channel_hash,
-					COUNT(*) AS msg_count,
-					MAX(t.first_seen) AS last_activity,
-					(SELECT t2.decoded_json FROM transmissions t2
-					 JOIN observations o2 ON o2.transmission_id = t2.id
-					 LEFT JOIN observers obs2 ON obs2.rowid = o2.observer_idx
-					 WHERE t2.channel_hash = t.channel_hash AND t2.payload_type = 5
-					 AND obs2.rowid IS NOT NULL AND UPPER(TRIM(obs2.iata)) IN (%s)
-					 ORDER BY t2.first_seen DESC LIMIT 1) AS sample_json
-				FROM transmissions t
-				JOIN observations o ON o.transmission_id = t.id
-				LEFT JOIN observers obs ON obs.rowid = o.observer_idx
-				WHERE t.payload_type = 5
-				AND t.channel_hash IS NOT NULL
-				AND t.channel_hash NOT LIKE 'enc_%%'
-				AND obs.rowid IS NOT NULL AND UPPER(TRIM(obs.iata)) IN (%s)
-				GROUP BY t.channel_hash
-				ORDER BY last_activity DESC`, regionPlaceholder, regionPlaceholder)
+
+		if db.channelsQueryHook != nil {
+			db.channelsQueryHook()
+		}
+
+		regionCodes := normalizeRegionCodes(regionParam)
+
+		var querySQL string
+		args := make([]interface{}, 0, len(regionCodes))
+
+		if len(regionCodes) > 0 {
+			placeholders := make([]string, len(regionCodes))
+			for i, code := range regionCodes {
+				placeholders[i] = "?"
+				args = append(args, code)
+			}
+			regionPlaceholder := strings.Join(placeholders, ",")
+			// #1899: the sample_json subquery is region-scoped too, so its placeholders
+			// appear FIRST in the statement (it sits in the SELECT list, ahead of the
+			// WHERE). Bind the codes twice, subquery set first.
+			args = append(append(make([]interface{}, 0, len(regionCodes)*2), args...), args...)
+			if db.isV3 {
+				querySQL = fmt.Sprintf(`SELECT t.channel_hash,
+						COUNT(*) AS msg_count,
+						MAX(t.first_seen) AS last_activity,
+						(SELECT t2.decoded_json FROM transmissions t2
+						 JOIN observations o2 ON o2.transmission_id = t2.id
+						 LEFT JOIN observers obs2 ON obs2.rowid = o2.observer_idx
+						 WHERE t2.channel_hash = t.channel_hash AND t2.payload_type = 5
+						 AND obs2.rowid IS NOT NULL AND UPPER(TRIM(obs2.iata)) IN (%s)
+						 ORDER BY t2.first_seen DESC LIMIT 1) AS sample_json
+					FROM transmissions t
+					JOIN observations o ON o.transmission_id = t.id
+					LEFT JOIN observers obs ON obs.rowid = o.observer_idx
+					WHERE t.payload_type = 5
+					AND t.channel_hash IS NOT NULL
+					AND t.channel_hash NOT LIKE 'enc_%%'
+					AND obs.rowid IS NOT NULL AND UPPER(TRIM(obs.iata)) IN (%s)
+					GROUP BY t.channel_hash
+					ORDER BY last_activity DESC`, regionPlaceholder, regionPlaceholder)
+			} else {
+				querySQL = fmt.Sprintf(`SELECT t.channel_hash,
+						COUNT(*) AS msg_count,
+						MAX(t.first_seen) AS last_activity,
+						(SELECT t2.decoded_json FROM transmissions t2
+						 JOIN observations o2 ON o2.transmission_id = t2.id
+						 WHERE t2.channel_hash = t.channel_hash AND t2.payload_type = 5
+						 AND EXISTS (
+							SELECT 1 FROM observers obs2
+							WHERE obs2.id = o2.observer_id
+							AND UPPER(TRIM(obs2.iata)) IN (%s)
+						 )
+						 ORDER BY t2.first_seen DESC LIMIT 1) AS sample_json
+					FROM transmissions t
+					JOIN observations o ON o.transmission_id = t.id
+					WHERE t.payload_type = 5
+					AND t.channel_hash IS NOT NULL
+					AND t.channel_hash NOT LIKE 'enc_%%'
+					AND EXISTS (
+						SELECT 1 FROM observers obs
+						WHERE obs.id = o.observer_id
+						AND UPPER(TRIM(obs.iata)) IN (%s)
+					)
+					GROUP BY t.channel_hash
+					ORDER BY last_activity DESC`, regionPlaceholder, regionPlaceholder)
+			}
 		} else {
-			querySQL = fmt.Sprintf(`SELECT t.channel_hash,
+			querySQL = `SELECT channel_hash,
 					COUNT(*) AS msg_count,
-					MAX(t.first_seen) AS last_activity,
+					MAX(first_seen) AS last_activity,
 					(SELECT t2.decoded_json FROM transmissions t2
-					 JOIN observations o2 ON o2.transmission_id = t2.id
 					 WHERE t2.channel_hash = t.channel_hash AND t2.payload_type = 5
-					 AND EXISTS (
-						SELECT 1 FROM observers obs2
-						WHERE obs2.id = o2.observer_id
-						AND UPPER(TRIM(obs2.iata)) IN (%s)
-					 )
 					 ORDER BY t2.first_seen DESC LIMIT 1) AS sample_json
 				FROM transmissions t
-				JOIN observations o ON o.transmission_id = t.id
-				WHERE t.payload_type = 5
-				AND t.channel_hash IS NOT NULL
-				AND t.channel_hash NOT LIKE 'enc_%%'
-				AND EXISTS (
-					SELECT 1 FROM observers obs
-					WHERE obs.id = o.observer_id
-					AND UPPER(TRIM(obs.iata)) IN (%s)
-				)
-				GROUP BY t.channel_hash
-				ORDER BY last_activity DESC`, regionPlaceholder, regionPlaceholder)
-		}
-	} else {
-		querySQL = `SELECT channel_hash,
-				COUNT(*) AS msg_count,
-				MAX(first_seen) AS last_activity,
-				(SELECT t2.decoded_json FROM transmissions t2
-				 WHERE t2.channel_hash = t.channel_hash AND t2.payload_type = 5
-				 ORDER BY t2.first_seen DESC LIMIT 1) AS sample_json
-			FROM transmissions t
-			WHERE payload_type = 5
-			AND channel_hash IS NOT NULL
-			AND channel_hash NOT LIKE 'enc_%%'
-			GROUP BY channel_hash
-			ORDER BY last_activity DESC`
-	}
-
-	rows, err := db.conn.Query(querySQL, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	channels := make([]map[string]interface{}, 0)
-	for rows.Next() {
-		var chHash, lastActivity, sampleJSON sql.NullString
-		var msgCount int
-		if err := rows.Scan(&chHash, &msgCount, &lastActivity, &sampleJSON); err != nil {
-			continue
-		}
-		channelName := nullStr(chHash)
-		if channelName == "" {
-			continue
+				WHERE payload_type = 5
+				AND channel_hash IS NOT NULL
+				AND channel_hash NOT LIKE 'enc_%%'
+				GROUP BY channel_hash
+				ORDER BY last_activity DESC`
 		}
 
-		var lastMessage, lastSender interface{}
-		if sampleJSON.Valid {
-			var decoded map[string]interface{}
-			if json.Unmarshal([]byte(sampleJSON.String), &decoded) == nil {
-				if text, ok := decoded["text"].(string); ok && text != "" {
-					idx := strings.Index(text, ": ")
-					if idx > 0 {
-						lastMessage = text[idx+2:]
-					} else {
-						lastMessage = text
-					}
-					if sender, ok := decoded["sender"].(string); ok {
-						lastSender = sender
+		rows, err := db.conn.Query(querySQL, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		channels := make([]map[string]interface{}, 0)
+		for rows.Next() {
+			var chHash, lastActivity, sampleJSON sql.NullString
+			var msgCount int
+			if err := rows.Scan(&chHash, &msgCount, &lastActivity, &sampleJSON); err != nil {
+				continue
+			}
+			channelName := nullStr(chHash)
+			if channelName == "" {
+				continue
+			}
+
+			var lastMessage, lastSender interface{}
+			if sampleJSON.Valid {
+				var decoded map[string]interface{}
+				if json.Unmarshal([]byte(sampleJSON.String), &decoded) == nil {
+					if text, ok := decoded["text"].(string); ok && text != "" {
+						idx := strings.Index(text, ": ")
+						if idx > 0 {
+							lastMessage = text[idx+2:]
+						} else {
+							lastMessage = text
+						}
+						if sender, ok := decoded["sender"].(string); ok {
+							lastSender = sender
+						}
 					}
 				}
 			}
+
+			channels = append(channels, map[string]interface{}{
+				"hash": channelName, "name": channelName,
+				"lastMessage": lastMessage, "lastSender": lastSender,
+				"messageCount": msgCount, "lastActivity": nullStr(lastActivity),
+			})
 		}
 
-		channels = append(channels, map[string]interface{}{
-			"hash": channelName, "name": channelName,
-			"lastMessage": lastMessage, "lastSender": lastSender,
-			"messageCount": msgCount, "lastActivity": nullStr(lastActivity),
-		})
+		db.setChannelsCache(regionParam, channels)
+
+		return channels, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	db.setChannelsCache(regionParam, channels)
-
-	return channels, nil
+	return v.([]map[string]interface{}), nil
 }
 
 // GetEncryptedChannels returns channels where all messages are undecryptable (no key).
@@ -1924,86 +2012,102 @@ func (db *DB) GetEncryptedChannels(region ...string) ([]map[string]interface{}, 
 		return cached, nil
 	}
 
-	regionCodes := normalizeRegionCodes(regionParam)
-
-	var querySQL string
-	args := make([]interface{}, 0, len(regionCodes))
-
-	if len(regionCodes) > 0 {
-		placeholders := make([]string, len(regionCodes))
-		for i, code := range regionCodes {
-			placeholders[i] = "?"
-			args = append(args, code)
+	v, err, _ := db.encChannelsSF.Do(regionParam, func() (interface{}, error) {
+		// Double-check inside the flight: a previous winner may have stored a
+		// fresh result between this caller's read above and its arrival here.
+		if cached, ok := db.getEncChannelsCache(regionParam); ok {
+			return cached, nil
 		}
-		regionPlaceholder := strings.Join(placeholders, ",")
-		if db.isV3 {
-			querySQL = fmt.Sprintf(`SELECT t.channel_hash,
-					COUNT(*) AS msg_count,
-					MAX(t.first_seen) AS last_activity
-				FROM transmissions t
-				JOIN observations o ON o.transmission_id = t.id
-				LEFT JOIN observers obs ON obs.rowid = o.observer_idx
-				WHERE t.payload_type = 5
-				AND t.channel_hash LIKE 'enc_%%'
-				AND obs.rowid IS NOT NULL AND UPPER(TRIM(obs.iata)) IN (%s)
-				GROUP BY t.channel_hash
-				ORDER BY last_activity DESC`, regionPlaceholder)
+
+		if db.encChannelsQueryHook != nil {
+			db.encChannelsQueryHook()
+		}
+
+		regionCodes := normalizeRegionCodes(regionParam)
+
+		var querySQL string
+		args := make([]interface{}, 0, len(regionCodes))
+
+		if len(regionCodes) > 0 {
+			placeholders := make([]string, len(regionCodes))
+			for i, code := range regionCodes {
+				placeholders[i] = "?"
+				args = append(args, code)
+			}
+			regionPlaceholder := strings.Join(placeholders, ",")
+			if db.isV3 {
+				querySQL = fmt.Sprintf(`SELECT t.channel_hash,
+						COUNT(*) AS msg_count,
+						MAX(t.first_seen) AS last_activity
+					FROM transmissions t
+					JOIN observations o ON o.transmission_id = t.id
+					LEFT JOIN observers obs ON obs.rowid = o.observer_idx
+					WHERE t.payload_type = 5
+					AND t.channel_hash LIKE 'enc_%%'
+					AND obs.rowid IS NOT NULL AND UPPER(TRIM(obs.iata)) IN (%s)
+					GROUP BY t.channel_hash
+					ORDER BY last_activity DESC`, regionPlaceholder)
+			} else {
+				querySQL = fmt.Sprintf(`SELECT t.channel_hash,
+						COUNT(*) AS msg_count,
+						MAX(t.first_seen) AS last_activity
+					FROM transmissions t
+					JOIN observations o ON o.transmission_id = t.id
+					WHERE t.payload_type = 5
+					AND t.channel_hash LIKE 'enc_%%'
+					AND EXISTS (
+						SELECT 1 FROM observers obs
+						WHERE obs.id = o.observer_id
+						AND UPPER(TRIM(obs.iata)) IN (%s)
+					)
+					GROUP BY t.channel_hash
+					ORDER BY last_activity DESC`, regionPlaceholder)
+			}
 		} else {
-			querySQL = fmt.Sprintf(`SELECT t.channel_hash,
+			querySQL = `SELECT channel_hash,
 					COUNT(*) AS msg_count,
-					MAX(t.first_seen) AS last_activity
-				FROM transmissions t
-				JOIN observations o ON o.transmission_id = t.id
-				WHERE t.payload_type = 5
-				AND t.channel_hash LIKE 'enc_%%'
-				AND EXISTS (
-					SELECT 1 FROM observers obs
-					WHERE obs.id = o.observer_id
-					AND UPPER(TRIM(obs.iata)) IN (%s)
-				)
-				GROUP BY t.channel_hash
-				ORDER BY last_activity DESC`, regionPlaceholder)
+					MAX(first_seen) AS last_activity
+				FROM transmissions
+				WHERE payload_type = 5
+				AND channel_hash LIKE 'enc_%%'
+				GROUP BY channel_hash
+				ORDER BY last_activity DESC`
 		}
-	} else {
-		querySQL = `SELECT channel_hash,
-				COUNT(*) AS msg_count,
-				MAX(first_seen) AS last_activity
-			FROM transmissions
-			WHERE payload_type = 5
-			AND channel_hash LIKE 'enc_%%'
-			GROUP BY channel_hash
-			ORDER BY last_activity DESC`
-	}
 
-	rows, err := db.conn.Query(querySQL, args...)
+		rows, err := db.conn.Query(querySQL, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		channels := make([]map[string]interface{}, 0)
+		for rows.Next() {
+			var chHash, lastActivity sql.NullString
+			var msgCount int
+			if err := rows.Scan(&chHash, &msgCount, &lastActivity); err != nil {
+				continue
+			}
+			fullHash := nullStrVal(chHash) // e.g. "enc_3A"
+			hexPart := strings.TrimPrefix(fullHash, "enc_")
+			channels = append(channels, map[string]interface{}{
+				"hash":         fullHash,
+				"name":         "Encrypted (0x" + hexPart + ")",
+				"lastMessage":  nil,
+				"lastSender":   nil,
+				"messageCount": msgCount,
+				"lastActivity": nullStr(lastActivity),
+				"encrypted":    true,
+			})
+		}
+
+		db.setEncChannelsCache(regionParam, channels)
+
+		return channels, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	channels := make([]map[string]interface{}, 0)
-	for rows.Next() {
-		var chHash, lastActivity sql.NullString
-		var msgCount int
-		if err := rows.Scan(&chHash, &msgCount, &lastActivity); err != nil {
-			continue
-		}
-		fullHash := nullStrVal(chHash) // e.g. "enc_3A"
-		hexPart := strings.TrimPrefix(fullHash, "enc_")
-		channels = append(channels, map[string]interface{}{
-			"hash":         fullHash,
-			"name":         "Encrypted (0x" + hexPart + ")",
-			"lastMessage":  nil,
-			"lastSender":   nil,
-			"messageCount": msgCount,
-			"lastActivity": nullStr(lastActivity),
-			"encrypted":    true,
-		})
-	}
-
-	db.setEncChannelsCache(regionParam, channels)
-
-	return channels, nil
+	return v.([]map[string]interface{}), nil
 }
 
 // getMsgCache/setMsgCache cache GetChannelMessages results, keyed by

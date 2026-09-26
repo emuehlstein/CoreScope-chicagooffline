@@ -321,6 +321,18 @@ func main() {
 		}
 	}
 
+	// Declared-region retention: bounds the opt-in node_declared_regions
+	// table (Task 6), independent of clientRxDays/clientRxObsDays/clientRfDays.
+	// 0 = disabled.
+	clientRegionsDays := cfg.ClientRegionsDaysOrZero()
+	if clientRegionsDays > 0 {
+		if n, err := store.PruneOldClientDeclaredRegions(clientRegionsDays); err != nil {
+			log.Printf("[prune] node_declared_regions: %v", err)
+		} else if n > 0 {
+			log.Printf("[prune] startup pruned %d node_declared_regions older than %d days", n, clientRegionsDays)
+		}
+	}
+
 	vacuumPages := cfg.IncrementalVacuumPages()
 	store.RunIncrementalVacuum(vacuumPages)
 
@@ -386,11 +398,11 @@ func main() {
 	}
 
 	// Daily ticker for client-RX coverage retention (#1727), reused for the
-	// diagnostic client_rx_observations and client_rf_samples retention
-	// (Task 6) rather than starting a second ticker — the three flags are
-	// independent (0 disables each separately), so the ticker itself must
-	// run when any is set.
-	if clientRxDays > 0 || clientRxObsDays > 0 || clientRfDays > 0 {
+	// diagnostic client_rx_observations, client_rf_samples, and
+	// node_declared_regions retention (Task 6) rather than starting a second
+	// ticker — the four flags are independent (0 disables each separately),
+	// so the ticker itself must run when any is set.
+	if clientRxDays > 0 || clientRxObsDays > 0 || clientRfDays > 0 || clientRegionsDays > 0 {
 		clientRxRetentionTicker := time.NewTicker(24 * time.Hour)
 		go func() {
 			for range clientRxRetentionTicker.C {
@@ -415,6 +427,13 @@ func main() {
 						store.RunIncrementalVacuum(vacuumPages)
 					}
 				}
+				if clientRegionsDays > 0 {
+					if n, err := store.PruneOldClientDeclaredRegions(clientRegionsDays); err != nil {
+						log.Printf("[prune] node_declared_regions: %v", err)
+					} else if n > 0 {
+						store.RunIncrementalVacuum(vacuumPages)
+					}
+				}
 			}
 		}()
 		if clientRxDays > 0 {
@@ -425,6 +444,9 @@ func main() {
 		}
 		if clientRfDays > 0 {
 			log.Printf("[prune] auto-prune enabled: client_rf_samples older than %d days will be removed daily", clientRfDays)
+		}
+		if clientRegionsDays > 0 {
+			log.Printf("[prune] auto-prune enabled: node_declared_regions older than %d days will be removed daily", clientRegionsDays)
 		}
 	}
 
@@ -458,6 +480,42 @@ func main() {
 		}
 	}()
 	log.Printf("[db] WAL checkpoint scheduled every 1h")
+
+	// Daily planner statistics refresh (#2058), in two parts.
+	//
+	// The routine refresh is staggered 2 minutes past startup for the same reason
+	// as the checkpoint above: it takes the write lock, and by then the initial
+	// ingest burst has passed, so it also sees the rows that burst added.
+	//
+	// The build in front of it deliberately does compete with that burst, because
+	// a database with no statistics at all has nothing better to offer the queries
+	// arriving in those 2 minutes. It only runs once per database; see
+	// Store.EnsurePlannerStats, which also carries what that costs.
+	//
+	// Bounded by analysis_limit either way, so neither grows with the file the way
+	// an unbounded ANALYZE does: 2.0s against 242.9s on a 9.4 GB database, both
+	// timed warm. Cold, on a first start, it is 3m43.9s.
+	{
+		analysisLimit := cfg.AnalysisLimit()
+		if analysisLimit < 0 {
+			log.Printf("[analyze] planner statistics refresh disabled (db.analysisLimit=%d)", analysisLimit)
+		} else {
+			analyzeTicker := time.NewTicker(24 * time.Hour)
+			go func() {
+				// Before the stagger, and only on a database that has never been
+				// analyzed: the stagger is a 2 minute window in which the first
+				// query would otherwise run on no statistics at all. A restart
+				// finds sqlite_stat1 already in the file and skips this.
+				store.EnsurePlannerStats(analysisLimit)
+				time.Sleep(2 * time.Minute)
+				store.RefreshPlannerStats(analysisLimit)
+				for range analyzeTicker.C {
+					store.RefreshPlannerStats(analysisLimit)
+				}
+			}()
+			log.Printf("[analyze] planner statistics refresh scheduled every 24h (analysis_limit=%d)", analysisLimit)
+		}
+	}
 
 	// Daily neighbor_edges retention (#1287 — moved from cmd/server).
 	{
@@ -744,11 +802,13 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		return
 	}
 
-	// Mobile client topics: meshcore/client/{PUBLIC_KEY}/packets (RX coverage)
-	// and meshcore/client/{PUBLIC_KEY}/rf (RF environment samples). A roaming
-	// companion reports where it directly heard a node, or its own radio's
-	// counters; both are handled in isolation from the observer/observations
-	// path. EMQX ACL binds parts[2] to the client's own key.
+	// Mobile client topics: meshcore/client/{PUBLIC_KEY}/packets (RX coverage),
+	// meshcore/client/{PUBLIC_KEY}/rf (RF environment samples), and
+	// meshcore/client/{PUBLIC_KEY}/regions (declared-region answers). A
+	// roaming companion reports where it directly heard a node, its own
+	// radio's counters, or a repeater's declared region list; all three are
+	// handled in isolation from the observer/observations path. EMQX ACL
+	// binds parts[2] to the client's own key.
 	//
 	// The topic match and the enable-gate MUST be separate: matching on
 	// parts[1]=="client" always returns from this branch, whatever the config
@@ -776,6 +836,10 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			if cfg.ClientRfSamplesEnabled() {
 				handleClientRfSample(store, tag, parts[2], msg)
 			}
+		case "regions":
+			if cfg.ClientRegionsEnabled() {
+				handleClientRegions(store, cfg, tag, parts[2], msg)
+			}
 		}
 		return
 	}
@@ -795,6 +859,14 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 	// Global observer IATA whitelist: if configured, drop messages from observers
 	// in non-whitelisted IATA regions. Applies to ALL message types (status + packets).
 	if len(parts) > 1 && !cfg.IsObserverIATAAllowed(parts[1]) {
+		// Throttled to one line per region per cfg.IATAWarnInterval — see
+		// ShouldWarnIATADrop. Format matches the fleet's Python region filter so
+		// one scraper regex covers both.
+		if cfg.ShouldWarnIATADrop(parts[1]) {
+			code := strings.ToUpper(strings.TrimSpace(parts[1]))
+			log.Printf("MQTT [%s] [region-filter] dropping unknown region '%s' (not in observerIATAWhitelist) -- further messages from %s suppressed for %.0fh",
+				tag, code, code, cfg.IATAWarnInterval().Hours())
+		}
 		return
 	}
 

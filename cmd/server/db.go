@@ -462,21 +462,6 @@ type Observer struct {
 	// repeaters). The ingestor sets can_relay_seen=1 only when it has
 	// an explicit value; the read layer returns nil when seen=0.
 	CanRelay *bool `json:"can_relay,omitempty"`
-	// Observer-reported neighbor table, from the firmware's dedicated
-	// meshcore/<iata>/<observer>/neighbors publication (fork feature).
-	//
-	// NOT derived from neighbor_edges — that table is INFERRED from
-	// observation co-reception by the ingestor's neighbor_builder and would
-	// conflate computed topology with a self-reported neighbor table.
-	//
-	// NeighborsLastReportAt == nil means "never reported", which is
-	// deliberately distinct from a report of zero neighbors
-	// (NeighborsCount == 0). NeighborsTotal exceeds NeighborsCount when the
-	// firmware truncated the payload to fit MTU.
-	NeighborsLastReportAt *string `json:"neighbors_last_report_at,omitempty"`
-	NeighborsCount        *int    `json:"neighbors_count,omitempty"`
-	NeighborsTotal        *int    `json:"neighbors_total,omitempty"`
-	NeighborsTruncated    bool    `json:"neighbors_truncated,omitempty"`
 }
 
 // Transmission represents a row from the transmissions table.
@@ -1539,31 +1524,10 @@ func (db *DB) GetObservers() ([]Observer, error) {
 	if hasCol, _ := dbschema.TableHasColumn(db.conn, "observers", "can_relay_seen"); hasCol {
 		canRelaySeenClause = "COALESCE(can_relay_seen, 0)"
 	}
-	// Observer-reported neighbor tables (meshcore/<iata>/<observer>/neighbors).
-	// Same probe-and-fall-back approach as can_relay: pre-migration DBs and
-	// older test fixtures lack these columns entirely. NULL is meaningful
-	// here ("never reported"), so the fallbacks select NULL rather than 0.
-	neighborsAtClause := "NULL"
-	neighborsCountClause := "NULL"
-	neighborsTotalClause := "NULL"
-	neighborsTruncClause := "0"
-	if hasCol, _ := dbschema.TableHasColumn(db.conn, "observers", "neighbors_last_report_at"); hasCol {
-		neighborsAtClause = "neighbors_last_report_at"
-	}
-	if hasCol, _ := dbschema.TableHasColumn(db.conn, "observers", "neighbors_count"); hasCol {
-		neighborsCountClause = "neighbors_count"
-	}
-	if hasCol, _ := dbschema.TableHasColumn(db.conn, "observers", "neighbors_total"); hasCol {
-		neighborsTotalClause = "neighbors_total"
-	}
-	if hasCol, _ := dbschema.TableHasColumn(db.conn, "observers", "neighbors_truncated"); hasCol {
-		neighborsTruncClause = "COALESCE(neighbors_truncated, 0)"
-	}
 	rows, err := db.conn.Query(`SELECT id, name, iata, last_seen, first_seen, packet_count,
 		model, firmware, client_version, radio, battery_mv, uptime_secs, noise_floor, last_packet_at,
 		clock_skew_seconds, clock_skew_count_24h, clock_last_naive_at,
-		` + canRelayClause + `, ` + canRelaySeenClause + `,
-		` + neighborsAtClause + `, ` + neighborsCountClause + `, ` + neighborsTotalClause + `, ` + neighborsTruncClause + `
+		` + canRelayClause + `, ` + canRelaySeenClause + `
 		FROM observers WHERE inactive IS NULL OR inactive = 0 ORDER BY last_seen DESC`)
 	if err != nil {
 		return nil, err
@@ -1577,34 +1541,14 @@ func (db *DB) GetObservers() ([]Observer, error) {
 		var clockSkewCount sql.NullInt64
 		var noiseFloor sql.NullFloat64
 		var canRelay, canRelaySeen int
-		var neighborsAt sql.NullString
-		var neighborsCount, neighborsTotal sql.NullInt64
-		var neighborsTrunc int
 		if err := rows.Scan(&o.ID, &o.Name, &o.IATA, &o.LastSeen, &o.FirstSeen, &o.PacketCount,
 			&o.Model, &o.Firmware, &o.ClientVersion, &o.Radio, &batteryMv, &uptimeSecs, &noiseFloor, &o.LastPacketAt,
-			&clockSkewSec, &clockSkewCount, &o.ClockLastNaiveAt, &canRelay, &canRelaySeen,
-			&neighborsAt, &neighborsCount, &neighborsTotal, &neighborsTrunc); err != nil {
+			&clockSkewSec, &clockSkewCount, &o.ClockLastNaiveAt, &canRelay, &canRelaySeen); err != nil {
 			continue
 		}
 		if canRelaySeen != 0 {
 			b := canRelay != 0
 			o.CanRelay = &b
-		}
-		// neighbors_last_report_at is the tri-state sentinel: NULL means the
-		// observer has never published a neighbors report, which the UI must
-		// render differently from a report of zero neighbors.
-		if neighborsAt.Valid && neighborsAt.String != "" {
-			v := neighborsAt.String
-			o.NeighborsLastReportAt = &v
-			if neighborsCount.Valid {
-				c := int(neighborsCount.Int64)
-				o.NeighborsCount = &c
-			}
-			if neighborsTotal.Valid {
-				t := int(neighborsTotal.Int64)
-				o.NeighborsTotal = &t
-			}
-			o.NeighborsTruncated = neighborsTrunc != 0
 		}
 		if batteryMv.Valid {
 			v := int(batteryMv.Int64)

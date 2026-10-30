@@ -1300,7 +1300,7 @@
             <div class="live-toggles">
               <div class="live-node-filter-wrap" style="position:relative">
                 <label class="live-node-filter-hitarea" style="display:inline-flex; align-items:center; min-height:44px; cursor:text;">
-                  <input type="text" id="liveNodeFilterInput" placeholder="Filter by node…" autocomplete="off" class="live-node-filter-input" role="combobox" aria-expanded="false" aria-owns="liveNodeFilterDropdown" aria-autocomplete="list" aria-activedescendant="">
+                  <input type="text" id="liveNodeFilterInput" placeholder="Filter by node…" autocomplete="off" class="live-node-filter-input" role="combobox" aria-expanded="false" aria-owns="liveNodeFilterDropdown" aria-autocomplete="list" aria-activedescendant="" disabled>
                 </label>
                 <div id="liveNodeFilterDropdown" class="live-node-filter-dropdown hidden" role="listbox"></div>
                 <button id="liveNodeFilterClear" class="vcr-btn" title="Clear node filter" style="display:none">×</button>
@@ -1903,6 +1903,8 @@
         // Slight delay so click on a suggestion can register first.
         setTimeout(hideDropdown, 150);
       });
+      // Initial node loading yields before these handlers are installed (#2094).
+      nodeFilterInput.disabled = false;
     }
     if (nodeFilterClear) {
       nodeFilterClear.addEventListener('click', () => {
@@ -2608,10 +2610,9 @@
       const roleLabel = (ROLE_LABELS[n.role] || n.role || 'unknown').replace(/s$/, '');
       const hasLoc = n.lat != null && n.lon != null;
       const lastSeen = formatLiveTimestampHtml(n.last_seen);
-      const thresholds = window.getHealthThresholds ? getHealthThresholds(n.role) : { degradedMs: 3600000, silentMs: 86400000 };
-      const ageMs = n.last_seen ? Date.now() - new Date(n.last_seen).getTime() : Infinity;
-      const statusDot = ageMs < thresholds.degradedMs ? 'health-green' : ageMs < thresholds.silentMs ? 'health-yellow' : 'health-red';
-      const statusLabel = ageMs < thresholds.degradedMs ? 'Online' : ageMs < thresholds.silentMs ? 'Degraded' : 'Offline';
+      const health = getHealthStatus(n.role, n.last_seen);
+      const statusDot = health === 'healthy' ? 'health-green' : health === 'degraded' ? 'health-yellow' : 'health-red';
+      const statusLabel = health === 'healthy' ? 'Online' : health === 'degraded' ? 'Degraded' : 'Offline';
 
       let html = `
         <div style="padding:16px;">
@@ -2642,7 +2643,7 @@
 
       if (observers.length) {
         const regions = [...new Set(observers.map(o => o.iata).filter(Boolean))];
-        html += `<h4 style="font-size:12px;margin:12px 0 6px;color:var(--text-muted);">Heard By${regions.length ? ' — Regions: ' + regions.join(', ') : ''}</h4>
+        html += `<h4 style="font-size:12px;margin:12px 0 6px;color:var(--text-muted);">Heard By${regions.length ? ' — Regions: ' + regions.map(r => escapeHtml(r)).join(', ') : ''}</h4>
           <div style="font-size:11px;">` +
           observers.map(o => `<div style="padding:2px 0;"><a href="#/observers/${encodeURIComponent(o.observer_id)}" style="color:var(--link-color);text-decoration:none;">${escapeHtml(o.observer_name || o.observer_id.slice(0, 12))}${o.iata ? ' (' + escapeHtml(o.iata) + ')' : ''}</a> — ${o.packetCount || o.count || 0} pkts</div>`).join('') +
           '</div>';
@@ -3167,8 +3168,8 @@
   // #1598: infra nodes (repeater/room) are ALWAYS dimmed, never deleted —
   // a dimmed marker still tells operators "infrastructure exists here,
   // advert stale", whereas deletion silently rewrites the map. Staleness
-  // itself is relay-aware via getNodeStatus(node) (max of advert-based
-  // freshness and last_relayed for infra).
+  // itself comes from getNodeStatus(node), whose last_heard includes the
+  // relays that can only be this node (#2260).
   // Remaining WS-only non-infra nodes are removed to prevent memory leaks.
   function pruneStaleNodes() {
     var now = Date.now();
@@ -3178,7 +3179,10 @@
       if (!n) continue;
       var lastSeen = n._liveSeen || (n.last_heard ? new Date(n.last_heard).getTime() : null) || (n.last_seen ? new Date(n.last_seen).getTime() : null);
       if (lastSeen == null) continue;
+      // #2260: 'uncertain' (only a shared hop prefix seen) dims like stale;
+      // it only occurs for repeaters and rooms, which are never removed.
       var status = window.getNodeStatus ? getNodeStatus(n) : 'active';
+      if (status === 'uncertain') status = 'stale';
       var isInfra = n.role === 'repeater' || n.role === 'room';
       var marker = nodeMarkers[key];
       if (status === 'stale') {

@@ -46,9 +46,24 @@ scripts/           — Tooling (coverage collector, fixture capture, frontend in
 ### Read/Write Separation Invariant (#1283)
 - **All DB writes live in `cmd/ingestor/`.** INSERT / UPDATE / DELETE / VACUUM /
   schema migrations / retention all run in the ingestor process.
-- **`cmd/server/` is read-only.** It opens SQLite with `mode=ro` and must not
-  acquire a write lock. Adding a write-side helper (e.g. a `cachedRW`-style
-  RW connection) regresses this invariant and races the ingestor → SQLITE_BUSY.
+- **`cmd/server/` never writes measurement data.** It opens the analyzer DB with
+  `mode=ro` and must not acquire a write lock on it. Adding a write-side helper
+  (e.g. a `cachedRW`-style RW connection) regresses this invariant and races the
+  ingestor → SQLITE_BUSY.
+- **Single exception: `users.db` (optional user management).** When
+  `userManagement.enabled`, the server owns a *separate* SQLite file through
+  `internal/users` only. `users.Open` refuses the analyzer DB path, and
+  `TestUsersOpenIsTheOnlyServerWritePath` pins the one call site. Account data
+  never goes into the analyzer DB, and measurement writes never go through
+  `internal/users`.
+- **The ingestor reads `users.db`, never writes it.** With
+  `userManagement.channelProposals.enabled` the ingestor opens `users.db`
+  read-only (`mode=ro`, raw SQL, no `internal/users` import) once a minute
+  for the approved hashtag channel names. With
+  `clientRxCoverage.requireLinkedCompanion` it reads `companion_links` the same
+  way (`SELECT pubkey`, every 60 s, plus at most one re-read per 5 s on a miss).
+  `TestChannelKeySetIsReadOnly` and `TestLinkedCompanionSetIsReadOnly` pin the
+  read-only open.
 - Enforcement: `cmd/server/readonly_invariant_test.go` reflect-asserts that
   `PruneOldPackets`, `PruneOldMetrics`, and `RemoveStaleObservers` are NOT
   methods on the server's `*DB`. If you need a new write, add it to
@@ -196,7 +211,8 @@ All colors MUST use CSS variables. Never hardcode `#hex` values outside of `:roo
 
 ### last_heard vs last_seen
 - `last_seen` = DB timestamp, only updates on adverts/direct upserts
-- `last_heard` = from in-memory packet store, updates on ALL traffic
+- `last_heard` = the newer of `last_seen` and the certain last heard from the in-memory packet store (#2260): the node's own packets plus relay hops whose prefix can only be this node. A 1-byte hop shared with other repeaters is NOT evidence, and neither is `last_relayed` (it counts those shared prefixes too). Liveness — status, Last Heard, the notify offline check — uses only this.
+- Status from `getNodeStatus(n)` is `'active'`, `'stale'` or, for a repeater or room, `'uncertain'`: nothing certain within the silent window, but `last_relayed` (its shared prefix in a path) is. Treat `'uncertain'` as not proven alive (dim it like stale); never as active.
 - Always prefer `n.last_heard || n.last_seen` for display and status calculation
 
 ### Packet Filter (packet-filter.js)

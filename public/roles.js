@@ -432,7 +432,8 @@
     infraDegradedMs: 86400000,   // 24h
     infraSilentMs:   259200000,  // 72h
     nodeDegradedMs:  3600000,    // 1h
-    nodeSilentMs:    86400000    // 24h
+    nodeSilentMs:    86400000,   // 24h
+    relayActiveMs:   86400000    // healthThresholds.relayActiveHours, default 24h
   };
 
   // Helper: get degraded/silent thresholds for a role (backward compat)
@@ -444,15 +445,29 @@
     };
   };
 
+  // Three-state health from when a node was last heard: 'healthy', 'degraded'
+  // or 'silent' by its role's thresholds, or null when `heard` is missing or
+  // not a date. The caller picks the timestamp (ISO string or epoch ms); this
+  // only applies the cut-offs, so every view that shows the three states uses
+  // the same ones. `now` defaults to Date.now().
+  window.getHealthStatus = function (role, heard, now) {
+    if (heard == null || heard === '') return null;
+    var heardMs = typeof heard === 'number' ? heard : new Date(heard).getTime();
+    if (isNaN(heardMs)) return null;
+    var age = (now == null ? Date.now() : now) - heardMs;
+    var th = window.getHealthThresholds(role);
+    return age < th.degradedMs ? 'healthy' : age < th.silentMs ? 'degraded' : 'silent';
+  };
+
   // Simplified two-state helper: returns 'active' or 'stale'.
   // Accepts either a full node object (preferred) or legacy (role, lastSeenMs).
   //
-  // #1598: for infra roles (repeater/room), freshness is the max of the
-  // ADVERT-based timestamp and last_relayed (resolved path participation).
-  // Operators increasingly run long or disabled advert intervals (firmware
-  // default trajectory is 47h flood adverts), so an actively-relaying
-  // backbone repeater must not be marked stale just because its last
-  // ADVERT is old.
+  // #1598: an actively-relaying backbone repeater must not be marked stale
+  // just because its last ADVERT is old (firmware default trajectory is 47h
+  // flood adverts). #2260: the server folds the relays that can only be this
+  // node into last_heard; last_relayed is NOT used here, because it also
+  // counts 1-byte prefix matches of other repeaters and kept a silent
+  // repeater "Active" for days.
   // #1845: the single definition of "how recently did we hear from this node",
   // extracted from getNodeStatus so a caller that needs the AGE gets the same
   // answer as the caller that needs the STATUS. Before this, nodes.js carried
@@ -461,28 +476,32 @@
   // #1598 exists to protect. Returns NaN when nothing is known.
   window.getEffectiveHeardMs = function (n) {
     if (!n || typeof n !== 'object') return NaN;
-    var role = String(n.role || 'companion').toLowerCase();
-    // Freshness precedence mirrors the existing call sites:
-    // _liveSeen (live view, ms) > _lastHeard (health API) >
-    // last_heard (in-memory packets) > last_seen (DB, ADVERT).
-    var seenTime = n._lastHeard || n.last_heard || n.last_seen;
-    var effectiveMs = (typeof n._liveSeen === 'number' && n._liveSeen) ||
-                      (seenTime ? new Date(seenTime).getTime() : NaN);
-    // #1598: an infra node that forwards traffic is alive even when its last
-    // ADVERT is old, which operators increasingly cause on purpose (the
-    // firmware default flood advert interval moved to 47h).
-    if ((role === 'repeater' || role === 'room') && n.last_relayed) {
-      var relayedMs = new Date(n.last_relayed).getTime();
-      if (!(effectiveMs >= relayedMs)) effectiveMs = relayedMs;
+    // The newest of everything known: _liveSeen (live view, ms), _lastHeard
+    // (node page), last_heard (newer of advert and certain last heard,
+    // #2260) and last_seen (DB, ADVERT). The newest wins rather than the
+    // first present, so an old _liveSeen cannot hide a fresh certain relay.
+    var newest = NaN;
+    var vals = [n._liveSeen, n._lastHeard, n.last_heard, n.last_seen];
+    for (var i = 0; i < vals.length; i++) {
+      var v = vals[i];
+      if (v == null || v === '' || v === 0) continue;
+      var ms = typeof v === 'number' ? v : new Date(v).getTime();
+      if (!isNaN(ms) && !(newest >= ms)) newest = ms;
     }
-    return effectiveMs;
+    return newest;
   };
 
+  // 'active' | 'stale', and for a repeater or room passed as an object also
+  // 'uncertain' (#2260): nothing that can only be this node within the
+  // silent window, but its hop prefix, shared with other repeaters, still
+  // shows up in paths (last_relayed). That may be this node or a namesake,
+  // so it is neither proof of life nor of an outage.
   window.getNodeStatus = function (roleOrNode, lastSeenMs) {
-    var role, effectiveMs;
+    var role, effectiveMs, node = null;
     if (roleOrNode && typeof roleOrNode === 'object') {
-      role = roleOrNode.role || 'companion';
-      effectiveMs = window.getEffectiveHeardMs(roleOrNode);
+      node = roleOrNode;
+      role = node.role || 'companion';
+      effectiveMs = window.getEffectiveHeardMs(node);
       if (isNaN(effectiveMs)) effectiveMs = undefined;
     } else {
       role = roleOrNode;
@@ -492,7 +511,12 @@
                   String(role || '').toLowerCase() === 'room';
     var staleMs = isInfra ? HEALTH_THRESHOLDS.infraSilentMs : HEALTH_THRESHOLDS.nodeSilentMs;
     var age = typeof effectiveMs === 'number' ? (Date.now() - effectiveMs) : Infinity;
-    return age < staleMs ? 'active' : 'stale';
+    if (age < staleMs) return 'active';
+    if (isInfra && node && node.last_relayed) {
+      var relayedAge = Date.now() - new Date(node.last_relayed).getTime();
+      if (relayedAge < staleMs) return 'uncertain';
+    }
+    return 'stale';
   };
 
   // ─── Tile URLs ───
@@ -584,6 +608,7 @@
   // ─── Fetch server overrides ───
   window.MeshConfigReady = fetch('/api/config/client').then(function (r) { return r.json(); }).then(function (cfg) {
     window.MC_CLIENT_RX_COVERAGE = cfg.clientRxCoverage === true;
+    window.MC_CLIENT_RF_SAMPLES = cfg.clientRfSamples === true;
     // Coverage is opt-in: the nav link is NOT in static HTML (so the default-off
     // nav matches upstream and the nav-overflow tests). Inject it after Analytics
     // only when enabled, then nudge applyNavPriority (it re-runs on 'resize').
@@ -654,6 +679,8 @@
     window.MC_CUSTOMIZER_CFG = (cfg.customizer && typeof cfg.customizer === 'object')
       ? { disabledTabs: Array.isArray(cfg.customizer.disabledTabs) ? cfg.customizer.disabledTabs : [] }
       : { disabledTabs: [] };
+    // Optional user management: present only when the server enables it.
+    window.MC_USER_MGMT = (cfg.userManagement && cfg.userManagement.enabled) ? { enabled: true, channelProposals: !!cfg.userManagement.channelProposals, notifications: !!cfg.userManagement.notifications, observerLogins: !!cfg.userManagement.observerLogins } : null;
     // #1574 — operator-configurable cap on /live map node count.
     if (cfg.liveMapMaxNodes != null) window.LIVE_MAP_MAX_NODES = cfg.liveMapMaxNodes;
     // #1784 — path trust threshold: minimum hash bytes for mapping evidence.
@@ -979,6 +1006,29 @@
       bytes: bytes,
       prefix: pk ? pk.slice(0, bytes * 2).toUpperCase() : '??',
     };
+  };
+
+  // The API accumulates route evidence across observations of the same advert.
+  // A canonical frame or selected observation cannot prove an exclusive kind.
+  window.classifyRecentAdvert = function (advert) {
+    var kind = advert && advert.advert_kind;
+    if (kind === 'flood' || kind === 'mixed') return kind;
+    return kind === 'zero_hop' ? 'zero-hop' : 'other';
+  };
+
+  // One pass over the API's bounded recent sample; keep input order and rows intact.
+  window.groupRecentAdverts = function (adverts) {
+    var groups = [
+      { kind: 'flood', label: 'Flood adverts', adverts: [] },
+      { kind: 'mixed', label: 'Mixed flood / direct (empty path) adverts', adverts: [] },
+      { kind: 'zero-hop', label: 'Direct adverts (empty path)', adverts: [] },
+      { kind: 'other', label: 'Other / unknown adverts', adverts: [] },
+    ];
+    adverts.forEach(function (advert) {
+      var kind = window.classifyRecentAdvert(advert);
+      groups[kind === 'flood' ? 0 : kind === 'mixed' ? 1 : kind === 'zero-hop' ? 2 : 3].adverts.push(advert);
+    });
+    return groups.filter(function (group) { return group.kind === 'flood' || group.kind === 'zero-hop' || group.adverts.length; });
   };
 
   /** Render a skew sparkline SVG (inline, word-sized) */

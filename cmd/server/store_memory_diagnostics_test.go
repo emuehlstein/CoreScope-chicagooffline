@@ -159,13 +159,11 @@ func TestObsRawHexNotRetainedOnLoad(t *testing.T) {
 	obs := tx.Observations[0]
 
 	// The dup must NOT be retained, even though the DB column held obsHex.
-	if obs.RawHex != "" {
-		t.Errorf("obs.RawHex should be empty after load (dropped as redundant dup), got %q", obs.RawHex)
-	}
+	ceAssertNoRaw(t, obs)
 
 	// The read path must still serve raw_hex via the parent-tx fallback.
 	store.mu.RLock()
-	m := store.enrichObs(obs)
+	m, _ := store.enrichObsRPJob(obs)
 	store.mu.RUnlock()
 	rh, _ := m["raw_hex"].(string)
 	if rh != txHex {

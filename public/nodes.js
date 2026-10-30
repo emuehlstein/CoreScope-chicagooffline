@@ -83,10 +83,14 @@
   let lastHeard = localStorage.getItem('meshcore-nodes-last-heard') || '';
   let statusFilter = localStorage.getItem('meshcore-nodes-status-filter') || 'all';
   // #1845: "silent longer than N", the inverse of the Last Heard filter. Empty
-  // means off. Ages are relay-aware (getEffectiveHeardMs), so a repeater that
-  // forwards traffic is never counted as silent just because its ADVERT is old.
+  // means off. Ages come from getEffectiveHeardMs, whose last_heard includes
+  // certain relays (#2260), so a repeater that forwards traffic is never
+  // counted as silent just because its ADVERT is old.
   let silentFor = localStorage.getItem('meshcore-nodes-silent-for') || '';
   const SILENT_MS = { '1d': 86400000, '3d': 259200000, '7d': 604800000, '14d': 1209600000, '30d': 2592000000 };
+  // #1268 M3: '' or 'differs' (LoRa settings differ from nearby same-band nodes).
+  let loraFilter = '';
+  let _loraDiffCount = 0;
   let _silentCounts = null;
   let wsHandler = null;
   let detailMap = null;
@@ -189,12 +193,80 @@
 
   /* === Shared helper functions for node detail rendering === */
 
+  function renderNodeMetric(label, value, table, title = '', attributes = '') {
+    const tip = title ? ' title="' + escapeHtml(title) + '"' : '';
+    return table
+      ? `<tr ${attributes}><td${tip}>${label}</td><td>${value}</td></tr>`
+      : `<dt${tip}>${label}</dt><dd ${attributes}>${value}</dd>`;
+  }
+
+  function nodeMetricNumber(raw) {
+    if (typeof raw !== 'number' && (typeof raw !== 'string' || !raw.trim())) return null;
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  }
+
+  function renderLastRelayed(n, table) {
+    if (n.role !== 'repeater' && n.role !== 'room') return '';
+    const hasRelay = n.last_relayed && Number.isFinite(new Date(n.last_relayed).getTime());
+    const certainMs = typeof n.last_certain_relay === 'string' ? Date.parse(n.last_certain_relay) : NaN;
+    const hasCertainRelay = Number.isFinite(certainMs);
+    const certainAge = Date.now() - certainMs;
+    let value = hasRelay
+      ? renderNodeTimestampHtml(n.last_relayed) + ' <span style="color:var(--text-muted);font-size:11px">attributed relay observation</span>'
+      : '<span style="color:var(--text-muted)">' + (hasCertainRelay ? 'no attributed non-advert relay' : 'never observed as relay hop') + '</span>';
+    if (hasCertainRelay && certainAge >= 0 && certainAge < HEALTH_THRESHOLDS.relayActiveMs) {
+      value += ' <span data-certain-relay-active style="color:var(--status-green-text);font-size:11px">actively relaying</span>';
+    }
+    if (n.relay_count_1h != null || n.relay_count_24h != null) {
+      const count = raw => { const v = nodeMetricNumber(raw); return Number.isSafeInteger(v) ? v : '—'; };
+      value += ` <span style="color:var(--text-muted);font-size:11px;margin-left:4px">(${count(n.relay_count_1h)} relays/hr, ${count(n.relay_count_24h)} relays/24h)</span>`;
+    }
+    return renderNodeMetric('Last Relayed', value, table, "Last time this node was attributed as a relay hop in a non-advert packet observed by the network. This includes 1-byte hops shared with other repeaters, so it does not decide Active/Stale: 'Last Heard' counts only packets that can be this node alone. The green actively relaying mark requires recent certain relay evidence, including forwarding another node's advert. No mark does not imply idle or offline.");
+  }
+
+  function renderTrafficShare(n, table) {
+    if (n.role !== 'repeater' && n.role !== 'room') return '';
+    // Older servers expose only usefulness_score; a measured zero is present.
+    const raw = n.traffic_share_score != null ? n.traffic_share_score : n.usefulness_score;
+    const s = nodeMetricNumber(raw);
+    if (s === null || s > 1) return '';
+    const pct = (s * 100).toFixed(1);
+    let label, color;
+    if (s >= 0.8) { label = 'Critical'; color = 'var(--status-green)'; }
+    else if (s >= 0.6) { label = 'Valuable'; color = 'var(--status-green)'; }
+    else if (s >= 0.3) { label = 'Moderate'; color = 'var(--status-yellow)'; }
+    else if (s >= 0.1) { label = 'Marginal'; color = 'var(--status-orange)'; }
+    else { label = 'Redundant'; color = 'var(--status-red)'; }
+    const barWidth = Math.max(2, Math.round(s * 100));
+    const tooltip = "Fraction of all non-advert mesh traffic in the analyzer's memory that transited through this repeater as a relay hop. High = lots of packets pass through; low = quieter (may still be structurally important — see Bridge score).";
+    const attributes = (table ? 'id="row-usefulness-score" ' : '') + `data-usefulness-score="${s.toFixed(4)}" data-traffic-share-score="${s.toFixed(4)}"`;
+    const value = `<span style="display:inline-block;vertical-align:middle;width:80px;height:8px;background:var(--bg-secondary);border-radius:4px;overflow:hidden;margin-right:6px"><span style="display:block;width:${barWidth}%;height:100%;background:${color}"></span></span><span style="color:${color};font-weight:600">${pct}%</span> <span style="color:var(--text-muted);font-size:11px;margin-left:4px">${label}</span>`;
+    return renderNodeMetric('Traffic share <span style="color:var(--text-muted);cursor:help" aria-label="help">ⓘ</span>', value, table, tooltip, attributes);
+  }
+
+  function renderHashPrefix(n, table) {
+    const key = String(n.public_key || '');
+    const size = nodeMetricNumber(n.hash_size);
+    let value = Number.isSafeInteger(size) && size > 0 && size * 2 <= key.length
+      ? '<code style="font-family:var(--mono);font-weight:700">' + escapeHtml(key.slice(0, size * 2).toUpperCase()) + '</code> (' + size + '-byte)'
+      : 'Unknown';
+    if (n.hash_size_inconsistent) {
+      const sizes = Array.isArray(n.hash_sizes_seen) ? n.hash_sizes_seen : [];
+      value += ' <span style="color:var(--status-yellow);cursor:help" title="Seen: ' + escapeHtml(sizes.join(', ')) + '-byte"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg>varies</span>';
+    }
+    return renderNodeMetric('Hash Prefix', value, table);
+  }
+
   function getStatusTooltip(role, status) {
     const isInfra = role === 'repeater' || role === 'room';
     const threshMs = isInfra ? HEALTH_THRESHOLDS.infraSilentMs : HEALTH_THRESHOLDS.nodeSilentMs;
     const threshold = threshMs >= 3600000 ? Math.round(threshMs / 3600000) + 'h' : Math.round(threshMs / 60000) + 'm';
     if (status === 'active') {
       return 'Active \u2014 heard within the last ' + threshold + '.' + (isInfra ? ' Repeaters typically advertise every 12-24h.' : '');
+    }
+    if (status === 'uncertain') {
+      return 'Uncertain \u2014 nothing that can only be this ' + role + ' for over ' + threshold + '. Its hop prefix, shared with other repeaters, still appears in paths: that may be this node or another one.';
     }
     if (role === 'companion') {
       return 'Stale \u2014 not heard for over ' + threshold + '. Companions only advertise when the user initiates \u2014 this may be normal.';
@@ -218,25 +290,27 @@
     // Single source of truth for all status-related info
     const role = (n.role || '').toLowerCase();
     const roleColor = ROLE_COLORS[n.role] || '#6b7280';
-    // Prefer last_heard (from in-memory packets) > _lastHeard (health API) > last_seen (DB)
-    const lastHeardTime = n._lastHeard || n.last_heard || n.last_seen;
-    const lastHeardMs = lastHeardTime ? new Date(lastHeardTime).getTime() : 0;
-    // #1598: pass the full node so infra staleness also considers last_relayed
+    // The newest of _lastHeard (health API), last_heard and last_seen, the
+    // same timestamp the status uses (getEffectiveHeardMs, #2260).
+    const effMs = window.getEffectiveHeardMs(n);
+    const lastHeardMs = isNaN(effMs) ? 0 : effMs;
+    const lastHeardTime = lastHeardMs ? new Date(lastHeardMs).toISOString() : null;
+    // #1598/#2260: certain relays are already in last_heard
     const status = getNodeStatus(n);
     const statusTooltip = getStatusTooltip(role, status);
-    const statusLabel = status === 'active' ? '<span style="color:var(--status-green-text)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> Active' : '<span style="color:var(--text-muted)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> Stale';
+    const statusLabel = status === 'active' ? '<span style="color:var(--status-green-text)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> Active'
+      : status === 'uncertain' ? '<span style="color:var(--text-muted)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle"/></svg></span> Uncertain'
+      : '<span style="color:var(--text-muted)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> Stale';
     const statusAge = lastHeardMs ? (Date.now() - lastHeardMs) : Infinity;
 
     let explanation = '';
     if (status === 'active') {
-      // #1598: an infra node can be active purely via relay participation —
-      // surface that instead of a misleading old "last heard".
-      const relayedMs = n.last_relayed ? new Date(n.last_relayed).getTime() : 0;
-      if (relayedMs > lastHeardMs) {
-        explanation = 'Last relayed ' + renderNodeTimestampText(n.last_relayed);
-      } else {
-        explanation = 'Last heard ' + (lastHeardTime ? renderNodeTimestampText(lastHeardTime) : 'unknown');
-      }
+      // #2260: no "Last relayed" here. last_relayed also counts 1-byte prefix
+      // matches of other repeaters; the certain relays are in last heard.
+      explanation = 'Last heard ' + (lastHeardTime ? renderNodeTimestampText(lastHeardTime) : 'unknown');
+    } else if (status === 'uncertain') {
+      explanation = 'Last certainly heard ' + (lastHeardTime ? renderNodeTimestampText(lastHeardTime) : 'never') +
+        ' \u2014 its shared hop prefix was last in a path ' + renderNodeTimestampText(n.last_relayed) + ', possibly another node';
     } else {
       const ageDays = Math.floor(statusAge / 86400000);
       const ageHours = Math.floor(statusAge / 3600000);
@@ -280,7 +354,7 @@
   function renderHashInconsistencyWarning(n) {
     if (!n.hash_size_inconsistent) return '';
     const sizes = Array.isArray(n.hash_sizes_seen) ? n.hash_sizes_seen : [];
-    return `<div style="font-size:11px;color:var(--text-muted);margin:-2px 0 6px;padding:6px 10px;background:var(--surface-2);border-radius:4px;border-left:3px solid var(--status-yellow)">Adverts show varying hash sizes (<strong>${sizes.join('-byte, ')}-byte</strong>). This is a <a href="https://github.com/meshcore-dev/MeshCore/commit/fcfdc5f" target="_blank" style="color:var(--link-color)">known bug</a> where automatic adverts ignore the configured multibyte path setting. Fixed in <a href="https://github.com/meshcore-dev/MeshCore/releases/tag/repeater-v1.14.1" target="_blank" style="color:var(--link-color)">repeater v1.14.1</a>.</div>`;
+    return `<div style="font-size:11px;color:var(--text-muted);margin:-2px 0 6px;padding:6px 10px;background:var(--surface-2);border-radius:4px;border-left:3px solid var(--status-yellow)">Adverts show varying hash sizes (<strong>${escapeHtml(sizes.join('-byte, '))}-byte</strong>). This is a <a href="https://github.com/meshcore-dev/MeshCore/commit/fcfdc5f" target="_blank" style="color:var(--link-color)">known bug</a> where automatic adverts ignore the configured multibyte path setting. Fixed in <a href="https://github.com/meshcore-dev/MeshCore/releases/tag/repeater-v1.14.1" target="_blank" style="color:var(--link-color)">repeater v1.14.1</a>.</div>`;
   }
 
   // ─── Neighbor section helpers ───────────────────────────────────────────────
@@ -491,9 +565,12 @@
   let directNode = null; // set when navigating directly to #/nodes/:pubkey
 
   let regionChangeHandler = null;
+  let packetCountHelpCleanup = null;
 
   function init(app, routeParam) {
+    if (window.setRouteTitle) window.setRouteTitle('nodes', routeParam);
     directNode = routeParam || null;
+    packetCountHelpCleanup = setupPacketCountHelp(app);
 
     if (directNode) {
       // Full-screen single node view (desktop + mobile).
@@ -532,6 +609,7 @@
     // #1845: shareable — "here are the repeaters silent over a week".
     const _urlSilent = _listUrlParams.get('silent');
     if (_urlSilent !== null) silentFor = SILENT_MS[_urlSilent] ? _urlSilent : '';
+    loraFilter = _listUrlParams.get('lora') === 'differs' ? 'differs' : '';
     // #749 — restore sort from URL (overrides localStorage persistence).
     var _urlSort = _listUrlParams.get('sort');
     if (_urlSort && window.URLState) {
@@ -628,10 +706,80 @@
   async function fetchNodeDetail(pubkey) {
     const [nodeData, healthData] = await Promise.all([
       api('/nodes/' + encodeURIComponent(pubkey), { ttl: CLIENT_TTL.nodeDetail }),
-      api('/nodes/' + encodeURIComponent(pubkey) + '/health', { ttl: CLIENT_TTL.nodeDetail }).catch(() => null)
+      api('/nodes/' + encodeURIComponent(pubkey) + '/health', { ttl: CLIENT_TTL.nodeDetail }).catch(() => null),
+      loadRfParams()
     ]);
     nodeData.healthData = healthData;
     return nodeData;
+  }
+
+  function renderPacketCountLabel(id) {
+    return `<button type="button" class="sort-help node-packet-count-help" aria-label="Total Packets help" aria-describedby="${id}">Total Packets <span aria-hidden="true">ⓘ</span><span class="sort-help-tip" id="${id}" role="tooltip">Total Packets counts distinct transmissions involving this node as an originator, destination, or resolved relay. The seen count totals observations of those transmissions; one transmission can have multiple observations.</span></button>`;
+  }
+
+  function setupPacketCountHelp(app) {
+    let activeHelp = null;
+    let frame = 0;
+
+    function position() {
+      if (!activeHelp || !activeHelp.isConnected) { activeHelp = null; return; }
+      const tip = activeHelp.querySelector('.sort-help-tip');
+      if (!tip.offsetHeight) return;
+      const trigger = activeHelp.getBoundingClientRect();
+      const bounds = activeHelp.closest('#nodesRight, #nodeFullBody').getBoundingClientRect();
+      const top = Math.max(0, bounds.top);
+      const bottom = Math.min(window.innerHeight, bounds.bottom);
+      const left = Math.max(0, bounds.left);
+      const right = Math.min(window.innerWidth, bounds.right);
+      if (trigger.bottom <= top || trigger.top >= bottom) {
+        activeHelp.classList.add('help-dismissed');
+        return;
+      }
+      tip.style.maxWidth = (right - left) + 'px';
+      tip.style.left = Math.max(left - trigger.left, Math.min(0, right - trigger.left - tip.offsetWidth)) + 'px';
+      const height = tip.offsetHeight;
+      const preferredTop = trigger.top - height < top ? trigger.bottom : trigger.top - height;
+      tip.style.top = (Math.max(top, Math.min(preferredTop, bottom - height)) - trigger.top) + 'px';
+      tip.style.bottom = 'auto';
+    }
+
+    function open(event) {
+      const help = event.target.closest('.node-packet-count-help');
+      if (!help || help.contains(event.relatedTarget)) return;
+      activeHelp = help;
+      help.classList.remove('help-dismissed');
+      if (event.type === 'pointerover') help.classList.toggle('help-touch', event.pointerType === 'touch');
+      position();
+    }
+
+    function schedule() {
+      if (!activeHelp || frame) return;
+      frame = requestAnimationFrame(() => { frame = 0; position(); });
+    }
+
+    function dismiss(event) {
+      if (event.key !== 'Escape' || !activeHelp || !activeHelp.isConnected ||
+          !activeHelp.querySelector('.sort-help-tip').offsetHeight) return;
+      activeHelp.classList.add('help-dismissed');
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+
+    app.addEventListener('pointerover', open);
+    app.addEventListener('focusin', open);
+    app.addEventListener('scroll', schedule, true);
+    window.addEventListener('resize', schedule);
+    // Capture also dismisses hover-only help before the page's Escape shortcuts.
+    document.addEventListener('keydown', dismiss, true);
+    return () => {
+      app.removeEventListener('pointerover', open);
+      app.removeEventListener('focusin', open);
+      app.removeEventListener('scroll', schedule, true);
+      window.removeEventListener('resize', schedule);
+      document.removeEventListener('keydown', dismiss, true);
+      cancelAnimationFrame(frame);
+      activeHelp = null;
+    };
   }
 
   async function loadFullNode(pubkey) {
@@ -652,10 +800,12 @@
       const observers = h.observers || [];
       const relayObserverCount = Number(h.relayObserverCount) || 0;
       const recent = h.recentPackets || [];
-      const lastHeard = stats.lastHeard;
-
-      // Attach health lastHeard for shared helpers
-      n._lastHeard = lastHeard || n.last_seen;
+      // Attach health lastHeard for shared helpers. Displayed: the newest of
+      // it, the node's last_heard and last_seen (#2260); either fetch may be
+      // the fresher one.
+      n._lastHeard = stats.lastHeard || n.last_seen;
+      const effMs = window.getEffectiveHeardMs(n);
+      const lastHeard = isNaN(effMs) ? null : new Date(effMs).toISOString();
       const si = getStatusInfo(n);
       const roleColor = si.roleColor;
       const statusLabel = si.statusLabel;
@@ -680,6 +830,7 @@
             <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="flex:0 0 auto;text-decoration:none;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg> Analytics</a>
             <a href="#/nodes/${encodeURIComponent(n.public_key)}/reach" class="btn-primary" style="flex:0 0 auto;text-decoration:none;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Reach</a>
             <a href="#/observers/${encodeURIComponent(n.public_key.toUpperCase())}" class="btn-primary" title="View this pubkey as an observer" style="flex:0 0 auto;text-decoration:none;font-size:12px;padding:4px 10px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-eye"/></svg> Observer →</a>
+            <span class="node-notify-slot" id="nodeNotifySlotFull"></span>
           </div>
         </div>
 
@@ -694,29 +845,8 @@
         <table class="node-stats-table" id="node-stats">
           <tr><td>Status</td><td><span title="${si.statusTooltip}">${statusLabel}</span> <span style="font-size:11px;color:var(--text-muted);margin-left:4px">${statusExplanation}</span></td></tr>
           <tr><td>Last Heard</td><td>${renderNodeTimestampHtml(lastHeard || n.last_seen)}</td></tr>
-          ${(n.role === 'repeater' || n.role === 'room') ? `<tr><td title="Last time this repeater appeared as a relay hop in a non-advert packet observed by the network. Distinct from 'Last Heard' (which counts the repeater's own adverts). See issue #662.">Last Relayed</td><td>${n.last_relayed ? renderNodeTimestampHtml(n.last_relayed) + ' ' + (n.relay_active ? '<span style="color:var(--status-green-text);font-size:11px"><span style="color:var(--status-green-text)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> actively relaying</span>' : '<span style="color:var(--status-yellow);font-size:11px"><span style="color:var(--status-yellow)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> alive (idle)</span>') : '<span style="color:var(--text-muted)">never observed as relay hop</span> <span style="color:var(--status-yellow);font-size:11px"><span style="color:var(--status-yellow)"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span> alive (idle)</span>'}${(n.relay_count_1h != null || n.relay_count_24h != null) ? ` <span style="color:var(--text-muted);font-size:11px;margin-left:4px">(${n.relay_count_1h || 0} relays/hr, ${n.relay_count_24h || 0} relays/24h)</span>` : ''}</td></tr>` : ''}
-          ${(n.role === 'repeater' || n.role === 'room') && (n.traffic_share_score != null || n.usefulness_score != null) ? (() => {
-            // #1456: prefer the new traffic_share_score field; fall back
-            // to legacy usefulness_score for graceful degradation
-            // against stale servers. The visible label is now "Traffic
-            // share" (the old "Usefulness" implied a composite that
-            // doesn't exist yet — see #672).
-            const raw = (n.traffic_share_score != null) ? n.traffic_share_score : n.usefulness_score;
-            const s = Number(raw) || 0;
-            const pct = (s * 100).toFixed(1);
-            // Visual indicator: width % bar with green→yellow→red color by score.
-            // Per issue #672 classification table: 0.8+ Critical, 0.6+ Valuable,
-            // 0.3+ Moderate, 0.1+ Marginal, else Redundant.
-            let label, color;
-            if (s >= 0.8) { label = 'Critical'; color = 'var(--status-green, #2ecc71)'; }
-            else if (s >= 0.6) { label = 'Valuable'; color = 'var(--status-green, #2ecc71)'; }
-            else if (s >= 0.3) { label = 'Moderate'; color = 'var(--status-yellow, #f1c40f)'; }
-            else if (s >= 0.1) { label = 'Marginal'; color = 'var(--status-orange, #e67e22)'; }
-            else { label = 'Redundant'; color = 'var(--status-red, #e74c3c)'; }
-            const barWidth = Math.max(2, Math.round(s * 100));
-            const tooltip = "Fraction of all non-advert mesh traffic in the analyzer's memory that transited through this repeater as a relay hop. High = lots of packets pass through; low = quieter (may still be structurally important — see Bridge score). One of 4 planned scoring axes (#672); others pending.";
-            return `<tr id="row-usefulness-score" data-usefulness-score="${s.toFixed(4)}" data-traffic-share-score="${s.toFixed(4)}"><td title="${tooltip}">Traffic share <span style="color:var(--text-muted);cursor:help" aria-label="help">ⓘ</span></td><td><span style="display:inline-block;vertical-align:middle;width:80px;height:8px;background:var(--bg-secondary,#333);border-radius:4px;overflow:hidden;margin-right:6px"><span style="display:block;width:${barWidth}%;height:100%;background:${color}"></span></span><span style="color:${color};font-weight:600">${pct}%</span> <span style="color:var(--text-muted);font-size:11px;margin-left:4px">${label}</span></td></tr>`;
-          })() : ''}
+          ${renderLastRelayed(n, true)}
+          ${renderTrafficShare(n, true)}
           ${(n.role === 'repeater' || n.role === 'room') && n.bridge_score != null ? (() => {
             // Bridge axis (issue #672 axis 2 of 4): normalized betweenness
             // centrality from the neighbor-edges graph. Distinct from the
@@ -738,18 +868,21 @@
           ${(n.role === 'repeater' || n.role === 'room') && Array.isArray(n.transported_scopes) && n.transported_scopes.length ? `<tr id="row-transported-scopes"><td title="Distinct region scopes (transmissions.scope_name) of the non-advert packets whose path names this repeater by its full pubkey. Shows which regions' traffic it has carried (#1751). Packets that only carry a 1-byte hop are excluded: that byte is shared by every node with the same pubkey prefix, so it cannot say which of them relayed (#1902).">Transported scopes</td><td><span style="display:inline-flex;flex-wrap:wrap;gap:3px;vertical-align:middle">${n.transported_scopes.map(sc => '<span class="badge">' + escapeHtml(String(sc)) + '</span>').join('')}</span></td></tr>` : ''}
           ${'configured_scope' in n && n.configured_scope !== null ? `<tr id="row-configured-scope"><td title="Region scopes this node has CONFIGURED, confirmed via an observer /neighbors report (status=responded) — concrete evidence, distinct from observed default scope and transported scopes (#1865).${n.configured_scope_at ? ' Last confirmed ' + escapeHtml(String(n.configured_scope_at)) + '.' : ''}">Configured scope <span style="color:var(--status-green-text)" role="img" aria-label="confirmed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check"/></svg></span></td><td>${n.configured_scope === '' ? '<span style="color:var(--text-muted)">none configured</span>' : `<code style="color:var(--link-color)">${escapeHtml(n.configured_scope)}</code>`}</td></tr>` : ''}
           <tr><td>First Seen</td><td>${renderNodeTimestampHtml(n.first_seen)}</td></tr>
-          <tr><td>Total Packets</td><td>${stats.totalTransmissions || stats.totalPackets || n.advert_count || 0}${stats.totalObservations && stats.totalObservations !== (stats.totalTransmissions || stats.totalPackets) ? ' <span class="text-muted" style="font-size:0.85em">(seen ' + stats.totalObservations + '×)</span>' : ''}</td></tr>
+          <tr><td>${renderPacketCountLabel('fullNodePacketCountHelp')}</td><td>${stats.totalTransmissions || stats.totalPackets || n.advert_count || 0}${stats.totalObservations && stats.totalObservations !== (stats.totalTransmissions || stats.totalPackets) ? ' <span class="text-muted" style="font-size:0.85em">(seen ' + stats.totalObservations + '×)</span>' : ''}</td></tr>
           <tr><td>Packets Today</td><td>${stats.packetsToday || 0}</td></tr>
           ${stats.avgHops ? `<tr><td>Avg Hops</td><td>${stats.avgHops}</td></tr>` : ''}
           ${hasLoc ? `<tr><td>Location</td><td>${Number(n.lat).toFixed(5)}, ${Number(n.lon).toFixed(5)}</td></tr>` : ''}
-          <tr><td>Hash Prefix</td><td>${n.hash_size ? '<code style="font-family:var(--mono);font-weight:700">' + n.public_key.slice(0, n.hash_size * 2).toUpperCase() + '</code> (' + n.hash_size + '-byte)' : 'Unknown'}${n.hash_size_inconsistent ? ' <span style="color:var(--status-yellow);cursor:help" title="Seen: ' + (Array.isArray(n.hash_sizes_seen) ? n.hash_sizes_seen : []).join(', ') + '-byte"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> varies</span>' : ''}</td></tr>
+          ${renderHashPrefix(n, true)}
+          ${rfOn() ? `<tr><td title="LoRa radio settings this node last advertised to the MeshCore map">LoRa</td><td data-testid="node-detail-lora">${RfParams.detailHtml(rfFor(n), _rfParams.presets, Date.now(), rfDev(n))}</td></tr>` : ''}
         </table>
 
         <div class="node-full-card" id="node-packets">
           ${(() => { const validPackets = adverts.filter(p => p.hash && p.timestamp); return `
-          <h4 title="Adverts this node originated. The section is limited to adverts because they are the only packet type attributable to an originating node: transmissions.from_pubkey is populated for ADVERTs only, so a relayed CHAN or TXT packet cannot be traced back to its sender without path resolution.">Recent Adverts (${validPackets.length})</h4>
+          <h4 title="Adverts this node originated. The section is limited to adverts because they are the only packet type attributable to an originating node: transmissions.from_pubkey is populated for ADVERTs only, so a relayed CHAN or TXT packet cannot be traced back to its sender without path resolution. Groups use available observations; older history may be incomplete. An observed empty direct path cannot prove an origin-local send or RF distance.">Recent Adverts (${validPackets.length})</h4>
           <div class="node-activity-list">
-            ${validPackets.length ? validPackets.map(p => {
+            ${window.groupRecentAdverts(validPackets).map(group => `<div class="node-advert-group" data-advert-kind="${group.kind}">
+            <h5 title="Count in this recent sample, not the node's lifetime total.">${group.label} (${group.adverts.length})</h5>
+            ${group.adverts.length ? group.adverts.map(p => {
               let decoded; try { decoded = JSON.parse(p.decoded_json); } catch {}
               const typeLabel = p.payload_type === 4 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Advert' : p.payload_type === 5 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chat-circle"/></svg> Channel' : p.payload_type === 2 ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-envelope"/></svg> DM' : '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-package"/></svg> Packet';
               const detail = decoded?.text ? ': ' + escapeHtml(truncate(decoded.text, 50)) : decoded?.name ? ' — ' + escapeHtml(decoded.name) : '';
@@ -773,19 +906,18 @@
                 <span>${typeLabel}${detail}${hashSizeBadge}${obsBadge}${obs ? ' via ' + escapeHtml(obs) : ''}${snr}${rssi}</span>
                 <a href="#/packets/${p.hash}" class="ch-analyze-link" style="margin-left:8px;font-size:0.8em">Analyze →</a>
               </div>`;
-            }).join('') : '<div class="text-muted">No recent packets</div>'}
+            }).join('') : '<div class="text-muted">None in this recent sample</div>'}
+            </div>`).join('')}
           </div>
         `; })()}
         </div>
 
         ${observers.length || relayObserverCount ? `<div class="node-full-card" id="node-observers">
-          ${(() => { const regions = [...new Set(observers.map(o => o.iata).filter(Boolean))]; return regions.length ? `<div style="margin-bottom:8px"><strong>Regions:</strong> ${regions.map(r => '<span class="badge" style="margin:0 2px">' + escapeHtml(r) + '</span>').join(' ')}</div>` : ''; })()}
           <h4 title="Observers that received this node's own transmission off the air. An observer that only saw traffic relayed through this node is counted separately below.">Heard By &mdash; direct (${observers.length} observer${observers.length === 1 ? '' : 's'})</h4>
           ${observers.length ? '' : '<div class="text-muted" style="font-size:12px;padding:4px 0" title="Only flood-routed transmissions identify who was heard: a direct route removes the sender from the path before retransmitting (firmware Mesh.cpp, removeSelfFromPath), and an ambiguous relay hop is left unattributed rather than guessed. So an empty list is missing evidence, not proof of missing coverage.">No observation proves a direct reception here, which is not the same as being out of range.</div>'}
           ${observers.length ? `<table class="data-table observer-sort-table" style="font-size:12px">
             <thead><tr>
               <th scope="col" data-sort-key="observer">Observer</th>
-              <th scope="col" data-sort-key="region">Region</th>
               <th scope="col" data-sort-key="packets" data-type="numeric" data-sort-default="desc">Packets</th>
               <th scope="col" data-sort-key="snr" data-type="numeric" data-sort-default="desc">Avg SNR</th>
               <th scope="col" data-sort-key="rssi" data-type="numeric" data-sort-default="desc">Avg RSSI</th>
@@ -793,7 +925,6 @@
             <tbody>
               ${observers.map(o => `<tr>
                 <td data-value="${escapeHtml((o.observer_name || o.observer_id || '').toLowerCase())}" style="font-weight:600">${escapeHtml(o.observer_name || o.observer_id)}${o.can_relay === false ? ' <span class="badge-listener" title="Firmware reported repeat:off — excluded from path-hop disambiguator (#1290)">listener</span>' : (o.can_relay === true ? ' <span class="badge-repeater" title="Firmware reported repeat:on — eligible as a path hop">repeater</span>' : '')}</td>
-                <td data-value="${escapeHtml((o.iata || '').toLowerCase())}">${o.iata ? escapeHtml(o.iata) : '—'}</td>
                 <td data-value="${o.packetCount || 0}">${o.packetCount}</td>
                 <td data-value="${o.avgSnr != null ? Number(o.avgSnr) : ''}">${o.avgSnr != null ? Number(o.avgSnr).toFixed(1) + ' dB' : '—'}</td>
                 <td data-value="${o.avgRssi != null ? Number(o.avgRssi) : ''}">${o.avgRssi != null ? Number(o.avgRssi).toFixed(0) + ' dBm' : '—'}</td>
@@ -822,6 +953,7 @@
         </div>
 
         <div class="node-full-card skew-detail-section" id="node-clock-skew" style="display:none"></div>`;
+      if (window.CSNotify) window.CSNotify.mount(document.getElementById('nodeNotifySlotFull'), n.public_key);
 
       // Map
       if (hasLoc) {
@@ -1007,7 +1139,7 @@
               if (window.HopDisplay) {
                 const entry = { name: h.name, pubkey: h.pubkey, ambiguous: h.ambiguous, conflicts: h.conflicts, totalGlobal: h.totalGlobal, totalRegional: h.totalRegional, globalFallback: h.globalFallback, unreliable: h.unreliable };
                 const html = HopDisplay.renderHop(h.prefix, entry);
-                return isThis ? html.replace('class="', 'class="hop-current ') : html;
+                return isThis ? html.replace('class="hop ', 'class="hop-current hop ') : html;
               }
               const name = escapeHtml(h.name || h.prefix);
               const link = h.pubkey ? `<a href="#/nodes/${encodeURIComponent(h.pubkey)}"${isThis ? ' class="hop-current"' : ''}>${name}</a>` : `<span>${name}</span>`;
@@ -1015,7 +1147,7 @@
             }).join(' → ');
             return `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">
               <div>${chain}</div>
-              <div style="color:var(--text-muted);margin-top:2px">${p.count}× · last ${renderNodeTimestampHtml(p.lastSeen)} · <a href="#/packets/${p.sampleHash}" class="ch-analyze-link">Analyze →</a></div>
+              <div style="color:var(--text-muted);margin-top:2px">${p.count}× · last ${renderNodeTimestampHtml(p.lastSeen)} · <a href="#/packets/${p.sampleHash}" class="ch-analyze-link">View example packet →</a></div>
             </div>`;
           }).join('');
         }
@@ -1039,6 +1171,20 @@
       // stays "Loading…" forever and there's no link back to the Nodes list.
       const msg = (e && e.message) || '';
       const is404 = /\b404\b/.test(msg) || /not\s*found/i.test(msg);
+      // A repeater known only from its reported name has no /api/nodes row.
+      // Checked before the title changes, so it never flashes "not found".
+      if (is404 && window.ReportedNodes) {
+        const rep = await window.ReportedNodes.load();
+        const hit = window.ReportedNodes.find(rep.nodes, pubkey);
+        if (document.getElementById('nodeFullBody') !== body) return;
+        if (hit) {
+          const t = document.querySelector('.node-full-title');
+          if (t) t.textContent = (hit.name || hit.pubkey.slice(0, 12)) + ' (self-reported)';
+          removeDetailMap(body);
+          body.innerHTML = window.ReportedNodes.detailHtml(hit, rep.method);
+          return;
+        }
+      }
       const titleEl = document.querySelector('.node-full-title');
       if (titleEl) {
         titleEl.textContent = is404
@@ -1073,6 +1219,7 @@
   }
 
   function destroy() {
+    if (packetCountHelpCleanup) { packetCountHelpCleanup(); packetCountHelpCleanup = null; }
     if (wsHandler) offWS(wsHandler);
     wsHandler = null;
     removeDetailMap();
@@ -1086,6 +1233,24 @@
 
   let _allNodes = null; // cached full node list
   let _fleetSkew = null; // cached clock skew map: pubkey → {severity, recentMedianSkewSec, medianSkewSec, ...}
+  let _rfParams = null; // #1268 /api/rf-params body: {enabled, presets, nodes: pubkey → {freq, sf, bw, cr, last_advert}}
+
+  // #1268 — one bulk fetch of the MeshCore map's radio settings for the
+  // detail views (api() caches it 5 min); a failure leaves the row off.
+  function loadRfParams() {
+    return api('/rf-params', { ttl: 300000 })
+      .catch(function () { return null; })
+      .then(function (d) { _rfParams = d; return d; });
+  }
+  // Off until the server has fetched the map once: before that every node
+  // would wrongly read as "not on the map".
+  function rfOn() { return !!(_rfParams && _rfParams.enabled && _rfParams.fetched_at); }
+  function rfFor(n) {
+    return (rfOn() && n && n.public_key && _rfParams.nodes[String(n.public_key).toLowerCase()]) || null;
+  }
+  function rfDev(n) {
+    return (rfOn() && n && n.public_key && _rfParams.deviations && _rfParams.deviations[String(n.public_key).toLowerCase()]) || null;
+  }
 
   /**
    * Fetch per-node clock skew and render into the given container element.
@@ -1131,7 +1296,7 @@
       }
       var header = '<div style="font-weight:600;font-size:12px;margin-top:6px">Hash ' + shortHash + '  ·  ' + obsCount + ' observer' + (obsCount !== 1 ? 's' : '') + '  ·  median corrected: ' + medianLabel + '</div>';
       var lines = (ev.observers || []).map(function(o) {
-        var name = o.observerName || o.observerID;
+        var name = escapeHtml(o.observerName || o.observerID);
         return '<div style="font-size:11px;padding-left:16px;font-family:var(--mono)">' +
           name + '   raw=' + formatSkew(o.rawSkewSec) + '  corrected=' + formatSkew(o.correctedSkewSec) + '  (observer offset ' + formatSkew(o.observerOffsetSec) + ')' +
           '</div>';
@@ -1251,6 +1416,7 @@
         let firstTotal = null; // informational only (M1: not used as loop bound)
         // Kick off fleet skew in parallel with the first page only.
         const skewPromise = getFleetSkew();
+        const rfPromise = loadRfParams(); // #1268 M3: deviation badges and filter
         const nodesBody = document.getElementById('nodesBody');
         while (offset < SAFETY_CAP) {
           baseParams.set('offset', String(offset));
@@ -1286,6 +1452,7 @@
         _allNodes = Array.from(seen.values());
         // m3: counts from first response only (subsequent pages may differ)
         await skewPromise;
+        await rfPromise;
       }
 
       // Client-side filtering
@@ -1302,7 +1469,7 @@
         });
       }
       // Status filter (active/stale)
-      if (statusFilter === 'active' || statusFilter === 'stale') {
+      if (statusFilter === 'active' || statusFilter === 'stale' || statusFilter === 'uncertain') {
         filtered = filtered.filter(n => getNodeStatus(n) === statusFilter); // #1598
       }
       // #1845: counts are taken BEFORE the silence filter is applied, so the
@@ -1315,6 +1482,9 @@
       if (silentFor && SILENT_MS[silentFor]) {
         filtered = filtered.filter(n => silenceAgeMs(n) >= SILENT_MS[silentFor]);
       }
+      // #1268 M3: count before the LoRa filter, like the silence counts.
+      updateLoraFilter(filtered.filter(n => rfDev(n)).length);
+      if (loraFilter === 'differs' && rfOn()) filtered = filtered.filter(n => rfDev(n));
       nodes = filtered;
 
       // Defensive filter: hide nodes with obviously corrupted data
@@ -1366,6 +1536,17 @@
     btn.textContent = n ? 'Export JSON (' + n + ')' : 'Export JSON';
   }
 
+  // #1268 M3: the LoRa filter only exists while the server has map data.
+  // renderLeft rebuilds it from this state; a refresh-only load (no
+  // renderLeft) updates the existing element.
+  function updateLoraFilter(count) {
+    _loraDiffCount = count;
+    const sel = document.getElementById('nodeLoraFilter');
+    if (!sel) return;
+    sel.hidden = !rfOn();
+    if (sel.options[1]) sel.options[1].textContent = 'LoRa: differs from nearby (' + count + ')';
+  }
+
   function renderCounts() {
     const el = document.getElementById('nodeCounts');
     if (!el) return;
@@ -1390,6 +1571,7 @@
           <div class="filter-group" id="nodeStatusFilter">
             <button class="btn ${statusFilter==='all'?'active':''}" data-status="all">All</button>
             <button class="btn ${statusFilter==='active'?'active':''}" data-status="active">Active</button>
+            <button class="btn ${statusFilter==='uncertain'?'active':''}" data-status="uncertain" title="No packet that can only be this repeater within its window; only its shared hop prefix still appears in paths (#2260)">Uncertain</button>
             <button class="btn ${statusFilter==='stale'?'active':''}" data-status="stale">Stale</button>
           </div>
           <select id="nodeLastHeard" aria-label="Filter by last heard time">
@@ -1409,6 +1591,10 @@
             <option value="">Silent for: Any</option>
             ${['1d','3d','7d','14d','30d'].map(k => `<option value="${k}" ${silentFor===k?'selected':''}>over ${k}${_silentCounts ? ` (${_silentCounts[k]})` : ''}</option>`).join('')}
           </select>
+          <select id="nodeLoraFilter" aria-label="Show only nodes whose LoRa settings differ from nearby nodes" ${rfOn() ? '' : 'hidden'}>
+            <option value="">LoRa: Any</option>
+            <option value="differs" ${loraFilter==='differs'?'selected':''}>LoRa: differs from nearby (${_loraDiffCount})</option>
+          </select>
         </div>
       </div>
       <div class="table-fluid-wrap"><table class="data-table" id="nodesTable">
@@ -1422,7 +1608,8 @@
           <th scope="col" data-sort-key="advert_count" data-sort-default="desc" data-priority="2">Adverts</th>
         </tr></thead>
         <tbody id="nodesBody"></tbody>
-      </table></div>`;
+      </table></div>
+      <div id="reportedSection"></div>`;
 
     // Tab clicks
     const nodeTabs = document.getElementById('nodeTabs');
@@ -1442,6 +1629,19 @@
         const base = String(location.hash || '#/nodes').split('?')[0];
         const params = getHashParams();
         if (silentFor) { params.set('silent', silentFor); } else { params.delete('silent'); }
+        const qs = params.toString();
+        history.replaceState(null, '', base + (qs ? '?' + qs : ''));
+      } catch (err) { /* URL sync is a convenience; never block the filter on it */ }
+      loadNodes();
+    });
+
+    // #1268 M3: same URL handling as Silent for, so the list can be shared.
+    document.getElementById('nodeLoraFilter').addEventListener('change', e => {
+      loraFilter = e.target.value;
+      try {
+        const base = String(location.hash || '#/nodes').split('?')[0];
+        const params = getHashParams();
+        if (loraFilter) { params.set('lora', loraFilter); } else { params.delete('lora'); }
         const qs = params.toString();
         history.replaceState(null, '', base + (qs ? '?' + qs : ''));
       } catch (err) { /* URL sync is a convenience; never block the filter on it */ }
@@ -1495,6 +1695,7 @@
           panel.innerHTML = '<span>Select a node to view details</span>';
           selectedKey = null;
           history.replaceState(null, '', '#/nodes');
+          if (window.setRouteTitle) window.setRouteTitle('nodes');
           renderRows();
         }
       }
@@ -1522,6 +1723,7 @@
         panel.innerHTML = '<span>Select a node to view details</span>';
         selectedKey = null;
         history.replaceState(null, '', '#/nodes');
+        if (window.setRouteTitle) window.setRouteTitle('nodes');
         renderRows();
       }
     });
@@ -1529,7 +1731,31 @@
     renderRows();
   }
 
+  // renderReported lists repeaters known only from their reported name
+  // (reported-nodes.js) under the table, on the All and Repeaters tabs, with
+  // the same search text applied.
+  // renderRows runs on every sort, select and refresh, so the section is only
+  // rebuilt when the element, the tab, the search text or the list changed.
+  let reportedShown = null; // { el, tab, q, nodes }
+  function reportedTab() { return activeTab === 'all' || activeTab === 'repeater'; }
+  function renderReported() {
+    const el = document.getElementById('reportedSection');
+    if (!el || !window.ReportedNodes) return;
+    if (!reportedTab()) { el.innerHTML = ''; reportedShown = null; return; }
+    const q = search, tab = activeTab;
+    window.ReportedNodes.load().then(function (rep) {
+      const cur = document.getElementById('reportedSection');
+      // The tab or the search may have changed while the list loaded.
+      if (!cur || q !== search || tab !== activeTab || !reportedTab()) return;
+      const s = reportedShown;
+      if (s && s.el === cur && s.tab === tab && s.q === q && s.nodes === rep.nodes) return;
+      cur.innerHTML = window.ReportedNodes.sectionHtml(rep.nodes, rep.method, q);
+      reportedShown = { el: cur, tab: tab, q: q, nodes: rep.nodes };
+    });
+  }
+
   function renderRows() {
+    renderReported();
     const tbody = document.getElementById('nodesBody');
     if (!tbody) return;
 
@@ -1573,7 +1799,7 @@
       const cs = _fleetSkew && _fleetSkew[n.public_key];
       const skewBadgeHtml = cs && cs.severity && cs.severity !== 'ok' ? renderSkewBadge(cs.severity, window.currentSkewValue(cs), cs) : '';
       return `<tr data-key="${n.public_key}" data-action="select" data-value="${n.public_key}" tabindex="0" role="row" class="${selectedKey === n.public_key ? 'selected' : ''}${isClaimed ? ' claimed-row' : ''}">
-        <td>${favStar(n.public_key, 'node-fav')}${isClaimed ? '<span class="claimed-badge" title="My Mesh"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg></span> ' : ''}<strong>${escapeHtml(n.name || '(unnamed)')}</strong>${dupNameBadge(n.name, n.public_key, dupMap)}${skewBadgeHtml}</td>
+        <td>${favStar(n.public_key, 'node-fav')}${isClaimed ? '<span class="claimed-badge" title="My Mesh"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg></span> ' : ''}<strong>${escapeHtml(n.name || '(unnamed)')}</strong>${dupNameBadge(n.name, n.public_key, dupMap)}${skewBadgeHtml}${RfParams.deviationBadge(rfFor(n), rfDev(n))}</td>
         <td class="mono col-pubkey">${truncate(n.public_key, 16)}</td>
         <td><span class="badge" style="${(window.aaBadgeStyle && window.aaBadgeStyle(roleColor)) || ('background:'+roleColor+';color:#fff')}">${n.role}</span></td>
         <td style="font-family:var(--mono);font-size:12px">${n.default_scope ? escapeHtml(n.default_scope) : ''}</td>
@@ -1621,6 +1847,7 @@
       location.hash = '#/nodes/' + encodeURIComponent(pubkey);
       return;
     }
+    if (window.setRouteTitle) window.setRouteTitle('nodes', pubkey);
     // #1056 AC#4: narrow desktop/tablet (641–1023) — open detail in slide-over.
     if (window.SlideOver && window.SlideOver.shouldUse()) {
       selectedKey = pubkey;
@@ -1638,6 +1865,7 @@
         onClose: function () {
           selectedKey = null;
           history.replaceState(null, '', '#/nodes');
+          if (window.setRouteTitle) window.setRouteTitle('nodes');
           renderRows();
         }
       });
@@ -1647,16 +1875,20 @@
         if (selectedKey !== pubkey) return;
         const n = (data && data.node) || data || {};
         const titleEl = document.querySelector('.slide-over-title');
-        if (titleEl) titleEl.textContent = n.advert_name || (n.public_key ? n.public_key.slice(0, 10) : 'Node');
+        const name = n.name || n.advert_name;
+        if (titleEl) titleEl.textContent = name || (n.public_key ? n.public_key.slice(0, 10) : 'Node');
         var role = (n.role || '').toString();
         var lastHeard = n.last_heard || n.last_seen;
         so.innerHTML =
           '<dl style="margin:0;display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-size:13px">' +
-            '<dt>Name</dt><dd>' + escapeHtml(n.advert_name || '—') + '</dd>' +
+            '<dt>Name</dt><dd>' + escapeHtml(name || '—') + '</dd>' +
             '<dt>Role</dt><dd>' + escapeHtml(role || '—') + '</dd>' +
             '<dt>Public key</dt><dd class="mono" style="word-break:break-all">' + escapeHtml(n.public_key || '—') + '</dd>' +
-            '<dt>Last heard</dt><dd>' + (lastHeard ? timeAgo(lastHeard) : '—') + '</dd>' +
+            '<dt>Last Heard</dt><dd>' + renderNodeTimestampHtml(lastHeard) + '</dd>' +
+            renderLastRelayed(n) +
+            renderTrafficShare(n) +
             '<dt>Adverts</dt><dd>' + (n.advert_count != null ? n.advert_count : '—') + '</dd>' +
+            renderHashPrefix(n) +
           '</dl>' +
           '<p style="margin-top:14px"><a class="btn-primary" href="#/nodes/' + encodeURIComponent(pubkey) + '">Open full detail →</a></p>';
       } catch (e) {
@@ -1693,9 +1925,11 @@
     const hasLoc = n.lat != null && n.lon != null;
     const nodeUrl = location.origin + '/#/nodes/' + encodeURIComponent(n.public_key);
 
-    // Status calculation via shared helper
-    const lastHeard = stats.lastHeard;
-    n._lastHeard = lastHeard || n.last_seen;
+    // Status calculation via shared helper. Displayed: the newest of the
+    // health lastHeard, the node's last_heard and last_seen (#2260).
+    n._lastHeard = stats.lastHeard || n.last_seen;
+    const effMs = window.getEffectiveHeardMs(n);
+    const lastHeard = isNaN(effMs) ? null : new Date(effMs).toISOString();
     const si = getStatusInfo(n);
     const roleColor = si.roleColor;
     const totalPackets = stats.totalTransmissions || stats.totalPackets || n.advert_count || 0;
@@ -1712,6 +1946,7 @@
           <button class="btn-primary node-detail-btn" data-pubkey="${encodeURIComponent(n.public_key)}" aria-label="View details for ${escapeHtml(n.name || n.public_key)}" style="font-size:11px;padding:2px 8px;margin-left:8px;cursor:pointer"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Details</button>
           <a href="#/nodes/${encodeURIComponent(n.public_key)}/analytics" class="btn-primary" style="display:inline-block;margin-left:4px;text-decoration:none;font-size:11px;padding:2px 8px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-chart-bar"/></svg> Analytics</a>
           <a href="#/nodes/${encodeURIComponent(n.public_key)}/reach" class="btn-primary" style="display:inline-block;margin-left:4px;text-decoration:none;font-size:11px;padding:2px 8px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Reach</a>
+          <span class="node-notify-slot" id="nodeNotifySlot"></span>
         </div>
         ${renderStatusExplanation(n)}
 
@@ -1728,19 +1963,25 @@
           <h4>Overview</h4>
           <dl class="detail-meta">
             <dt>Last Heard</dt><dd>${renderNodeTimestampHtml(lastHeard || n.last_seen)}</dd>
+            ${renderLastRelayed(n)}
+            ${renderTrafficShare(n)}
             <dt>First Seen</dt><dd>${renderNodeTimestampHtml(n.first_seen)}</dd>
-            <dt>Total Packets</dt><dd>${totalPackets}</dd>
+            <dt>${renderPacketCountLabel('nodePacketCountHelp')}</dt><dd>${totalPackets}</dd>
             <dt>Packets Today</dt><dd>${stats.packetsToday || 0}</dd>
             ${stats.avgHops ? `<dt>Avg Hops</dt><dd>${stats.avgHops}</dd>` : ''}
             ${hasLoc ? `<dt>Location</dt><dd>${Number(n.lat).toFixed(5)}, ${Number(n.lon).toFixed(5)}</dd>` : ''}
+            ${renderHashPrefix(n)}
+            ${rfOn() ? `<dt title="LoRa radio settings this node last advertised to the MeshCore map">LoRa</dt><dd data-testid="node-detail-lora">${RfParams.detailHtml(rfFor(n), _rfParams.presets, Date.now(), rfDev(n))}</dd>` : ''}
           </dl>
         </div>
 
         <div class="node-detail-section">
           ${(() => { const validPackets = adverts.filter(a => a.hash && a.timestamp); return `
-          <h4 title="Adverts this node originated. The section is limited to adverts because they are the only packet type attributable to an originating node: transmissions.from_pubkey is populated for ADVERTs only, so a relayed CHAN or TXT packet cannot be traced back to its sender without path resolution.">Recent Adverts (${validPackets.length})</h4>
+          <h4 title="Adverts this node originated. The section is limited to adverts because they are the only packet type attributable to an originating node: transmissions.from_pubkey is populated for ADVERTs only, so a relayed CHAN or TXT packet cannot be traced back to its sender without path resolution. Groups use available observations; older history may be incomplete. An observed empty direct path cannot prove an origin-local send or RF distance.">Recent Adverts (${validPackets.length})</h4>
           <div id="advertTimeline">
-            ${validPackets.length ? validPackets.map(a => {
+            ${window.groupRecentAdverts(validPackets).map(group => `<div class="node-advert-group" data-advert-kind="${group.kind}">
+            <h5 title="Count in this recent sample, not the node's lifetime total.">${group.label} (${group.adverts.length})</h5>
+            ${group.adverts.length ? group.adverts.map(a => {
               let decoded;
               try { decoded = JSON.parse(a.decoded_json); } catch {}
               const pType = PAYLOAD_TYPES[a.payload_type] || 'Packet';
@@ -1757,13 +1998,13 @@
                   <br><a href="#/packets/${a.hash}" class="ch-analyze-link">Analyze →</a>
                 </div>
               </div>`;
-            }).join('') : '<div class="text-muted" style="padding:8px">No recent packets</div>'}
+            }).join('') : '<div class="text-muted">None in this recent sample</div>'}
+            </div>`).join('')}
           </div>
           `; })()}
         </div>
 
         ${observers.length || relayObserverCount ? `<div class="node-detail-section">
-          ${(() => { const regions = [...new Set(observers.map(o => o.iata).filter(Boolean))]; return regions.length ? `<div style="margin-bottom:6px;font-size:12px"><strong>Regions:</strong> ${regions.join(', ')}</div>` : ''; })()}
           <h4 title="Observers that received this node's own transmission off the air.">Heard By &mdash; direct (${observers.length} observer${observers.length === 1 ? '' : 's'})</h4>
           ${observers.length ? '' : '<div class="text-muted" style="font-size:12px;padding:4px 0" title="Only flood-routed transmissions identify who was heard: a direct route removes the sender from the path before retransmitting (firmware Mesh.cpp, removeSelfFromPath), and an ambiguous relay hop is left unattributed rather than guessed. So an empty list is missing evidence, not proof of missing coverage.">No observation proves a direct reception here, which is not the same as being out of range.</div>'}
           <div class="observer-list">
@@ -1772,7 +2013,7 @@
               if (o.avgSnr != null) stats.push('SNR ' + Number(o.avgSnr).toFixed(1) + 'dB');
               if (o.avgRssi != null) stats.push('RSSI ' + Number(o.avgRssi).toFixed(0));
               return `<div class="observer-row" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
-              <span style="font-weight:600">${escapeHtml(o.observer_name || o.observer_id)}${o.iata ? ' <span class="badge" style="font-size:10px">' + escapeHtml(o.iata) + '</span>' : ''}</span>
+              <span style="font-weight:600">${escapeHtml(o.observer_name || o.observer_id)}</span>
               <span style="color:var(--text-muted)">${stats.join(' · ')}</span>
             </div>`;
             }).join('')}
@@ -1792,6 +2033,7 @@
 
         <div class="node-detail-section skew-detail-section" id="node-clock-skew" style="display:none"></div>
       </div>`;
+    if (window.CSNotify) window.CSNotify.mount(document.getElementById('nodeNotifySlot'), n.public_key);
 
     // Init map
     if (hasLoc) {
@@ -1874,7 +2116,7 @@
           }).join(' → ');
           return `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">
             <div>${chain}</div>
-            <div style="color:var(--text-muted);margin-top:2px">${p.count}× · last ${renderNodeTimestampHtml(p.lastSeen)} · <a href="#/packets/${p.sampleHash}" class="ch-analyze-link">Analyze →</a></div>
+            <div style="color:var(--text-muted);margin-top:2px">${p.count}× · last ${renderNodeTimestampHtml(p.lastSeen)} · <a href="#/packets/${p.sampleHash}" class="ch-analyze-link">View example packet →</a></div>
           </div>`;
         }).join('');
       }

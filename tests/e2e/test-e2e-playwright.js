@@ -5,6 +5,7 @@ const REPO_ROOT = require('path').resolve(__dirname, '..', '..');
  * Usage: node test-e2e-playwright.js
  */
 const { chromium } = require('playwright');
+const { doesNotReject } = require('node:assert/strict');
 
 const BASE = process.env.BASE_URL || 'http://localhost:3000';
 const GO_BASE = process.env.GO_BASE_URL || '';  // e.g. https://analyzer.00id.net:82
@@ -64,6 +65,245 @@ async function run() {
   page.setDefaultTimeout(10000);
 
   console.log(`\nRunning E2E tests against ${BASE}\n`);
+
+  for (const [view, width, full, interaction] of [
+    ['desktop side pane', 1280, false],
+    ['desktop full view', 1280, true],
+    ['mobile full view', 375, true],
+  ].flatMap(([view, width, full]) =>
+    ['', 'Escape', 'scroll edges', ...(width < 640 ? [] : ['hover Escape', 'hover transfer'])]
+      .map(interaction => [view, width, full, interaction]))) {
+    await test(`#2131 packet count help${interaction ? ' ' + interaction : ''} in ${view}`, async () => {
+      const height = interaction === 'scroll edges' ? 600 : (width < 640 ? 667 : 900);
+      const fixtureContext = await browser.newContext({
+        viewport: { width, height }, hasTouch: width < 640,
+      });
+      const fixturePage = await fixtureContext.newPage();
+      await fixturePage.addInitScript(() => {
+        window.addEventListener('theme-refresh', () => { window.__packetCountThemeReady = true; }, { once: true });
+      });
+      const pubkey = 'b'.repeat(64);
+      const node = { public_key: pubkey, name: 'Packet count fixture', role: 'repeater',
+        last_seen: new Date().toISOString(), advert_count: 900,
+        traffic_share_score: 0.25, bridge_score: 0.2 };
+      const stats = { totalTransmissions: 233, totalPackets: 500, totalObservations: 12278 };
+      // Score rows above Total Packets and adverts below it make both scroll
+      // edges reachable without depending on relay wording or platform fonts.
+      const recentAdverts = Array.from({ length: 12 }, (_, i) => ({ hash: i.toString(16).padStart(64, '0'),
+        timestamp: new Date(Date.now() - i * 60000).toISOString(), payload_type: 4, route_type: 1 }));
+      await fixturePage.route('**/api/nodes**', async route => {
+        const path = new URL(route.request().url()).pathname;
+        let body;
+        if (path === '/api/nodes') body = { nodes: [node], total: 1 };
+        else if (path === '/api/nodes/' + pubkey) body = { node, recentAdverts };
+        else if (path === '/api/nodes/' + pubkey + '/health') body = { stats };
+        else return route.continue();
+        await route.fulfill({ json: body });
+      });
+      try {
+        // Initial theme refresh rebuilds node details; finish it before testing focus.
+        await fixturePage.goto(`${BASE}/#/home`, { waitUntil: 'domcontentloaded' });
+        await fixturePage.waitForFunction(() => window.__packetCountThemeReady);
+        await fixturePage.goto(`${BASE}/#/nodes${full ? '/' + pubkey : ''}`, { waitUntil: 'domcontentloaded' });
+        if (!full) await fixturePage.locator(`tr[data-key="${pubkey}"]`).click();
+        const label = fixturePage.locator(full ? '#nodeFullBody td:first-child' : '#nodesRight dt')
+          .filter({ hasText: 'Total Packets' });
+        await label.waitFor();
+        const count = await label.evaluate(el => el.nextElementSibling.innerText.trim());
+        assert(count === (full ? '233 (seen 12278×)' : '233'), `Packet counts changed: ${count}`);
+
+        const help = label.getByRole('button', { name: 'Total Packets help', exact: true });
+        assert(await help.count() === 1, `Total Packets help is missing in ${view}`);
+        const descriptionId = await help.getAttribute('aria-describedby');
+        assert(descriptionId, 'Packet count help must have an accessible description');
+        const tooltip = fixturePage.locator('#' + descriptionId);
+        assert(await tooltip.count() === 1, 'Packet count description must reference one tooltip');
+        await fixturePage.mouse.move(0, 0);
+        assert(!await tooltip.isVisible(), 'Packet count tooltip should start closed');
+        if (width < 640) {
+          await help.tap();
+        } else {
+          await help.hover();
+          assert(await tooltip.isVisible(), 'Packet count help must open on hover');
+          await fixturePage.mouse.move(0, 0);
+          await help.focus();
+          await fixturePage.keyboard.press('Shift+Tab');
+          await fixturePage.keyboard.press('Tab');
+          assert(await help.evaluate(el => el === document.activeElement), 'Packet count help must be keyboard reachable');
+        }
+        assert(await tooltip.isVisible(), `Packet count help is not visible after ${width < 640 ? 'tap' : 'keyboard focus'}`);
+        const explanation = await tooltip.innerText();
+        assert(/distinct transmissions/i.test(explanation), 'Help must explain the Total Packets count');
+        assert(/originator/i.test(explanation) && /destination/i.test(explanation) && /resolved relay/i.test(explanation),
+          'Help must explain that counted traffic can involve this node in different roles');
+        assert(/seen/i.test(explanation) && /one transmission can have multiple observations/i.test(explanation),
+          'Help must explain why seen observations can exceed transmissions');
+        const box = await tooltip.boundingBox();
+        assert(box && box.x >= 0 && box.x + box.width <= width && box.y >= 0 && box.y + box.height <= height,
+          `Packet count help is clipped in ${view}`);
+        const clippedBy = await tooltip.evaluate(el => {
+          const rect = el.getBoundingClientRect();
+          for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+            const style = getComputedStyle(parent);
+            const bounds = parent.getBoundingClientRect();
+            if ((/hidden|auto|scroll|clip/.test(style.overflowX) && (rect.left < bounds.left - 1 || rect.right > bounds.right + 1)) ||
+                (/hidden|auto|scroll|clip/.test(style.overflowY) && (rect.top < bounds.top - 1 || rect.bottom > bounds.bottom + 1))) {
+              return parent.id || parent.className || parent.tagName;
+            }
+          }
+          return null;
+        });
+        assert(!clippedBy, `Packet count help is clipped by ${clippedBy} in ${view}`);
+        if (width < 640) await label.locator('..').locator('td').nth(1).tap();
+        else await fixturePage.keyboard.press('Tab');
+        assert(!await tooltip.isVisible(), 'Packet count help must close when focus or touch moves away');
+
+        if (interaction === 'Escape' || interaction === 'hover Escape') {
+          const selectedUrl = fixturePage.url();
+          if (interaction === 'Escape') await help.focus();
+          else await help.hover();
+          const focusedBeforeEscape = await fixturePage.evaluateHandle(() => document.activeElement);
+          assert(await tooltip.isVisible(), 'Help must be open before Escape');
+          await fixturePage.keyboard.press('Escape');
+          assert(await help.count() === 1, `Escape dismissed the selected node in ${view}`);
+          assert(fixturePage.url() === selectedUrl, `Escape changed the selected node URL in ${view}`);
+          assert(await focusedBeforeEscape.evaluate(el => el === document.activeElement), 'Escape must preserve the current focus');
+          assert(!await tooltip.isVisible(), 'Escape must dismiss the packet count help');
+          await fixturePage.keyboard.press('Escape');
+          await fixturePage.waitForFunction(() => location.hash === '#/nodes');
+          await help.waitFor({ state: 'detached' });
+          assert(await help.count() === 0, 'A second Escape must retain normal node dismissal');
+          if (!full) assert(await fixturePage.locator('#nodesRight.empty').count() === 1, 'A second Escape must clear the side pane');
+        }
+
+        if (interaction === 'scroll edges') {
+          await fixturePage.evaluate(() => document.fonts.ready);
+          const container = fixturePage.locator(full ? '#nodeFullBody' : '#nodesRight');
+          for (const edge of ['top', 'bottom']) {
+            await help.evaluate((el, edge) => {
+              const scroller = el.closest('#nodeFullBody, #nodesRight');
+              const bounds = scroller.getBoundingClientRect();
+              const trigger = el.getBoundingClientRect();
+              const target = edge === 'top' ? bounds.top + 40 : bounds.bottom - trigger.height - 40;
+              scroller.scrollTop += trigger.top - target;
+            }, edge);
+            const trigger = await help.boundingBox();
+            const bounds = await container.boundingBox();
+            assert(trigger && bounds && trigger.y >= bounds.y && trigger.y + trigger.height <= bounds.y + bounds.height,
+              `Help trigger must remain visible near the ${edge} in ${view}`);
+            assert(edge === 'top' ? trigger.y - bounds.y <= 50 : bounds.y + bounds.height - trigger.y - trigger.height <= 50,
+              `Help trigger did not reach the ${edge} of the scroll container in ${view}`);
+            if (width < 640) await help.tap();
+            else await help.hover();
+            assert(await tooltip.isVisible(), `Help must open after scrolling near the ${edge} in ${view}`);
+            const tip = await tooltip.boundingBox();
+            assert(tip && tip.x >= Math.max(0, bounds.x) && tip.x + tip.width <= Math.min(width, bounds.x + bounds.width) &&
+              tip.y >= Math.max(0, bounds.y) && tip.y + tip.height <= Math.min(height, bounds.y + bounds.height),
+            `Packet count help is clipped at the scroll container ${edge} in ${view}: ${JSON.stringify({ tip, bounds })}`);
+            if (width < 640) await label.locator('..').locator('td').nth(1).tap();
+            else await fixturePage.mouse.move(0, 0);
+            assert(!await tooltip.isVisible(), 'Help must close before testing the next scroll edge');
+          }
+        }
+
+        if (interaction === 'hover transfer') {
+          assert(!await help.evaluate(el => el === document.activeElement), 'Hover transfer must not rely on trigger focus');
+          await help.hover();
+          assert(await tooltip.isVisible(), 'Help must open before pointer transfer');
+          const tip = await tooltip.boundingBox();
+          await fixturePage.mouse.move(tip.x + tip.width / 2, tip.y + tip.height / 2, { steps: 20 });
+          assert(await tooltip.isVisible(), `Help disappeared while the pointer moved into its explanation in ${view}`);
+          await fixturePage.mouse.move(0, 0);
+          assert(!await tooltip.isVisible(), 'Help must close when the pointer leaves both trigger and explanation');
+        }
+      } finally {
+        await fixtureContext.close();
+      }
+    });
+  }
+
+  // API contract fixtures exercise both real node renderers at desktop/mobile sizes.
+  for (const width of [1280, 375]) {
+    await test(`#2073 recent adverts grouped in both node views at ${width}px`, async () => {
+      const fixtureContext = await browser.newContext({ viewport: { width, height: 900 } });
+      const fixturePage = await fixtureContext.newPage();
+      const pubkey = 'a'.repeat(64);
+      const node = { public_key: pubkey, name: 'Advert fixture', role: 'repeater',
+        last_seen: new Date().toISOString(), advert_count: 900 };
+      const routes = [
+        { advert_kind: 'flood', route_type: 1, raw_hex: '110000' },
+        { advert_kind: 'zero_hop', route_type: 2, raw_hex: '120000' },
+        { advert_kind: 'flood', route_type: 0, raw_hex: '10010203040000' },
+        { advert_kind: 'zero_hop', route_type: 3, raw_hex: '13010203040000' },
+        { advert_kind: 'other', route_type: 2, raw_hex: '1201ab00', path_json: '[]' },
+        { route_type: null, raw_hex: null },
+        { route_type: 2, raw_hex: '1200zz' },
+        { advert_kind: 'mixed', route_type: 1, raw_hex: '110000' },
+        { advert_kind: 'mixed', route_type: 2, raw_hex: '120000' },
+        { route_type: 1, raw_hex: '110000' },
+        { advert_kind: 'future_kind', route_type: 2, raw_hex: '120000' },
+      ];
+      let adverts = routes.map((route, i) => ({ ...route, hash: String(i + 1).repeat(16),
+        timestamp: new Date(Date.now() - i * 60000).toISOString(), payload_type: 4,
+        observer_name: `Fixture observer ${i + 1}`, snr: 7 + i, rssi: -80 - i, observation_count: 2 }));
+      await fixturePage.route('**/api/nodes**', async route => {
+        const path = new URL(route.request().url()).pathname;
+        let body;
+        if (path === '/api/nodes') body = { nodes: [node], total: 1 };
+        else if (path === '/api/nodes/' + pubkey) body = { node, recentAdverts: adverts };
+        else if (path === '/api/nodes/' + pubkey + '/health') body = {};
+        else return route.continue();
+        await route.fulfill({ json: body });
+      });
+      try {
+        for (const empty of [false, true]) {
+          if (empty) adverts = [];
+          for (const full of [false, true]) {
+            await fixturePage.goto(`${BASE}/#/nodes${full ? '/' + pubkey : ''}`, { waitUntil: 'domcontentloaded' });
+            await fixturePage.reload({ waitUntil: 'domcontentloaded' });
+            if (!full) await fixturePage.locator(`tr[data-key="${pubkey}"]`).click();
+            // On phones a list click opens the full page; only desktop has a side pane.
+            const fullView = full || width <= 640;
+            const root = fullView ? '#node-packets' : '#advertTimeline';
+            await fixturePage.locator(root).waitFor();
+            const groups = await fixturePage.locator(root + ' [data-advert-kind]').evaluateAll(els => els.map(el => ({
+              kind: el.dataset.advertKind,
+              heading: el.querySelector('h5').textContent.trim(),
+              rows: Array.from(el.querySelectorAll('a.ch-analyze-link'), a => ({
+                href: a.getAttribute('href'),
+                text: a.closest('.node-activity-item, .advert-entry').textContent,
+              })),
+              text: el.textContent,
+              overflow: el.scrollWidth > el.clientWidth + 1,
+            })));
+            assert(groups.length === (empty ? 2 : 4), `Expected ${empty ? 2 : 4} advert groups, got ${groups.length}`);
+            const expected = empty ? [[], []] : [[0, 2], [7, 8], [1, 3], [4, 5, 6, 9, 10]];
+            const labels = empty ? ['Flood adverts', 'Direct adverts (empty path)'] : ['Flood adverts', 'Mixed flood / direct (empty path) adverts', 'Direct adverts (empty path)', 'Other / unknown adverts'];
+            assert(groups.reduce((count, group) => count + group.rows.length, 0) === adverts.length, 'Each advert must appear exactly once');
+            expected.forEach((indices, i) => {
+              assert(groups[i].heading === `${labels[i]} (${indices.length})`, `Wrong sample count: ${groups[i].heading}`);
+              assert(JSON.stringify(groups[i].rows.map(row => row.href)) === JSON.stringify(indices.map(j => '#/packets/' + adverts[j].hash)), 'Advert order or analyze links changed');
+              assert(!groups[i].overflow, `${labels[i]} overflows at ${width}px`);
+              if (empty) assert(groups[i].text.includes('None in this recent sample'), `${labels[i]} empty-state message missing`);
+              indices.forEach((j, rowIndex) => {
+                const advert = adverts[j];
+                const row = groups[i].rows[rowIndex];
+                assert(row.text.includes(advert.observer_name) && row.text.includes(`SNR ${advert.snr}dB`) && row.text.includes(`RSSI ${advert.rssi}dBm`), `RF/observer metadata changed for ${row.href}`);
+              });
+            });
+            const heading = fullView ? fixturePage.locator('#node-packets h4') : fixturePage.locator('#advertTimeline').locator('..').locator('h4');
+            assert(await heading.textContent() === `Recent Adverts (${adverts.length})`, 'Recent Adverts count must reflect sample, not lifetime');
+            assert((await heading.getAttribute('title')).includes('originated'), 'Existing origin tooltip lost');
+            const explanation = await heading.getAttribute('title');
+            assert(explanation.includes('available observations') && explanation.includes('older history may be incomplete'), 'Grouping must explain the available-evidence limit');
+            assert(explanation.includes('observed empty direct path') && explanation.includes('cannot prove an origin-local send or RF distance'), 'Both node views must distinguish an observed path from send origin and distance');
+          }
+        }
+      } finally {
+        await fixtureContext.close();
+      }
+    });
+  }
 
   // --- Group: Home page (tests 1, 6, 7) ---
 
@@ -328,12 +568,14 @@ async function run() {
     // Use page.click() to avoid detached-element race with WebSocket auto-refresh.
     await page.click('table tbody tr:not([id^=vscroll])');
     await page.waitForSelector('.node-detail');
-    // Find the Details link in the side panel
-    await page.waitForSelector('#nodesRight a.btn-primary[href^="#/nodes/"]');
-    const href = await page.$eval('#nodesRight a.btn-primary[href^="#/nodes/"]', el => el.getAttribute('href'));
-    assert(href, 'Details link not found in side panel');
-    // Click the Details link — this should navigate to the full detail page
-    await page.click('#nodesRight a.btn-primary[href^="#/nodes/"]');
+    // Find the Details button in the side panel. The a.btn-primary next to
+    // it is the Analytics link (#2218).
+    await page.waitForSelector('#nodesRight .node-detail-btn');
+    const pk = await page.$eval('#nodesRight .node-detail-btn', el => el.getAttribute('data-pubkey'));
+    assert(pk, 'Details button not found in side panel');
+    const href = '#/nodes/' + pk;
+    // Click the Details button — this should navigate to the full detail page
+    await page.click('#nodesRight .node-detail-btn');
     // Wait for navigation — the full detail page has sections like neighbors/packets
     await page.waitForFunction((expectedHash) => {
       return location.hash === expectedHash;
@@ -809,6 +1051,68 @@ async function run() {
   });
 
   // Test 8b (#842): time-window picker triggers requests with ?window=… param.
+  // #2041: exercise the overview's actual API-to-renderer path at both sizes.
+  await test('Relay airtime chart splits adverts without hiding zero-relay rows', async () => {
+    const chartPage = await context.newPage();
+    try {
+      await chartPage.route('**/api/analytics/relay-airtime-share*', route => route.fulfill({
+        json: { total_count: 5, total_score: 300, rows: [
+          { payload_type: 'ADVERT', type: 4, advert_kind: 'flood', count: 1, count_pct: 20, score: 100, airtime_pct: 33.333 },
+          { payload_type: 'ADVERT', type: 4, advert_kind: 'other', count: 1, count_pct: 20, score: 100, airtime_pct: 33.333 },
+          { payload_type: 'ADVERT', type: 4, advert_kind: 'zero_hop', count: 1, count_pct: 20, score: 0, airtime_pct: 0 },
+          { payload_type: 'ADVERT', type: 4, advert_kind: 'mixed', count: 1, count_pct: 20, score: 100, airtime_pct: 33.333 },
+          { payload_type: 'ACK', type: 3, count: 1, count_pct: 20, score: 0, airtime_pct: 0 },
+        ] },
+      }));
+      for (const width of [1280, 320]) {
+        await chartPage.setViewportSize({ width, height: 900 });
+        await chartPage.goto(BASE + '/#/analytics');
+        await chartPage.reload({ waitUntil: 'domcontentloaded' });
+        await chartPage.waitForSelector('.dumbbell-row');
+        const labels = await chartPage.locator('.dumbbell-label').allTextContents();
+        assert(JSON.stringify(labels) === JSON.stringify(['Flood adverts', 'Other adverts', 'Direct adverts (empty path)', 'Mixed adverts', 'ACK']), 'advert chart labels: ' + labels.join(', '));
+        assert((await chartPage.locator('.dumbbell-evidence-note').textContent()).includes('older overwritten observations cannot be recovered'), 'known-evidence caveat is visible');
+        const zero = chartPage.locator('.dumbbell-row').filter({ hasText: 'Direct adverts (empty path)' });
+        assert((await zero.textContent()).includes('air 0.0%'), 'zero-relay advert row must remain visible');
+        assert((await zero.getAttribute('title')).includes('Count: 1 (20.00%)'), 'tooltip retains count');
+        const layout = await chartPage.locator('.dumbbell-chart').evaluate(chart => {
+          const box = chart.getBoundingClientRect();
+          const axisLabels = [...chart.querySelectorAll('.dumbbell-axis span')];
+          const expectedAxis = ['0%', '50%', '100%'];
+          return {
+            axisFits: axisLabels.length === expectedAxis.length && axisLabels.every((label, i) => {
+              const bounds = label.getBoundingClientRect();
+              return label.textContent.trim() === expectedAxis[i] && bounds.width > 0 && bounds.height > 0 &&
+                (i === 0 || axisLabels[i - 1].getBoundingClientRect().right <= bounds.left);
+            }),
+            overflow: chart.scrollWidth > chart.clientWidth + 1,
+            outside: box.left < -1 || box.right > window.innerWidth + 1,
+            rowsFit: [...chart.querySelectorAll('.dumbbell-row')].every(row => {
+              const label = row.querySelector('.dumbbell-label').getBoundingClientRect();
+              const track = row.querySelector('.dumbbell-track').getBoundingClientRect();
+              const values = row.querySelector('.dumbbell-values').getBoundingClientRect();
+              return label.right <= track.left && track.width >= 20 && track.right <= values.left && values.right <= box.right + 1;
+            }),
+          };
+        });
+        assert(!layout.overflow && !layout.outside && layout.rowsFit && layout.axisFits, `relay chart layout at ${width}px: ${JSON.stringify(layout)}`);
+      }
+    } finally { await chartPage.close(); }
+  });
+
+  await test('Relay airtime zero-activity state does not infer direct routing', async () => {
+    const chartPage = await context.newPage();
+    try {
+      await chartPage.route('**/api/analytics/relay-airtime-share*', route => route.fulfill({
+        json: { total_count: 1, total_score: 0, rows: [
+          { payload_type: 'ADVERT', type: 4, advert_kind: 'flood', count: 1, count_pct: 100, score: 0, airtime_pct: 0 },
+        ] },
+      }));
+      await chartPage.goto(BASE + '/#/analytics');
+      await chartPage.waitForFunction(() => document.body.textContent.includes('No relay activity observed'));
+      assert(!(await chartPage.locator('body').textContent()).includes('all packets direct'), 'no resolved relays does not imply direct packets');
+    } finally { await chartPage.close(); }
+  });
   await test('Analytics time-window picker refetches with window param', async () => {
     // Picker must be rendered.
     await page.waitForSelector('#analyticsTimeWindow', { timeout: 5000 });
@@ -2233,14 +2537,13 @@ async function run() {
     // Wait for the channels init() to mount and expose the test hook.
     await page.waitForFunction(() => typeof window._channelsProcessWSBatchForTest === 'function', { timeout: 10000 });
 
-    // Snapshot starting state so we can compare deltas.
-    const before = await page.evaluate(() => {
+    // Keep both snapshots and the synchronous batch in one browser turn so
+    // initial channel loading cannot change the registry between snapshots.
+    const { before, after } = await page.evaluate(() => {
       const s = window._channelsGetStateForTest();
-      return { count: s.channels.length, names: s.channels.map(c => c.name || c.channel || '') };
-    });
+      const before = { count: s.channels.length, names: s.channels.map(c => c.name || c.channel || '') };
 
-    // Feed a CHAN-like message with NO payload.channel field (but valid hash).
-    await page.evaluate(() => {
+      // Feed a CHAN-like message with NO payload.channel field (but valid hash).
       window._channelsProcessWSBatchForTest([
         {
           type: 'packet',
@@ -2253,11 +2556,10 @@ async function run() {
           },
         },
       ], null);
-    });
 
-    const after = await page.evaluate(() => {
-      const s = window._channelsGetStateForTest();
-      return { count: s.channels.length, names: s.channels.map(c => c.name || c.channel || '') };
+      const end = window._channelsGetStateForTest();
+      const after = { count: end.channels.length, names: end.channels.map(c => c.name || c.channel || '') };
+      return { before, after };
     });
 
     // No "unknown" channel materialized.
@@ -2274,13 +2576,11 @@ async function run() {
     await page.waitForFunction(() => typeof window._channelsProcessWSBatchForTest === 'function', { timeout: 10000 });
 
     const sentinel = '__test_chan_1468_' + Date.now();
-    const before = await page.evaluate((name) => {
+    // Initial channel loading must not overwrite the sentinel between reads.
+    const { before, after } = await page.evaluate((name) => {
       const s = window._channelsGetStateForTest();
-      return { hasSentinel: s.channels.some(c => (c.name || c.channel) === name) };
-    }, sentinel);
-    assert(!before.hasSentinel, 'pre: sentinel channel does not pre-exist');
+      const before = { hasSentinel: s.channels.some(c => (c.name || c.channel) === name) };
 
-    await page.evaluate((name) => {
       window._channelsProcessWSBatchForTest([
         {
           type: 'packet',
@@ -2293,33 +2593,20 @@ async function run() {
           },
         },
       ], null);
-    }, sentinel);
 
-    const after = await page.evaluate((name) => {
-      const s = window._channelsGetStateForTest();
-      return {
-        hasSentinel: s.channels.some(c => (c.name || c.channel) === name),
-        names: s.channels.map(c => c.name || c.channel || ''),
+      const end = window._channelsGetStateForTest();
+      const after = {
+        hasSentinel: end.channels.some(c => (c.name || c.channel) === name),
+        names: end.channels.map(c => c.name || c.channel || ''),
       };
+      return { before, after };
     }, sentinel);
+    assert(!before.hasSentinel, 'pre: sentinel channel does not pre-exist');
     assert(after.hasSentinel,
       'control: channel WITH payload.channel IS routed into the registry — got ' + JSON.stringify(after.names));
   });
 
   // ─── End #1468 tests ──────────────────────────────────────────────────────
-
-  // Extract frontend coverage if instrumented server is running
-  try {
-    const coverage = await page.evaluate(() => window.__coverage__);
-    if (coverage) {
-      const fs = require('fs');
-      const path = require('path');
-      const outDir = path.join(REPO_ROOT, '.nyc_output');
-      if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-      fs.writeFileSync(path.join(outDir, 'e2e-coverage.json'), JSON.stringify(coverage));
-      console.log(`Frontend coverage from E2E: ${Object.keys(coverage).length} files`);
-    }
-  } catch {}
 
   // --- Group: Deep linking (#536) ---
 
@@ -2408,6 +2695,95 @@ async function run() {
     assert(val === '60', `Expected timeWindow dropdown = 60, got: ${val}`);
     const url = page.url();
     assert(url.includes('timeWindow=60'), `URL should still contain timeWindow=60, got: ${url}`);
+  });
+
+  await test('#2231 All time survives selection, reload and fresh shared links', async () => {
+    const desktop = await browser.newContext({ viewport: { width: 1400, height: 900 } });
+    const fresh = await browser.newContext({ viewport: { width: 1400, height: 900 } });
+    const mobile = await browser.newContext({ viewport: { width: 375, height: 812 }, isMobile: true });
+    try {
+      const allTimePage = await desktop.newPage();
+      await allTimePage.goto(BASE + '/#/packets', { waitUntil: 'domcontentloaded' });
+      await allTimePage.waitForSelector('#fTimeWindow');
+      assert(await allTimePage.inputValue('#fTimeWindow') === '15', 'new visitors must still default to 15 minutes');
+      const request = allTimePage.waitForRequest(req => {
+        const url = new URL(req.url());
+        return url.pathname === '/api/packets' && !url.searchParams.has('since');
+      });
+      await allTimePage.selectOption('#fTimeWindow', '0');
+      await request;
+      assert(new URLSearchParams(new URL(allTimePage.url()).hash.split('?')[1]).get('timeWindow') === '0',
+        'selecting All time must write timeWindow=0');
+      assert(await allTimePage.evaluate(() => localStorage.getItem('meshcore-time-window')) === '0',
+        'selecting All time must persist zero');
+      const sharedUrl = allTimePage.url();
+      await allTimePage.reload({ waitUntil: 'domcontentloaded' });
+      await allTimePage.waitForSelector('#fTimeWindow');
+      assert(await allTimePage.inputValue('#fTimeWindow') === '0', 'reload must retain All time');
+
+      const sharedPage = await fresh.newPage();
+      await sharedPage.goto(sharedUrl, { waitUntil: 'domcontentloaded' });
+      await sharedPage.waitForSelector('#fTimeWindow');
+      assert(await sharedPage.inputValue('#fTimeWindow') === '0', 'a fresh browser must restore shared All time');
+
+      // The #1486 fixture is deliberately older than the default window and
+      // carries multiple observations. Select it through the real grouped UI.
+      const hash = 'fae0c9e6d357a814';
+      const detail = await (await desktop.request.get(BASE + '/api/packets/' + hash)).json();
+      assert(detail.packet && detail.observations.length > 1, '#2231 requires the grouped-packet fixture');
+      assert(detail.observations.every(obs => Date.parse(obs.timestamp) < Date.now() - 15 * 60000),
+        'the selected grouped packet must be older than 15 minutes');
+      const filtered = allTimePage.waitForResponse(response => {
+        const url = new URL(response.url());
+        return url.pathname === '/api/packets' && url.searchParams.get('hash') === hash;
+      });
+      await allTimePage.fill('#fHash', hash);
+      const filteredResponse = await filtered;
+      assert(filteredResponse.ok(), 'the debounced hash-filter request must succeed');
+      await filteredResponse.finished();
+      await allTimePage.waitForFunction(hash => {
+        const rows = document.querySelectorAll('#pktBody tr[data-hash]');
+        return rows.length === 1 && rows[0].dataset.hash === hash;
+      }, hash);
+      // Row centers can contain navigable hop links; use the group expand control.
+      await allTimePage.locator('#pktBody tr[data-hash="' + hash + '"][data-action="toggle-select"] > .col-expand').click();
+      await allTimePage.waitForSelector('#pktRight .detail-obs-row');
+      const obsId = String(detail.observations[1].id);
+      await allTimePage.locator('#pktRight .detail-obs-row[data-obs-id="' + obsId + '"]').click();
+      await allTimePage.waitForSelector('#pktRight .detail-obs-row.observation-current[data-obs-id="' + obsId + '"]');
+      const selectedUrl = allTimePage.url();
+      const selectedParams = new URLSearchParams(new URL(selectedUrl).hash.split('?')[1]);
+      assert(selectedParams.get('timeWindow') === '0', 'selecting an old group/observation must retain All time');
+      assert(selectedParams.get('obs') === obsId, 'the selected observation must remain in the shared URL');
+      await allTimePage.reload({ waitUntil: 'domcontentloaded' });
+      await allTimePage.waitForSelector('#pktRight .detail-obs-row.observation-current[data-obs-id="' + obsId + '"]');
+      assert(await allTimePage.inputValue('#fTimeWindow') === '0', 'selected group reload must retain All time');
+
+      await fresh.clearCookies();
+      await sharedPage.evaluate(() => localStorage.clear());
+      await sharedPage.goto(BASE + '/#/home', { waitUntil: 'domcontentloaded' });
+      await sharedPage.goto(selectedUrl, { waitUntil: 'domcontentloaded' });
+      await sharedPage.reload({ waitUntil: 'domcontentloaded' });
+      await sharedPage.waitForSelector('#pktRight .detail-obs-row.observation-current[data-obs-id="' + obsId + '"]');
+      assert(await sharedPage.inputValue('#fTimeWindow') === '0', 'a fresh shared group link must retain All time');
+
+      const mobilePage = await mobile.newPage();
+      const mobileRequest = mobilePage.waitForRequest(req => new URL(req.url()).pathname === '/api/packets');
+      await mobilePage.goto(sharedUrl, { waitUntil: 'domcontentloaded' });
+      await mobilePage.locator('.filter-toggle-btn-mirror').click();
+      await mobilePage.waitForSelector('#fTimeWindow');
+      const mobileParams = new URL((await mobileRequest).url()).searchParams;
+      const mobileMinutes = (Date.now() - Date.parse(mobileParams.get('since'))) / 60000;
+      assert(await mobilePage.inputValue('#fTimeWindow') === '15', 'mobile must keep the safe 15-minute window');
+      assert(mobileMinutes >= 15 && mobileMinutes < 16 && mobileParams.get('limit') === '1000',
+        'mobile All time links must keep the request bounded');
+      assert(await mobilePage.locator('#fTimeWindow option[value="0"]').count() === 0,
+        'mobile must not offer All time');
+    } finally {
+      await desktop.close();
+      await fresh.close();
+      await mobile.close();
+    }
   });
 
   // Test: hash filter updates URL and is restored (#682)
@@ -2538,41 +2914,42 @@ async function run() {
 
   // Test: per-observation raw_hex — hex pane updates when switching observations (#881)
   await test('Packet detail hex pane updates per observation', async () => {
-    await gotoPackets(page);
-    await page.waitForTimeout(500);
+    // Reuse the real #1486 transmission, seeded with distinct raw bytes after
+    // migration in deploy.yml. Missing fixture data must fail, never skip.
+    const hash = 'fae0c9e6d357a814';
+    const expectedHex = [
+      '1501aa0102030405060708090a0b0c0d0e0f',
+      '1501bb0102030405060708090a0b0c0d0e0f'
+    ];
+    const response = await context.request.get(BASE + '/api/packets/' + hash);
+    assert(response.ok(), '#2104 requires the #1486 grouped-packet fixture');
+    const detail = await response.json();
+    assert(detail.packet && detail.packet.hash === hash && Array.isArray(detail.observations),
+      'fixture must expose the expected packet and observations');
+    const observations = expectedHex.map(hex => detail.observations.find(o => o.raw_hex === hex));
+    assert(observations.every(Boolean), 'fixture must include both distinct observation raw byte strings');
+    assert(String(observations[0].id) !== String(observations[1].id), 'observation IDs must differ');
 
-    // Try clicking packet rows to find one with multiple observations
-    const rows = await page.$$('table tbody tr[data-action]');
-    let obsRows = [];
-    for (let i = 0; i < Math.min(rows.length, 10); i++) {
-      await rows[i].click({ timeout: 3000 }).catch(() => null);
-      await page.waitForTimeout(600);
-      obsRows = await page.$$('.detail-obs-row');
-      if (obsRows.length >= 2) break;
-    }
+    // Start on B so selecting A must complete a render before selecting B again.
+    await page.goto(BASE + '/#/packets/' + hash + '?obs=' + observations[1].id + '&timeWindow=0',
+      { waitUntil: 'domcontentloaded' });
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForSelector('#pktRight .detail-obs-row.observation-current[data-obs-id="' + observations[1].id + '"]');
+    const obsRows = observations.map(o =>
+      page.locator('#pktRight .detail-obs-row[data-obs-id="' + o.id + '"]'));
 
-    if (obsRows.length < 2) {
-      console.log('    ⏭ Skipped: no packet with ≥2 observations found in first 10 rows');
-      return;
-    }
-
-    // Click first observation, capture hex dump
-    await obsRows[0].click({ timeout: 5000 });
-    await page.waitForTimeout(500);
-    const hex1 = await page.$eval('.hex-dump', el => el.textContent).catch(() => '');
-
-    // Click second observation, capture hex dump
-    await obsRows[1].click({ timeout: 5000 });
-    await page.waitForTimeout(500);
-    const hex2 = await page.$eval('.hex-dump', el => el.textContent).catch(() => '');
-
-    // If both have content and differ, the feature works
-    if (hex1 && hex2 && hex1 !== hex2) {
-      console.log('    ✓ Hex pane content differs between observations');
-    } else if (hex1 && hex2 && hex1 === hex2) {
-      console.log('    ⏭ Hex same for both observations (likely historical NULL raw_hex — OK)');
-    } else {
-      console.log('    ⏭ Could not capture hex content from both observations');
+    for (const index of [0, 1, 0]) {
+      const id = String(observations[index].id);
+      await doesNotReject(() => obsRows[index].click({ timeout: 5000 }),
+        'Observation ' + id + ' must remain selectable after the detail rerenders');
+      await page.waitForFunction(expectedId => {
+        const selected = document.querySelector('#pktRight .detail-obs-row.observation-current');
+        return selected && selected.dataset.obsId === expectedId;
+      }, id);
+      const selectedId = await page.locator('#pktRight .detail-obs-row.observation-current').getAttribute('data-obs-id');
+      assert(selectedId === id, 'expected selected observation ' + id + ', got ' + selectedId);
+      const hex = (await page.locator('#pktRight .hex-dump').textContent()).replace(/\s+/g, '').toLowerCase();
+      assert(hex === expectedHex[index], 'observation ' + id + ': expected hex ' + expectedHex[index] + ', got ' + hex);
     }
   });
 

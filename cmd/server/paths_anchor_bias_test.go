@@ -13,7 +13,7 @@ import (
 
 // TestHandleNodePaths_AnchorBiasInconsistency_Issue1278 reproduces #1278:
 // /api/nodes/{pk}/paths returns a tx whose CANONICAL persisted resolved_path
-// (the one the packets page reads via fetchResolvedPathForTxBest) does NOT
+// (the one the packets page reads via bestResolvedPath) does NOT
 // contain the queried pubkey.
 //
 // Two nodes share the 1-byte prefix "c0":
@@ -63,7 +63,7 @@ func TestHandleNodePaths_AnchorBiasInconsistency_Issue1278(t *testing.T) {
 		t.Fatalf("insert obs1: %v", err)
 	}
 	// obs2: LONGER path_json (two hops, first hop is what packets page shows
-	// as resolved_path[0]). fetchResolvedPathForTxBest picks this obs as
+	// as resolved_path[0]). bestResolvedPath picks this obs as
 	// canonical because it has the longer path_json. Its resolved_path
 	// picks nodeGPS for "c0", NOT nodeNoGPS.
 	if _, err := db.conn.Exec(`INSERT INTO observations (transmission_id, observer_idx, path_json, timestamp, resolved_path)
@@ -78,17 +78,8 @@ func TestHandleNodePaths_AnchorBiasInconsistency_Issue1278(t *testing.T) {
 	if err := store.Load(); err != nil {
 		t.Fatalf("store.Load: %v", err)
 	}
-	// The path-hop index that /paths reads is built in a background goroutine
-	// (#1008); querying before it is ready races the build and yields a
-	// non-deterministic membership/canonical result (the flake). Wait for
-	// readiness so the test asserts against the fully-built index.
-	pathHopDeadline := time.After(5 * time.Second)
-	for !store.PathHopIndexReady() {
-		select {
-		case <-pathHopDeadline:
-			t.Fatal("path-hop index not ready within 5s")
-		case <-time.After(10 * time.Millisecond):
-		}
+	if !store.WaitIndexesReady(5 * time.Second) {
+		t.Fatal("background indexes not ready within 5s")
 	}
 	srv.store = store
 	router := mux.NewRouter()

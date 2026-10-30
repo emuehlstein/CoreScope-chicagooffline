@@ -12,6 +12,29 @@ function payloadTypeColor(n) { return PAYLOAD_COLORS[n] || 'unknown'; }
 function isTransportRoute(rt) { return rt === 0 || rt === 3; }
 /** Byte offset of path_len in raw_hex: 5 for transport routes (4 bytes of next/last hop codes precede it), 1 otherwise. */
 function getPathLenOffset(routeType) { return isTransportRoute(routeType) ? 5 : 1; }
+/**
+ * Path hash size (1-3 bytes) the originator chose, from raw_hex's path byte, or
+ * 0 when the packet carries none. Same rule as packetpath.HashSize on the
+ * server; both run test-fixtures/path-hash-size-cases.json. A flood packet
+ * always encodes it (firmware sendFlood sets it before the first hop), a direct
+ * packet with no hops does not (sendZeroHop writes 0x00, and an exhausted
+ * direct path has no hash left to size), and TRACE path bytes are SNR readings.
+ */
+function pathHashSize(rawHex) {
+  // Names as in internal/packetpath/route.go.
+  const PAYLOAD_TRACE = 9, ROUTE_DIRECT = 2, ROUTE_TRANSPORT_DIRECT = 3;
+  if (typeof rawHex !== 'string' || !/^[0-9a-f]{2}/i.test(rawHex)) return 0;
+  const header = parseInt(rawHex.slice(0, 2), 16);
+  if (((header >> 2) & 0x0F) === PAYLOAD_TRACE) return 0;
+  const routeType = header & 0x03;
+  const off = getPathLenOffset(routeType) * 2;
+  const pathHex = rawHex.slice(off, off + 2);
+  if (!/^[0-9a-f]{2}$/i.test(pathHex)) return 0;
+  const pathByte = parseInt(pathHex, 16);
+  if ((pathByte & 0x3F) === 0 && (routeType === ROUTE_DIRECT || routeType === ROUTE_TRANSPORT_DIRECT)) return 0;
+  const size = (pathByte >> 6) + 1;
+  return size > 3 ? 0 : size;
+}
 function transportBadge(rt) { return isTransportRoute(rt) ? ' <span class="badge badge-transport" title="' + routeTypeName(rt) + '">T</span>' : ''; }
 
 /**
@@ -157,7 +180,14 @@ async function api(path, { ttl = 0, bust = false } = {}) {
           attempt++;
           continue;
         }
-        if (!res.ok) throw new Error(`API ${res.status}: ${path}`);
+        if (!res.ok) {
+          // status and Retry-After ride on the error so a caller can decide to
+          // retry; api() itself retries only the 503 warm-up above.
+          const err = new Error(`API ${res.status}: ${path}`);
+          err.status = res.status;
+          err.retryAfter = res.headers.get('Retry-After');
+          throw err;
+        }
         const data = await res.json();
         const ms = performance.now() - t0;
         _apiPerf.calls++;
@@ -180,7 +210,9 @@ async function api(path, { ttl = 0, bust = false } = {}) {
     }
   })();
   _inflight.set(path, promise);
-  promise.finally(() => _inflight.delete(path));
+  // The cleanup chain must not reject on its own: callers handle the error
+  // through `promise`, and an unhandled copy logs 'Uncaught (in promise)'.
+  promise.finally(() => _inflight.delete(path)).catch(() => {});
   return promise;
 }
 
@@ -1072,6 +1104,25 @@ function debounce(fn, ms) {
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
+/* Visible-only throttle for background refreshes (nav stats).
+ * Returns trigger(); calling it runs fn() at most once per opts.minIntervalMs,
+ * and never while the tab is hidden. opts.now and opts.isHidden are injectable
+ * for tests. */
+function createVisibleThrottle(fn, opts) {
+  const minIntervalMs = opts.minIntervalMs;
+  const now = opts.now || Date.now;
+  const isHidden = opts.isHidden || function () { return typeof document !== 'undefined' && !!document.hidden; };
+  let last = -Infinity;
+  return function trigger() {
+    if (isHidden()) return false;
+    const t = now();
+    if (t - last < minIntervalMs) return false;
+    last = t;
+    fn();
+    return true;
+  };
+}
+
 /* Debounced WS helper — batches rapid messages, calls fn with array of msgs */
 function debouncedOnWS(fn, ms) {
   if (typeof ms === 'undefined') ms = 250;
@@ -1113,6 +1164,48 @@ registerPage('tools-landing', {
 });
 
 let currentPage = null;
+
+// Keep branding separate so route changes and late theme loads cannot
+// overwrite one another or accumulate title suffixes (#2259).
+let _siteTitle = document.title || 'CoreScope';
+let _pageTitle = '';
+function setPageTitle(title) {
+  _pageTitle = title;
+  document.title = title ? title + ' | ' + _siteTitle : _siteTitle;
+}
+function setSiteTitle(title) {
+  _siteTitle = String(title || '').trim() || 'CoreScope';
+  setPageTitle(_pageTitle);
+}
+function routeTitle(page, param) {
+  const id = param ? param.split('/')[0].slice(0, 12) : '';
+  if (id && ['nodes', 'node-analytics', 'node-reach'].includes(page)) {
+    return 'Node ' + id + (page === 'node-reach' ? ' | Reach' : page === 'node-analytics' ? ' | Analytics' : '');
+  }
+  if (id && (page === 'packets' || page === 'packet-detail')) return 'Packet ' + id;
+  if (page === 'observer-detail') return 'Observer ' + id;
+  const names = {
+    home: '', packets: 'Packets', nodes: 'Nodes', map: 'Map', live: 'Live',
+    channels: 'Channels', observers: 'Observers', analytics: 'Analytics',
+    'scope-audit': 'Scope Audit', perf: 'Performance', 'audio-lab': 'Audio Lab',
+    'tools-landing': 'Tools', traces: 'Packet Trace', 'path-inspector': 'Path Inspector',
+    account: 'Account', admin: 'Admin', compare: 'Observer Comparison', 'rx-coverage': 'RX Coverage',
+  };
+  return Object.prototype.hasOwnProperty.call(names, page) ? names[page] : 'Not Found';
+}
+function setRouteTitle(page, param) {
+  // Ignore a detail callback from a page the user already left.
+  if (currentPage === page || (page === 'packets' && currentPage === 'packet-detail')) {
+    setPageTitle(routeTitle(page, param));
+  }
+}
+
+// Bumped on every page init, so async page work can tell its visit is over:
+// capture viewGeneration() at init and drop the result when it has moved on
+// (#2218, #2230, #2200). A route change to another node of the same page
+// type is a new visit too.
+let _viewGeneration = 0;
+function viewGeneration() { return _viewGeneration; }
 
 function closeNav() {
   document.querySelector('.nav-links')?.classList.remove('open');
@@ -1212,10 +1305,12 @@ function navigate() {
     moreBtn.classList.toggle('active', !!hasActiveMore);
   }
 
+  _viewGeneration++;
   if (currentPage && pages[currentPage]?.destroy) {
     pages[currentPage].destroy();
   }
   currentPage = basePage;
+  setRouteTitle(basePage, routeParam);
 
   // #1572 — defensive: ensure body.live-fullscreen is cleared whenever
   // we navigate to a non-live route. Live page's destroy() also clears
@@ -1258,7 +1353,7 @@ function navigate() {
       else { app.setAttribute('tabindex', '-1'); app.focus({ preventScroll: true }); }
     });
   } else {
-    app.innerHTML = `<div style="padding:40px;text-align:center;color:#6b7280"><h2>${route}</h2><p>Page not yet implemented.</p></div>`;
+    app.innerHTML = `<div style="padding:40px;text-align:center;color:#6b7280"><h2>${escapeHtml(route)}</h2><p>Page not yet implemented.</p></div>`;
   }
 }
 
@@ -1283,10 +1378,14 @@ window.addEventListener('DOMContentLoaded', () => {
   const darkToggle = document.getElementById('darkModeToggle');
   const darkCheckbox = document.getElementById('darkModeCheckbox');
   const savedTheme = localStorage.getItem('meshcore-theme');
-  function applyTheme(theme) {
+  // #2236: ?theme= from the URL (parsed in index.html) holds for this page
+  // load and is never saved, so the stored choice and the account stay as
+  // they were. A click on the toggle is an explicit choice and ends it.
+  let themeOverride = window.__themeOverride || null;
+  function applyTheme(theme, persist) {
     document.documentElement.setAttribute('data-theme', theme);
     if (darkCheckbox) darkCheckbox.checked = theme === 'dark';
-    localStorage.setItem('meshcore-theme', theme);
+    if (persist !== false) localStorage.setItem('meshcore-theme', theme);
     // Re-apply user theme CSS vars for the correct mode (light/dark)
     reapplyUserThemeVars(theme === 'dark');
   }
@@ -1325,8 +1424,10 @@ window.addEventListener('DOMContentLoaded', () => {
       }
     } catch (e) { console.error('[theme] reapply error:', e); }
   }
-  // On load: respect saved pref, else OS pref, else light
-  if (savedTheme) {
+  // On load: URL override, else saved pref, else OS pref, else light
+  if (themeOverride) {
+    applyTheme(themeOverride, false);
+  } else if (savedTheme) {
     applyTheme(savedTheme);
   } else if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
     applyTheme('dark');
@@ -1335,12 +1436,14 @@ window.addEventListener('DOMContentLoaded', () => {
   }
   if (darkCheckbox) {
     darkCheckbox.addEventListener('change', () => {
+      themeOverride = null;
       applyTheme(darkCheckbox.checked ? 'dark' : 'light');
     });
   } else {
     // Fallback for button-style toggle (upstream compatibility)
     darkToggle.addEventListener('click', () => {
       const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+      themeOverride = null;
       applyTheme(isDark ? 'light' : 'dark');
     });
   }
@@ -1350,6 +1453,7 @@ window.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('storage', function (ev) {
     if (!ev || ev.key !== 'meshcore-theme' || !ev.newValue) return;
     if (ev.newValue !== 'dark' && ev.newValue !== 'light') return;
+    if (themeOverride) return;
     document.documentElement.setAttribute('data-theme', ev.newValue);
     if (darkCheckbox) darkCheckbox.checked = ev.newValue === 'dark';
     try { reapplyUserThemeVars(ev.newValue === 'dark'); } catch (_) {}
@@ -1434,6 +1538,10 @@ window.addEventListener('DOMContentLoaded', () => {
     var overflowQueue = buildOverflowQueue();
 
     function rebuildMoreMenu() {
+      // Removing a focused clone drops focus onto the body. Keep its
+      // destination whether the next fit leaves it in More or moves it inline.
+      const focused = navMoreMenu.contains(document.activeElement) ? document.activeElement : null;
+      let focusTarget = focused && allLinks.find(link => link.getAttribute('href') === focused.getAttribute('href'));
       navMoreMenu.innerHTML = '';
       const hidden = allLinks.filter(a => a.classList.contains('is-overflow'));
       hidden.forEach(function(link) {
@@ -1449,24 +1557,21 @@ window.addEventListener('DOMContentLoaded', () => {
         clone.addEventListener('click', closeNav);
         clone.addEventListener('click', closeMoreMenu);
         navMoreMenu.appendChild(clone);
+        if (link === focusTarget) focusTarget = clone;
       });
       // If nothing overflows, hide the More button entirely so wide
       // viewports don't show a useless dropdown trigger.
       navMoreWrap.classList.toggle('is-hidden', hidden.length === 0);
+      if (hidden.length === 0) closeMoreMenu();
       // Refresh active state on the More button (a hidden active link
       // means the More menu currently "is" the active section).
       var hasActiveMore = navMoreMenu.querySelector('.nav-link.active');
       navMoreBtn.classList.toggle('active', !!hasActiveMore);
+      if (focusTarget) focusTarget.focus();
     }
 
-    // #1105 MINOR 1: cached intrinsic width of the More button. Captured
-    // the first time `fits()` sees navMoreWrap rendered (display:flex).
-    // Falls back to MORE_BTN_RESERVE_PX (a conservative initial guess
-    // sized for "More ▾" at default font/padding) until that happens.
-    var cachedMoreW = 0;
-    var MORE_BTN_RESERVE_PX = 70;
-
     function applyNavPriority() {
+      navTop.classList.remove('nav-hide-stats', 'nav-compact');
       // Skip on mobile (<768px) — hamburger CSS owns that layout.
       if (window.innerWidth < 768) {
         allLinks.forEach(a => a.classList.remove('is-overflow'));
@@ -1508,59 +1613,12 @@ window.addEventListener('DOMContentLoaded', () => {
             a.classList.add('is-overflow');
           }
         });
-        rebuildMoreMenu();
-        return;
       }
-      // Iteratively hide low-priority links until the link strip fits.
-      // .top-nav has overflow:hidden and .nav-left has flex-shrink:1, so
-      // an overflowing strip silently clips rather than pushing
-      // nav-right out — bounding-rect math on .nav-left lies. Instead
-      // measure the *intrinsic* widths of the parts (independent of
-      // current clipping) and compare to the viewport. SAFETY absorbs
-      // the .top-nav side padding + nav-right inner gaps + sub-pixel
-      // rounding (the historic #1055 bug was a 6–20px overlap).
-      //
-      // #1105 MINOR 3: at the 1101px media-query flip `.nav-stats`
-      // toggles from display:none → flex (and vice-versa). The resize
-      // handler is rAF-debounced and runs *after* the layout flip, so
-      // navRightEl.scrollWidth measured here reflects the post-flip
-      // intrinsic width — not stale pre-flip width.
-      const navBrand   = document.querySelector('.nav-brand');
-      const SAFETY     = 32;
-      // #1105 MINOR 1+2: read both gap values from CSS rather than a
-      // shared `GUTTER = 24` constant. Today `.nav-left` (gap between
-      // brand/links/more/right cells) and `.nav-links` (gap between
-      // individual link items) both resolve to --space-lg = 24px, but
-      // they're conceptually distinct gaps. If --space-lg or .nav-left's
-      // gap diverges in the future, the fit math must follow.
-      const navLeftGap = parseFloat(getComputedStyle(navLeft).columnGap ||
-                                    getComputedStyle(navLeft).gap || '0') || 0;
-      // #1105 MINOR 1: compute the More-button reserve from its actual
-      // rendered width on first measure, instead of a hard-coded 70px
-      // fallback. Cached so we don't re-measure (offsetWidth is 0 when
-      // display:none; we capture the value the first time it's visible).
+      // The flex strip shrinks to the actual room left by the brand, More,
+      // statistics and optional account control. Measure its overflow rather
+      // than guessing those widths and gaps from the viewport.
       function fits() {
-        const visibleLinks = allLinks.filter(a => !a.classList.contains('is-overflow'));
-        let linkW = 0;
-        visibleLinks.forEach(a => { linkW += a.getBoundingClientRect().width; });
-        const linkGapPx = parseFloat(getComputedStyle(linksContainer).columnGap ||
-                                     getComputedStyle(linksContainer).gap || '0') || 0;
-        const linksGap = Math.max(0, visibleLinks.length - 1) * linkGapPx;
-        const brandW = navBrand ? navBrand.getBoundingClientRect().width : 0;
-        // Always reserve space for the More button if anything could
-        // overflow. Measure the live width when visible and cache it
-        // for use when the button is currently hidden (display:none →
-        // getBoundingClientRect() returns 0). MORE_BTN_RESERVE_PX is
-        // the conservative initial fallback used until we get a real
-        // measurement.
-        const moreVis = !navMoreWrap.classList.contains('is-hidden');
-        const liveMoreW = moreVis ? navMoreWrap.getBoundingClientRect().width : 0;
-        if (liveMoreW > 0) cachedMoreW = liveMoreW;
-        const moreW = liveMoreW > 0 ? liveMoreW
-                    : (cachedMoreW > 0 ? cachedMoreW : MORE_BTN_RESERVE_PX);
-        const rightW  = navRightEl.scrollWidth; // intrinsic, ignores clipping
-        const needed  = brandW + navLeftGap + linkW + linksGap + navLeftGap + moreW + navLeftGap + rightW + SAFETY;
-        return needed <= window.innerWidth;
+        return linksContainer.scrollWidth <= linksContainer.clientWidth;
       }
       let i = 0;
       // #1391: rebuild queue here so it reflects the CURRENT active
@@ -1617,26 +1675,33 @@ window.addEventListener('DOMContentLoaded', () => {
           console.warn('[nav] More menu floor: overflowQueue exhausted with 1 item; cannot enforce >=2 floor');
         }
       }
+      // Keep the primary/active floor. Optional stats yield first, then
+      // compact desktop spacing without reducing button touch targets.
+      if (!fits()) navTop.classList.add('nav-hide-stats');
+      if (!fits()) navTop.classList.add('nav-compact');
       rebuildMoreMenu();
     }
 
     // Run once on load, again after fonts settle (label widths shift),
     // and on resize (debounced via rAF).
-    navPriorityFn = applyNavPriority;
+    navPriorityFn = scheduleNavPriority;
     applyNavPriority();
     if (document.fonts && document.fonts.ready) {
-      document.fonts.ready.then(applyNavPriority);
+      document.fonts.ready.then(scheduleNavPriority);
     }
     let rafId = 0;
-    window.addEventListener('resize', function() {
+    function scheduleNavPriority() {
       if (rafId) cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(applyNavPriority);
-    });
+    }
+    window.addEventListener('resize', scheduleNavPriority);
+    window.addEventListener('cs-auth-control-added', scheduleNavPriority);
+    window.addEventListener('cs-auth-changed', scheduleNavPriority);
     // Re-apply on route change too: the active link gets bigger padding
     // (background pill), so which links fit can shift between pages.
     window.addEventListener('hashchange', function() {
       // Defer so the route handler's class toggles run first.
-      requestAnimationFrame(applyNavPriority);
+      scheduleNavPriority();
     });
 
     // #1406: position the fixed dropdown relative to the More button on each open.
@@ -1717,13 +1782,15 @@ window.addEventListener('DOMContentLoaded', () => {
     const items = await Promise.all(favs.map(async (pk) => {
       try {
         const h = await api('/nodes/' + pk + '/health', { ttl: CLIENT_TTL.nodeHealth });
-        const age = h.stats.lastHeard ? Date.now() - new Date(h.stats.lastHeard).getTime() : null;
-        const statusCls = age === null ? 'status-err' : age < HEALTH_THRESHOLDS.nodeDegradedMs ? 'status-ok' : age < HEALTH_THRESHOLDS.nodeSilentMs ? 'status-warn' : 'status-err';
-        const statusLabel = age === null ? 'unknown' : age < HEALTH_THRESHOLDS.nodeDegradedMs ? 'healthy' : age < HEALTH_THRESHOLDS.nodeSilentMs ? 'degraded' : 'silent';
+        // Packet-store time first, then the DB's last_seen, as My Repeaters does.
+        const heard = h.stats.lastHeard || (h.node && h.node.last_seen);
+        const status = getHealthStatus(h.node && h.node.role, heard);
+        const statusCls = status === 'healthy' ? 'status-ok' : status === 'degraded' ? 'status-warn' : 'status-err';
+        const statusLabel = status || 'unknown';
         return '<a href="#/nodes/' + pk + '" class="fav-dd-item" data-key="' + pk + '">'
           + '<span class="fav-dd-status ' + statusCls + '" title="' + statusLabel + '" aria-label="' + statusLabel + '"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"/></svg></span>'
-          + '<span class="fav-dd-name">' + (h.node.name || truncate(pk, 12)) + '</span>'
-          + '<span class="fav-dd-meta">' + (h.stats.lastHeard ? timeAgo(h.stats.lastHeard) : 'never') + '</span>'
+          + '<span class="fav-dd-name">' + escapeHtml(h.node.name || truncate(pk, 12)) + '</span>'
+          + '<span class="fav-dd-meta">' + (heard ? timeAgo(heard) : 'never') + '</span>'
           + favStar(pk, 'fav-dd-star')
           + '</a>';
       } catch {
@@ -1790,10 +1857,12 @@ window.addEventListener('DOMContentLoaded', () => {
     if (!q) { searchResults.innerHTML = ''; return; }
     searchTimeout = setTimeout(async () => {
       try {
-        const [packets, nodes, channels] = await Promise.all([
+        const [packets, nodes, channels, reported] = await Promise.all([
           fetch('/api/packets?limit=5&hash=' + encodeURIComponent(q)).then(r => r.json()).catch(() => ({ packets: [] })),
           fetch('/api/nodes?search=' + encodeURIComponent(q)).then(r => r.json()).catch(() => []),
-          fetch('/api/channels').then(r => r.json()).catch(() => [])
+          fetch('/api/channels').then(r => r.json()).catch(() => []),
+          // Repeaters known only from their reported name are not in /api/nodes.
+          window.ReportedNodes ? window.ReportedNodes.load() : Promise.resolve({ nodes: [] })
         ]);
         let html = '';
         const pktList = packets.packets || packets;
@@ -1810,6 +1879,7 @@ window.addEventListener('DOMContentLoaded', () => {
               <span class="search-result-type">Node</span>${escapeHtml(n.name)} — ${truncate(n.public_key || '', 16)}</div>`;
           }
         }
+        if (window.ReportedNodes) html += window.ReportedNodes.searchItemsHtml(reported.nodes, q, 5);
         const chList = Array.isArray(channels) ? channels : [];
         for (const c of chList) {
           if (c.name && c.name.toLowerCase().includes(q.toLowerCase())) {
@@ -1869,13 +1939,19 @@ window.addEventListener('DOMContentLoaded', () => {
         el.innerHTML = `<span class="stat-val">${stats.totalPackets}</span> <svg width="14" height="14" viewBox="0 0 20 20" fill="none" class="stat-icon" title="packets"><rect x="2" y="2" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="12" y="2" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="2" y="12" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="12" y="12" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/></svg> · <span class="stat-val">${stats.totalNodes}</span> <svg width="14" height="14" viewBox="0 0 20 20" fill="none" class="stat-icon" title="nodes"><circle cx="10" cy="3" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="4" cy="12" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="16" cy="12" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="10" cy="17" r="2" stroke="currentColor" stroke-width="1.5"/><line x1="10" y1="5" x2="10" y2="15" stroke="currentColor" stroke-width="1.5"/><line x1="8.5" y1="4" x2="5.5" y2="11" stroke="currentColor" stroke-width="1.5"/><line x1="11.5" y1="4" x2="14.5" y2="11" stroke="currentColor" stroke-width="1.5"/></svg> · <span class="stat-val">${stats.totalObservers}</span> <svg width="14" height="14" viewBox="0 0 20 20" fill="none" class="stat-icon" title="observers"><path d="M10 2 L10 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="10" r="2" stroke="currentColor" stroke-width="1.5"/><path d="M4 6 L7.5 8.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M16 6 L12.5 8.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M3 14 L8 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M17 14 L12 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>${formatVersionBadge(stats.version, stats.commit, stats.engine, stats.buildTime)}`;
         el.querySelectorAll('.stat-val').forEach(s => s.classList.add('updated'));
         setTimeout(() => { el.querySelectorAll('.stat-val').forEach(s => s.classList.remove('updated')); }, 600);
-        if (navPriorityFn) requestAnimationFrame(navPriorityFn);
+        if (navPriorityFn) navPriorityFn();
       }
     } catch {}
   }
-  updateNavStats();
-  setInterval(updateNavStats, 15000);
-  debouncedOnWS(function () { updateNavStats(); });
+  // One refresh per 15 s at most, none in hidden tabs: the timer, live packets
+  // and returning to the tab all go through the same throttle.
+  const refreshNavStats = createVisibleThrottle(updateNavStats, { minIntervalMs: 15000 });
+  refreshNavStats();
+  setInterval(refreshNavStats, 15000);
+  debouncedOnWS(function () { refreshNavStats(); });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) refreshNavStats();
+  });
 
   // --- Theme Customization ---
   // Fetch theme config and apply via customizer v2 pipeline
@@ -1998,8 +2074,7 @@ function makeColumnsResizable(tableSelector, storageKey) {
 
   if (!widths) {
     // Measure actual max content width per column by scanning visible rows
-    const tbody = table.querySelector('tbody');
-    const rows = tbody ? Array.from(tbody.querySelectorAll('tr')).slice(0, 30) : [];
+    const rows = measurableRows(table);
 
     // Temporarily set auto layout to measure
     table.style.tableLayout = 'auto';
@@ -2070,6 +2145,8 @@ function makeColumnsResizable(tableSelector, storageKey) {
   // Add resize handles
   ths.forEach((th, i) => {
     if (i === ths.length - 1) return;
+    // Anchor the handle to static headers without overriding sticky headers.
+    if (getComputedStyle(th).position === 'static') th.style.position = 'relative';
     const handle = document.createElement('div');
     handle.className = 'col-resize-handle';
     handle.addEventListener('mousedown', (e) => {
@@ -2115,4 +2192,311 @@ function makeColumnsResizable(tableSelector, storageKey) {
     th.appendChild(handle);
   });
   } // end addResizeHandles
+}
+
+/**
+ * Body rows that can be measured column by column. Virtual-scroll spacers
+ * and "loading" rows are a single colspan cell; indexing their children by
+ * column puts the spacer's full table width into column 0.
+ */
+function measurableRows(table, limit) {
+  const tbody = table.querySelector('tbody');
+  if (!tbody) return [];
+  return Array.from(tbody.children)
+    .filter(r => !Array.prototype.some.call(r.children, c => c.colSpan > 1))
+    .slice(0, limit || 30);
+}
+
+let _cellMeasureRange = null;
+
+/**
+ * Width a cell needs to show its content on one line, padding included.
+ * Measured from the laid-out content, so it works under table-layout: fixed
+ * without switching the table to auto. Resize handles and the "+N hidden"
+ * pill are absolutely positioned or transient and are left out.
+ */
+function cellContentWidth(cell) {
+  const range = _cellMeasureRange || (_cellMeasureRange = document.createRange());
+  // Span from the leftmost to the rightmost node, so margins between them
+  // (the IATA badge's margin-left) count too.
+  let left = Infinity;
+  let right = -Infinity;
+  for (const n of cell.childNodes) {
+    if (n.nodeType === 1 && n.matches('.col-resize-handle, .col-hidden-pill')) continue;
+    range.selectNode(n);
+    const r = range.getBoundingClientRect();
+    if (!r.width) continue;
+    left = Math.min(left, r.left);
+    right = Math.max(right, r.right);
+  }
+  const w = right > left ? right - left : 0;
+  const cs = getComputedStyle(cell);
+  return Math.ceil(w + parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight));
+}
+
+/**
+ * Split `avail` px between content-sized columns and flex columns.
+ *
+ * Each fixed column keeps its content width `w` when there is room. When
+ * there is not, the widest ones are capped at a common level (water-filling)
+ * so the flex columns still get `flexMin` each, but no column goes below its
+ * `floor`. Flex columns share what is left, the rounding remainder going to
+ * the last one. When even the floors leave less than `flexMin`, the flex
+ * columns shrink further, down to `flexHardMin`; below that `total` exceeds
+ * `avail` and the caller's wrapper scrolls. With no flex column (both hidden
+ * by the user), the last fixed column takes the spare width, so the table
+ * still fills `avail`.
+ *
+ * @param {{w: number, floor: number}[]} fixed
+ * @param {number} flexCount
+ * @param {number} avail
+ * @param {number} flexMin
+ * @param {number} [flexHardMin=flexMin]
+ * @returns {{fixed: number[], flex: number[], total: number}}
+ */
+function distributeColumnWidths(fixed, flexCount, avail, flexMin, flexHardMin) {
+  const hardMin = flexHardMin == null ? flexMin : Math.min(flexHardMin, flexMin);
+  const budget = avail - flexCount * flexMin;
+  const sumAt = cap => fixed.reduce((s, c) => s + Math.max(c.floor, Math.min(c.w, cap)), 0);
+  let cap = Infinity;
+  if (sumAt(Infinity) > budget) {
+    // Largest integer cap whose total fits; sumAt is monotonic in cap.
+    let lo = 0;
+    let hi = Math.max(0, ...fixed.map(c => c.w));
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (sumAt(mid) <= budget) lo = mid; else hi = mid - 1;
+    }
+    cap = lo;
+  }
+  const widths = fixed.map(c => Math.max(c.floor, Math.min(c.w, cap)));
+  const fixedSum = widths.reduce((s, w) => s + w, 0);
+  const spare = Math.max(0, avail - fixedSum);
+  const share = flexCount ? Math.max(hardMin, Math.floor(spare / flexCount)) : 0;
+  const flexW = [];
+  for (let i = 0; i < flexCount; i++) flexW.push(share);
+  if (flexCount) flexW[flexCount - 1] += Math.max(0, spare - share * flexCount);
+  else if (widths.length) widths[widths.length - 1] += spare;
+  const total = widths.reduce((s, w) => s + w, 0) + flexW.reduce((s, w) => s + w, 0);
+  return { fixed: widths, flex: flexW, total };
+}
+
+/**
+ * Pixel column sizing for dense tables: every column not listed in
+ * `opts.flex` is sized to its content, and the flex columns split whatever
+ * width the container has left. makeColumnsResizable stores percentages,
+ * which inflate a "17s ago" column to 180px on a wide screen; this keeps
+ * short columns short at every width.
+ *
+ * Every visible column gets an explicit px width and the table gets their
+ * sum as its width. Leaving the flex columns auto would hand a share of the
+ * slack to phantom columns too: a colspan spacer row keeps a slot for each
+ * hidden column, and that slot renders as a blank strip at the right edge.
+ * When the container is too narrow, the widest content-sized columns give
+ * way first (down to `opts.shrinkFloor`, their text ellipsised) so the flex
+ * columns keep `opts.flexMin`; then the flex columns shrink to
+ * `opts.flexHardMin`; past that the wrapper scrolls. A header's CSS
+ * max-width (Scope's 110px) caps its measured width.
+ *
+ * `opts.min` sets floors by column class, for columns whose widest content
+ * may not be on screen at measure time (the expand caret only appears on
+ * grouped rows).
+ *
+ * Content-sized columns have drag handles; dragged widths are saved to
+ * localStorage in px, keyed by column class, and give way under pressure
+ * like measured ones. Double-clicking a handle forgets its width. Flex
+ * columns have no handle: they always share the remaining width.
+ *
+ * Re-measures on its own when the container resizes (the detail panel) and
+ * when the table fires `table-columns-changed` (TableResponsive hiding or
+ * revealing columns). Call refit() after anything else that changes cell
+ * content width: column toggles, name display modes, sorting (the sort
+ * arrow moves to another header). Call grow() after rows render, with the
+ * inserted rows when only some are new.
+ *
+ * @param {string} tableSelector
+ * @param {string} storageKey
+ * @param {{flex: string[], flexMin?: number, flexHardMin?: number, shrinkFloor?: number, min?: Object<string, number>}} opts
+ * @returns {{refit: function(): void, grow: function(Element[]=): void, destroy: function(): void}|null}
+ */
+function fitColumnsToContent(tableSelector, storageKey, opts) {
+  const table = document.querySelector(tableSelector);
+  if (!table) return null;
+  const ths = Array.from(table.querySelectorAll('thead tr:first-child th'));
+  if (ths.length < 2) return null;
+  const wrap = table.parentElement;
+  const flex = new Set(opts.flex);
+  const flexMin = opts.flexMin || 120;
+  const flexHardMin = opts.flexHardMin || 60;
+  const mins = opts.min || {};
+  const shrinkFloor = opts.shrinkFloor || 64;
+  const MIN_DRAG = 28;
+  const colKey = th => Array.from(th.classList).find(c => c.startsWith('col-') && c !== 'col-hidden');
+
+  let dragged = {};
+  try { dragged = JSON.parse(localStorage.getItem(storageKey)) || {}; } catch { dragged = {}; }
+  if (typeof dragged !== 'object' || Array.isArray(dragged)) dragged = {};
+  for (const k of Object.keys(dragged)) {
+    if (flex.has(k) || !Number.isFinite(dragged[k]) || dragged[k] < MIN_DRAG) delete dragged[k];
+  }
+  function saveDragged() {
+    try { localStorage.setItem(storageKey, JSON.stringify(dragged)); } catch { /* quota / private mode */ }
+  }
+
+  table.style.tableLayout = 'fixed';
+
+  // Content widths of the visible fixed columns, from the last measure().
+  let natural = new Map();
+  let borderPx = 0;
+
+  // Content widths per visible fixed column over `rows` (default: every
+  // rendered row; virtual scroll already bounds how many exist).
+  function measure(rows) {
+    rows = (rows || measurableRows(table, Infinity))
+      .filter(r => !Array.prototype.some.call(r.children, c => c.colSpan > 1));
+    const next = new Map();
+    ths.forEach((th, i) => {
+      const key = colKey(th);
+      if (th.offsetParent === null || dragged[key] || flex.has(key)) return;
+      let w = Math.max(mins[key] || 0, cellContentWidth(th));
+      rows.forEach(r => { if (r.children[i]) w = Math.max(w, cellContentWidth(r.children[i])); });
+      const maxW = parseFloat(getComputedStyle(th).maxWidth);
+      if (Number.isFinite(maxW)) w = Math.min(w, maxW);
+      next.set(th, w);
+    });
+    return next;
+  }
+
+  function layout() {
+    const fixedThs = [];
+    const fixedCols = [];
+    const flexThs = [];
+    // The last visible column absorbs the slack when no flex column is
+    // shown; `fit-last` hides its drag handle, which overhangs the table's
+    // right edge by a few px and would give the wrapper a scrollbar.
+    const visible = ths.filter(th => th.offsetParent !== null);
+    ths.forEach(th => th.classList.toggle('fit-last', th === visible[visible.length - 1]));
+    ths.forEach(th => {
+      if (th.offsetParent === null) return;
+      const key = colKey(th);
+      const w = dragged[key] || natural.get(th);
+      if (flex.has(key)) flexThs.push(th);
+      else if (w) {
+        fixedThs.push(th);
+        fixedCols.push({ w, floor: Math.min(w, Math.max(mins[key] || 0, shrinkFloor)) });
+      } else th.style.width = '';
+    });
+    const apply = () => {
+      const d = distributeColumnWidths(fixedCols, flexThs.length, wrap.clientWidth - borderPx, flexMin, flexHardMin);
+      fixedThs.forEach((th, i) => { th.style.width = d.fixed[i] + 'px'; });
+      flexThs.forEach((th, i) => { th.style.width = d.flex[i] + 'px'; });
+      table.style.width = d.total + 'px';
+      return d.total;
+    };
+    // Collapsed borders (the row's coloured left edge) render a few px
+    // beyond the column sum. Learn how many on the first pass and lay out
+    // again without them, so a table that should fit grows no scrollbar.
+    // Bounded: anything bigger is not a border and must not eat the width.
+    const total = apply();
+    const extra = Math.min(8, Math.max(0, table.offsetWidth - total));
+    if (extra !== borderPx) { borderPx = extra; apply(); }
+  }
+
+  function refit() {
+    if (!table.isConnected) return;
+    natural = measure();
+    layout();
+  }
+
+  // After new rows render: widen any column whose content outgrew it (rows
+  // age from "9m ago" to "10m ago", scrolling brings longer names), but never
+  // narrow one, so columns do not jitter as rows scroll past. Pass just the
+  // rows that were inserted when the others are unchanged (virtual-scroll
+  // steps): measuring is ~10 rects per cell.
+  function grow(rows) {
+    if (!table.isConnected) return;
+    if (rows && !rows.length) return;
+    let changed = false;
+    measure(rows).forEach((w, th) => {
+      if (w > (natural.get(th) || 0)) { natural.set(th, w); changed = true; }
+    });
+    if (changed) layout();
+  }
+
+  // Its own flag: `resizable` is makeColumnsResizable's already-wired guard.
+  if (!table.dataset.fitColumns) {
+    table.dataset.fitColumns = '1';
+    ths.forEach(th => {
+      const key = colKey(th);
+      if (flex.has(key)) return;
+      const handle = document.createElement('div');
+      handle.className = 'col-resize-handle';
+      handle.title = 'Drag to resize, double-click to fit the content';
+      handle.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const startX = e.clientX;
+        const startW = th.offsetWidth;
+        handle.classList.add('active');
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+        function onMove(e2) {
+          // Re-lay out on every move so the flex columns give the width
+          // back: setting only this <th> lets fixed layout spread the
+          // difference over every column, and the edge lags the pointer.
+          dragged[key] = Math.max(MIN_DRAG, startW + e2.clientX - startX);
+          layout();
+        }
+        function onUp() {
+          handle.classList.remove('active');
+          document.body.style.cursor = '';
+          document.body.style.userSelect = '';
+          if (dragged[key]) saveDragged();
+          refit();
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+        }
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      });
+      handle.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        delete dragged[key];
+        saveDragged();
+        refit();
+      });
+      // A handle click must not reach the header's sort handler.
+      handle.addEventListener('click', (e) => e.stopPropagation());
+      th.appendChild(handle);
+    });
+  }
+
+  // The container changes width when the detail panel opens or is dragged:
+  // redistribute only. Responsive hiding changes which columns exist.
+  // Coalesced to one layout per frame: dragging the detail-panel divider
+  // resizes the wrapper on every pointer move, and layout() forces a
+  // synchronous reflow.
+  let lastWrapW = wrap.clientWidth;
+  let layoutRaf = 0;
+  const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => {
+    if (layoutRaf) return;
+    layoutRaf = requestAnimationFrame(() => {
+      layoutRaf = 0;
+      if (!table.isConnected || wrap.clientWidth === lastWrapW) return;
+      lastWrapW = wrap.clientWidth;
+      layout();
+    });
+  }) : null;
+  if (ro) ro.observe(wrap);
+  table.addEventListener('table-columns-changed', refit);
+
+  function destroy() {
+    if (ro) ro.disconnect();
+    if (layoutRaf) cancelAnimationFrame(layoutRaf);
+    table.removeEventListener('table-columns-changed', refit);
+  }
+
+  refit();
+  return { refit, grow, destroy };
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/meshcore-analyzer/dbschema"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -193,12 +195,11 @@ func newResolver(pm *prefixMap) func(string) string {
 //
 // Both columns are optional: they are added by migration and an older database
 // simply lacks them, so each is gated on the schema flag the handle probed at
-// open time. Every return value is best-effort — a missing row, a missing
-// column or a scan error yields empty strings, because a reach report must
-// still render for a node we know nothing else about.
-func (s *Server) reachNodeScopes(ctx context.Context, pubkey string) (string, string, string) {
+// open time. Missing rows or optional columns yield empty strings; query and
+// scan failures must abort the build rather than cache missing scope data.
+func (s *Server) reachNodeScopes(ctx context.Context, pubkey string) (string, string, string, error) {
 	if s.db == nil || s.db.conn == nil {
-		return "", "", ""
+		return "", "", "", nil
 	}
 	cols := make([]string, 0, 3)
 	if s.db.hasDefaultScope {
@@ -208,7 +209,7 @@ func (s *Server) reachNodeScopes(ctx context.Context, pubkey string) (string, st
 		cols = append(cols, "configured_scope", "configured_scope_at")
 	}
 	if len(cols) == 0 {
-		return "", "", ""
+		return "", "", "", nil
 	}
 	vals := make([]sql.NullString, len(cols))
 	args := make([]interface{}, len(cols))
@@ -218,7 +219,10 @@ func (s *Server) reachNodeScopes(ctx context.Context, pubkey string) (string, st
 	row := s.db.conn.QueryRowContext(ctx,
 		"SELECT "+strings.Join(cols, ", ")+" FROM nodes WHERE public_key = ?", pubkey)
 	if err := row.Scan(args...); err != nil {
-		return "", "", ""
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", "", nil
+		}
+		return "", "", "", err
 	}
 	out := map[string]string{}
 	for i, c := range cols {
@@ -226,7 +230,7 @@ func (s *Server) reachNodeScopes(ctx context.Context, pubkey string) (string, st
 			out[c] = vals[i].String
 		}
 	}
-	return out["default_scope"], out["configured_scope"], out["configured_scope_at"]
+	return out["default_scope"], out["configured_scope"], out["configured_scope_at"], nil
 }
 
 type NodeReachInfo struct {
@@ -331,6 +335,15 @@ type reachCacheEntry struct {
 type reachState struct {
 	cacheMu sync.RWMutex
 	cache   map[string]reachCacheEntry
+	// cold bounds how many cold-cache reach scans run at the same time.
+	// singleflight only collapses identical keys; distinct (pubkey, days)
+	// keys each start a scan, and the endpoint is unauthenticated, so
+	// without a cap a handful of requests can hold every SQLite reader.
+	// Zero value is ready to use (see node_reach_cold_limit.go).
+	cold reachColdLimiter
+	// beforeFlight is a test hook run between the cache check and the
+	// singleflight call; nil in production.
+	beforeFlight func()
 	// sf dedups concurrent cold-cache requests for the same key so N
 	// simultaneous callers run the scan + attribution once, not N times.
 	sf singleflight.Group
@@ -484,14 +497,23 @@ func (s *Server) handleNodeReach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.reach.beforeFlight != nil {
+		s.reach.beforeFlight()
+	}
 	// singleflight: collapse a thundering herd on a cold key to one scan. The
 	// shared computation uses the triggering request's context; a disconnect
-	// there can cancel the in-flight scan for all waiters (acceptable — the
-	// next request recomputes).
+	// there cancels it for all waiters, and those still connected get 429
+	// (below), so their retry recomputes.
 	v, err, _ := s.reach.sf.Do(cacheKey, func() (interface{}, error) {
 		if raw, ok := s.reachCacheGet(cacheKey); ok {
 			return raw, nil
 		}
+		// Taken only here, after the cache recheck: a warm hit never waits
+		// for a slot, and a coalesced herd on one key takes one slot.
+		if aErr := s.reach.cold.acquire(r.Context()); aErr != nil {
+			return nil, aErr
+		}
+		defer s.reach.cold.release()
 		resp, ok, cErr := s.computeNodeReach(r.Context(), pubkey, days)
 		if cErr != nil {
 			// Real backend failure (e.g. DB scan exploded) — propagate so the
@@ -510,6 +532,18 @@ func (s *Server) handleNodeReach(w http.ResponseWriter, r *http.Request) {
 		s.reachCachePut(cacheKey, raw)
 		return raw, nil
 	})
+	if errors.Is(err, errReachColdBusy) {
+		writeReachColdBusy429(w)
+		return
+	}
+	// The shared computation runs on the context of the request that started
+	// it. If that request went away (while queued for a slot or mid-scan), a
+	// caller that is still connected was not at fault: tell it to retry, as
+	// for a busy limiter, instead of answering 500. Nothing was cached.
+	if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && r.Context().Err() == nil {
+		writeReachColdBusy429(w)
+		return
+	}
 	if err != nil {
 		writeError(w, 500, "reach computation failed")
 		return
@@ -565,7 +599,10 @@ func (s *Server) computeNodeReach(ctx context.Context, pubkey string, days int) 
 
 	// #1865: scopes for the report header. Single-row lookup rather than widening
 	// buildNodeInfoMap's bulk SELECT, which every other consumer would pay for.
-	defScope, confScope, confAt := s.reachNodeScopes(ctx, pubkey)
+	defScope, confScope, confAt, err := s.reachNodeScopes(ctx, pubkey)
+	if err != nil {
+		return NodeReachResponse{}, false, err
+	}
 
 	// assemble links
 	links := make([]NodeReachLink, 0, len(d.we)+len(d.they))
@@ -629,6 +666,9 @@ func (s *Server) computeNodeReach(ctx context.Context, pubkey string, days int) 
 	sort.Strings(toks)
 
 	selfLat, selfLon := gpsPtrs(self)
+	if err := ctx.Err(); err != nil {
+		return NodeReachResponse{}, false, err
+	}
 	return NodeReachResponse{
 		Node: NodeReachInfo{Pubkey: pubkey, Name: self.Name, Role: self.Role,
 			Lat: selfLat, Lon: selfLon, FirstSeen: firstSeen,
@@ -704,11 +744,16 @@ func (s *Server) getDegreeSnapshot(ctx context.Context) *degreeSnapshot {
 	for rows.Next() {
 		var pk string
 		var neigh int
-		if rows.Scan(&pk, &neigh) != nil {
-			continue
+		if err := rows.Scan(&pk, &neigh); err != nil {
+			log.Printf("[reach] degree snapshot scan failed: %v (serving stale)", err)
+			return stale
 		}
 		deg[strings.ToLower(pk)] = neigh
 		sortedDesc = append(sortedDesc, neigh)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[reach] degree snapshot iteration failed: %v (serving stale)", err)
+		return stale
 	}
 	sort.Sort(sort.Reverse(sort.IntSlice(sortedDesc)))
 	snap := &degreeSnapshot{at: time.Now(), total: len(deg), deg: deg, sortedDesc: sortedDesc}
@@ -716,6 +761,26 @@ func (s *Server) getDegreeSnapshot(ctx context.Context) *degreeSnapshot {
 	s.reach.degreeSnap = snap
 	s.reach.degreeMu.Unlock()
 	return snap
+}
+
+// reachScanSQL is the reach scan for nTokens path tokens. Arguments: the
+// window start (epoch seconds), one LIKE pattern per token, the row limit.
+//
+// CROSS JOIN fixes the join order in SQLite: observations is the outer loop,
+// read through idx_observations_timestamp for the window. With a plain JOIN
+// the planner scanned every transmission and probed observations per row
+// (3.2-3.3 s against 1.8-2.0 s on an 18M-observation database, #2146).
+func reachScanSQL(nTokens int) string {
+	likes := make([]string, nTokens)
+	for i := range likes {
+		likes[i] = "o.path_json LIKE ?"
+	}
+	return `SELECT LOWER(COALESCE(obs.id,'')), LOWER(COALESCE(t.from_pubkey,'')), COALESCE(t.payload_type,0), o.path_json, o.snr
+	      FROM observations o
+	      CROSS JOIN transmissions t ON t.id = o.transmission_id
+	      LEFT JOIN observers obs ON obs.rowid = o.observer_idx
+	      WHERE o.timestamp >= ? AND (` + strings.Join(likes, " OR ") + `)
+	      LIMIT ?`
 }
 
 // scanReachRows reads windowed observations whose path contains any reliable
@@ -732,7 +797,20 @@ func (s *Server) scanReachRows(ctx context.Context, tokens map[string]bool, sinc
 	if len(tokens) == 0 {
 		return nil, nil // defensive: an empty LIKE chain would render `AND ()` (SQL error)
 	}
-	likes := make([]string, 0, len(tokens))
+	// Prefer the inverted hop index when the ingestor's backfill has covered
+	// this window: a token seek instead of a substring scan of every
+	// observation in the window (which, cold, outlives the HTTP WriteTimeout).
+	if s.reachHopIndexCovers(ctx, sinceEpoch) {
+		rows, err := s.scanReachRowsIndexed(ctx, tokens, sinceEpoch)
+		if err == nil {
+			return rows, nil
+		}
+		// The coverage check and the scan are separate queries, and the ingestor
+		// drops the index when hopIndexDays is set to 0: a removal between the
+		// two fails the scan with "no such table". Answer from the substring scan
+		// instead; an error there still reaches the caller as a 500.
+		log.Printf("[reach] hop index scan failed, using the path_json scan: %v", err)
+	}
 	args := []interface{}{sinceEpoch}
 	// Sort tokens so the generated SQL text is byte-stable across requests
 	// with the same token set — preserves the driver's prepared-statement
@@ -743,16 +821,16 @@ func (s *Server) scanReachRows(ctx context.Context, tokens map[string]bool, sinc
 	}
 	sort.Strings(toks)
 	for _, tok := range toks {
-		likes = append(likes, "o.path_json LIKE ?")
 		args = append(args, "%\""+tok+"\"%")
 	}
-	q := `SELECT LOWER(COALESCE(obs.id,'')), LOWER(COALESCE(t.from_pubkey,'')), COALESCE(t.payload_type,0), o.path_json, o.snr
-	      FROM observations o
-	      JOIN transmissions t ON t.id = o.transmission_id
-	      LEFT JOIN observers obs ON obs.rowid = o.observer_idx
-	      WHERE o.timestamp >= ? AND (` + strings.Join(likes, " OR ") + `)
-	      LIMIT ?`
 	args = append(args, reachScanRowLimit)
+	return s.readReachRows(ctx, reachScanSQL(len(toks)), args)
+}
+
+// readReachRows runs a reach scan query (column order fixed by the callers) and
+// folds the result into pathRows. Shared by the LIKE scan and the indexed scan
+// so both apply identical row handling and truncation accounting.
+func (s *Server) readReachRows(ctx context.Context, q string, args []interface{}) ([]pathRow, error) {
 	rows, err := s.db.conn.QueryContext(ctx, q, args...)
 	if err != nil {
 		log.Printf("[reach] scan query failed: %v", err)
@@ -791,4 +869,44 @@ func (s *Server) scanReachRows(ctx context.Context, tokens map[string]bool, sinc
 		return nil, err
 	}
 	return out, nil
+}
+
+// reachHopIndexCovers reports whether observation_hops can answer a window that
+// starts at sinceEpoch. The table is an optional accelerator maintained by the
+// ingestor when retention.hopIndexDays > 0 (see
+// internal/dbschema/observation_hops.go): a missing table or coverage row
+// (index off, older DB, ingestor not yet started) just means "no".
+func (s *Server) reachHopIndexCovers(ctx context.Context, sinceEpoch int64) bool {
+	var covered int64
+	err := s.db.conn.QueryRowContext(ctx,
+		`SELECT since FROM `+dbschema.ObservationHopsCoverageTable+` WHERE id = 1`).Scan(&covered)
+	return err == nil && covered <= sinceEpoch
+}
+
+// scanReachRowsIndexed is scanReachRows answered from observation_hops. It
+// returns the same rows as the LIKE scan: hop tokens are matched as whole path
+// elements (the LIKE pattern "%\"TOK\"%" is exactly that), both sides are
+// upper-cased with SQLite's ASCII UPPER (LIKE ignores ASCII case; the index
+// stores UPPER(hop)), and IN (subquery) keeps an observation that matches
+// several tokens to one row.
+func (s *Server) scanReachRowsIndexed(ctx context.Context, tokens map[string]bool, sinceEpoch int64) ([]pathRow, error) {
+	toks := make([]string, 0, len(tokens))
+	for tok := range tokens {
+		toks = append(toks, tok)
+	}
+	sort.Strings(toks)
+	args := make([]interface{}, 0, len(toks)+2)
+	marks := make([]string, len(toks))
+	for i, tok := range toks {
+		marks[i] = "UPPER(?)"
+		args = append(args, tok)
+	}
+	args = append(args, sinceEpoch, reachScanRowLimit)
+	q := `SELECT LOWER(COALESCE(obs.id,'')), LOWER(COALESCE(t.from_pubkey,'')), COALESCE(t.payload_type,0), o.path_json, o.snr
+	      FROM observations o
+	      JOIN transmissions t ON t.id = o.transmission_id
+	      LEFT JOIN observers obs ON obs.rowid = o.observer_idx
+	      WHERE o.id IN (SELECT observation_id FROM observation_hops WHERE hop IN (` + strings.Join(marks, ",") + `) AND timestamp >= ?)
+	      LIMIT ?`
+	return s.readReachRows(ctx, q, args)
 }

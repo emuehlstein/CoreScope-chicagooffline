@@ -1,0 +1,493 @@
+package main
+
+import (
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/meshcore-analyzer/users"
+)
+
+// UserManagementConfig is the "userManagement" block of config.json.
+type UserManagementConfig struct {
+	Enabled          bool                    `json:"enabled"`
+	DBPath           string                  `json:"dbPath,omitempty"`
+	AdminEmails      []string                `json:"adminEmails,omitempty"`
+	PublicBaseURL    string                  `json:"publicBaseUrl,omitempty"`
+	SessionDays      int                     `json:"sessionDays,omitempty"`
+	TrustedProxies   []string                `json:"trustedProxies,omitempty"`
+	Mail             UserMailConfig          `json:"mail"`
+	ChannelProposals *ChannelProposalsConfig `json:"channelProposals,omitempty"`
+	Notifications    *NotificationsConfig    `json:"notifications,omitempty"`
+	Backup           *UsersBackupConfig      `json:"backup,omitempty"`
+	ObserverLogins   *ObserverLoginsConfig   `json:"observerLogins,omitempty"`
+}
+
+// UserMailConfig is userManagement.mail.
+type UserMailConfig struct {
+	Provider      string `json:"provider,omitempty"`
+	BrevoAPIKey   string `json:"brevoApiKey,omitempty"`
+	PostalBaseURL string `json:"postalBaseUrl,omitempty"`
+	PostalAPIKey  string `json:"postalApiKey,omitempty"`
+	FromEmail     string `json:"fromEmail,omitempty"`
+	FromName      string `json:"fromName,omitempty"`
+	WebhookSecret string `json:"webhookSecret,omitempty"`
+}
+
+// ChannelProposalsConfig is userManagement.channelProposals
+// (docs/specs/2026-10-07-channel-proposals-design.md). Off by default.
+type ChannelProposalsConfig struct {
+	Enabled       bool `json:"enabled"`
+	MaxPending    int  `json:"maxPending,omitempty"`
+	MaxApproved   int  `json:"maxApproved,omitempty"`
+	PerUserPerDay int  `json:"perUserPerDay,omitempty"`
+}
+
+// proposalSettings is the resolved form; the zero value means off.
+type proposalSettings struct {
+	enabled       bool
+	maxPending    int // pending proposals of every kind
+	maxApproved   int // approved hashtag channels; bounds the ingestor's key set
+	perUserPerDay int
+}
+
+const (
+	defaultMaxPendingProposals    = 100
+	defaultMaxApprovedChannels    = 128
+	defaultProposalsPerUserPerDay = 5
+)
+
+func positiveOr(v, def int) int {
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+// resolveProposals fills the defaults for absent, zero or negative limits.
+func resolveProposals(c *ChannelProposalsConfig) proposalSettings {
+	if c == nil || !c.Enabled {
+		return proposalSettings{}
+	}
+	return proposalSettings{
+		enabled:       true,
+		maxPending:    positiveOr(c.MaxPending, defaultMaxPendingProposals),
+		maxApproved:   positiveOr(c.MaxApproved, defaultMaxApprovedChannels),
+		perUserPerDay: positiveOr(c.PerUserPerDay, defaultProposalsPerUserPerDay),
+	}
+}
+
+// NotificationsConfig is userManagement.notifications
+// (docs/specs/2026-10-07-node-notifications-design.md). Off by default.
+type NotificationsConfig struct {
+	Enabled           bool `json:"enabled"`
+	IntervalMinutes   int  `json:"intervalMinutes,omitempty"`
+	PerUserPerDay     int  `json:"perUserPerDay,omitempty"`
+	MaxMailsPerDay    int  `json:"maxMailsPerDay,omitempty"`
+	MaxWatchesPerUser int  `json:"maxWatchesPerUser,omitempty"`
+	// ExternalAlerts feeds the node.external event (#2177). Absent: the
+	// event is not offered.
+	ExternalAlerts *ExternalAlertsConfig `json:"externalAlerts,omitempty"`
+	// AdaptiveOffline learns node.offline's threshold per node from its own
+	// certain traffic (#2260, adaptive_offline.go). Absent or not enabled:
+	// the fixed healthThresholds silent windows only.
+	AdaptiveOffline *AdaptiveOfflineConfig `json:"adaptiveOffline,omitempty"`
+}
+
+// AdaptiveOfflineConfig is userManagement.notifications.adaptiveOffline.
+type AdaptiveOfflineConfig struct {
+	Enabled      bool `json:"enabled"`
+	FloorMinutes int  `json:"floorMinutes,omitempty"` // shortest learned threshold, default 30
+	MinObservers int  `json:"minObservers,omitempty"` // fewer distinct observers keep the fixed window, default 3
+}
+
+// ExternalAlertsConfig is userManagement.notifications.externalAlerts: a
+// JSON feed of per-node alerts computed outside CoreScope.
+type ExternalAlertsConfig struct {
+	URL         string `json:"url"`
+	MaxAgeHours int    `json:"maxAgeHours,omitempty"`
+	Label       string `json:"label,omitempty"`
+}
+
+// notifySettings is the resolved form; the zero value means off.
+type notifySettings struct {
+	enabled           bool
+	interval          time.Duration // between evaluations, at least a minute
+	perUserPerDay     int           // notification mails per user per 24 hours
+	maxMailsPerDay    int           // notification mails per instance per 24 hours
+	maxWatchesPerUser int
+	external          externalAlertSettings
+	adaptive          adaptiveSettings
+}
+
+// adaptiveSettings is the resolved adaptiveOffline block; the zero value is
+// off.
+type adaptiveSettings struct {
+	enabled      bool
+	floor        time.Duration
+	minObservers int
+}
+
+const (
+	defaultAdaptiveFloorMinutes = 30
+	defaultAdaptiveMinObservers = 3
+)
+
+// resolveAdaptiveOffline fills the defaults; nil or not enabled is off.
+func resolveAdaptiveOffline(c *AdaptiveOfflineConfig) adaptiveSettings {
+	if c == nil || !c.Enabled {
+		return adaptiveSettings{}
+	}
+	return adaptiveSettings{enabled: true,
+		floor:        time.Duration(positiveOr(c.FloorMinutes, defaultAdaptiveFloorMinutes)) * time.Minute,
+		minObservers: positiveOr(c.MinObservers, defaultAdaptiveMinObservers)}
+}
+
+// externalAlertSettings is the resolved externalAlerts block; url "" means
+// not configured.
+type externalAlertSettings struct {
+	url    string
+	maxAge time.Duration // a feed generated longer ago is stale
+	label  string        // names the source in mail lines and on the account page
+}
+
+const (
+	defaultExternalAlertsMaxAgeHours = 48
+	defaultExternalAlertsLabel       = "External alert"
+)
+
+// resolveExternalAlerts validates the externalAlerts block and fills the
+// defaults; nil gives the zero value (not configured).
+func resolveExternalAlerts(c *ExternalAlertsConfig) (externalAlertSettings, error) {
+	if c == nil {
+		return externalAlertSettings{}, nil
+	}
+	u, err := url.Parse(strings.TrimSpace(c.URL))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return externalAlertSettings{}, errors.New("userManagement.notifications.externalAlerts.url must be an absolute http(s) URL")
+	}
+	label := mailSafeText(c.Label)
+	if label == "" {
+		label = defaultExternalAlertsLabel
+	}
+	return externalAlertSettings{url: u.String(), label: label,
+		maxAge: time.Duration(positiveOr(c.MaxAgeHours, defaultExternalAlertsMaxAgeHours)) * time.Hour}, nil
+}
+
+const (
+	defaultNotifyIntervalMinutes = 5
+	defaultNotifyPerUserPerDay   = 20
+	// defaultNotifyMaxMailsPerDay counts notification mail only. A third of
+	// Brevo's free 300 a day, so activation, reset and address-change mail
+	// (and other senders on the same account) still fit in the quota.
+	defaultNotifyMaxMailsPerDay = 100
+	defaultNotifyMaxWatches     = 50
+)
+
+// resolveNotifications fills the defaults for absent, zero or negative
+// values. The interval is in whole minutes, so its floor is one minute.
+func resolveNotifications(c *NotificationsConfig) notifySettings {
+	if c == nil || !c.Enabled {
+		return notifySettings{}
+	}
+	return notifySettings{
+		enabled:           true,
+		interval:          time.Duration(positiveOr(c.IntervalMinutes, defaultNotifyIntervalMinutes)) * time.Minute,
+		perUserPerDay:     positiveOr(c.PerUserPerDay, defaultNotifyPerUserPerDay),
+		maxMailsPerDay:    positiveOr(c.MaxMailsPerDay, defaultNotifyMaxMailsPerDay),
+		maxWatchesPerUser: positiveOr(c.MaxWatchesPerUser, defaultNotifyMaxWatches),
+		adaptive:          resolveAdaptiveOffline(c.AdaptiveOffline),
+	}
+}
+
+// UsersBackupConfig is userManagement.backup: scheduled users.db
+// snapshots (docs/specs/2026-10-08-account-export-and-users-backup-design.md).
+// On by default: an absent block, or one without "enabled", means on.
+type UsersBackupConfig struct {
+	Enabled *bool  `json:"enabled,omitempty"`
+	Dir     string `json:"dir,omitempty"`
+	Keep    int    `json:"keep,omitempty"`
+}
+
+// backupSettings is the resolved form; the zero value means off.
+type backupSettings struct {
+	enabled bool
+	dir     string // relative paths resolve against the working directory, like dbPath
+	keep    int    // snapshots kept after each run
+}
+
+const defaultBackupKeep = 7
+
+// resolveBackup fills the defaults: dir "backups" next to users.db, keep 7
+// for an absent, zero or negative value. Only "enabled": false turns it off.
+func resolveBackup(c *UsersBackupConfig, dbPath string) backupSettings {
+	if c != nil && c.Enabled != nil && !*c.Enabled {
+		return backupSettings{}
+	}
+	b := backupSettings{enabled: true, dir: filepath.Join(filepath.Dir(dbPath), "backups"), keep: defaultBackupKeep}
+	if c == nil {
+		return b
+	}
+	if d := strings.TrimSpace(c.Dir); d != "" {
+		b.dir = d
+	}
+	b.keep = positiveOr(c.Keep, defaultBackupKeep)
+	return b
+}
+
+// ObserverLoginsConfig is userManagement.observerLogins: personal MQTT logins
+// for observers. Off by default.
+type ObserverLoginsConfig struct {
+	Enabled       bool                 `json:"enabled"`
+	HookSecret    string               `json:"hookSecret,omitempty"`
+	EncryptionKey string               `json:"encryptionKey,omitempty"`
+	Broker        ObserverBrokerConfig `json:"broker"`
+	// SharedUsernames are the broker's own shared login names; the authz
+	// hook denies them a publish under a confirmed observer pubkey.
+	SharedUsernames []string `json:"sharedUsernames,omitempty"`
+}
+
+// ObserverBrokerConfig is the broker an observer connects to, as shown to
+// the user.
+type ObserverBrokerConfig struct {
+	Host      string `json:"host"`
+	Port      int    `json:"port,omitempty"`
+	Transport string `json:"transport,omitempty"`
+	TLS       bool   `json:"tls,omitempty"`
+}
+
+// observerLoginSettings is the resolved form; the zero value means off.
+type observerLoginSettings struct {
+	enabled    bool
+	hookSecret string
+	key        []byte // 32 bytes, for users.NewSecretBox
+	host       string
+	port       int
+	transport  string
+	tls        bool
+	// sharedUsernames is nil when none are configured.
+	sharedUsernames map[string]bool
+}
+
+const (
+	defaultObserverBrokerPort      = 1883
+	defaultObserverBrokerTransport = "tcp"
+)
+
+// resolveObserverLogins validates the block only when it is enabled. The
+// hook secret and key may come from the environment, which wins.
+func resolveObserverLogins(c *ObserverLoginsConfig, getenv func(string) string) (observerLoginSettings, error) {
+	if c == nil || !c.Enabled {
+		return observerLoginSettings{}, nil
+	}
+	o := observerLoginSettings{enabled: true, tls: c.Broker.TLS}
+	o.hookSecret = envOrValue(getenv, "CORESCOPE_OBSERVER_HOOK_SECRET", c.HookSecret)
+	if o.hookSecret == "" {
+		return observerLoginSettings{}, errors.New("userManagement.observerLogins.hookSecret is required (or CORESCOPE_OBSERVER_HOOK_SECRET)")
+	}
+	if len(o.hookSecret) < 16 {
+		return observerLoginSettings{}, errors.New("userManagement.observerLogins.hookSecret must be at least 16 characters")
+	}
+	rawKey := envOrValue(getenv, "CORESCOPE_OBSERVER_KEY", c.EncryptionKey)
+	if rawKey == "" {
+		return observerLoginSettings{}, errors.New("userManagement.observerLogins.encryptionKey is required (or CORESCOPE_OBSERVER_KEY)")
+	}
+	key, err := base64.StdEncoding.DecodeString(rawKey)
+	if err != nil || len(key) != 32 {
+		return observerLoginSettings{}, errors.New("userManagement.observerLogins.encryptionKey must be standard base64 of exactly 32 bytes")
+	}
+	o.key = key
+	o.host = strings.TrimSpace(c.Broker.Host)
+	if o.host == "" {
+		return observerLoginSettings{}, errors.New("userManagement.observerLogins.broker.host is required")
+	}
+	o.port = positiveOr(c.Broker.Port, defaultObserverBrokerPort)
+	o.transport = strings.TrimSpace(c.Broker.Transport)
+	if o.transport == "" {
+		o.transport = defaultObserverBrokerTransport
+	}
+	if o.transport != "tcp" && o.transport != "websockets" {
+		return observerLoginSettings{}, fmt.Errorf("userManagement.observerLogins.broker.transport %q is not supported (use \"tcp\" or \"websockets\")", o.transport)
+	}
+	for _, name := range c.SharedUsernames {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if strings.HasPrefix(name, mqttUsernamePrefix) {
+			return observerLoginSettings{}, fmt.Errorf("userManagement.observerLogins.sharedUsernames: %q is a personal login name", name)
+		}
+		if o.sharedUsernames == nil {
+			o.sharedUsernames = map[string]bool{}
+		}
+		o.sharedUsernames[name] = true
+	}
+	return o, nil
+}
+
+// UserManagementEnabled reports whether optional accounts are on. Nil config
+// or absent section means off (the default).
+func (c *Config) UserManagementEnabled() bool {
+	return c != nil && c.UserManagement != nil && c.UserManagement.Enabled
+}
+
+// userMgmtSettings is the validated, resolved form the auth service runs on.
+type userMgmtSettings struct {
+	dbPath         string
+	adminEmails    map[string]bool
+	baseURL        *url.URL // no trailing slash, no query or fragment
+	secureCookie   bool
+	sessionTTL     time.Duration
+	trustedProxies []*net.IPNet
+	provider       string // "brevo", "postal" or (e2etest builds only) "fake"
+	brevoAPIKey    string
+	postalBaseURL  string // no trailing slash
+	postalAPIKey   string
+	fromEmail      string
+	fromName       string
+	webhookSecret  string
+	proposals      proposalSettings
+	notify         notifySettings
+	backup         backupSettings
+	observerLogins observerLoginSettings
+}
+
+const defaultSessionDays = 30
+
+// fakeMailerAllowed is flipped only by the e2etest build (auth_e2e.go).
+var fakeMailerAllowed bool
+
+// resolveUserManagement validates the block and fills defaults. It refuses
+// configurations where nobody could activate an account, so the server
+// fails at startup instead of running half-working.
+func resolveUserManagement(u *UserManagementConfig, measurementDBPath string, getenv func(string) string) (*userMgmtSettings, error) {
+	set := &userMgmtSettings{adminEmails: map[string]bool{}}
+
+	set.dbPath = strings.TrimSpace(u.DBPath)
+	if set.dbPath == "" {
+		set.dbPath = filepath.Join(filepath.Dir(measurementDBPath), "users.db")
+	}
+	for _, raw := range u.AdminEmails {
+		e, err := users.NormalizeEmail(raw)
+		if err != nil {
+			return nil, fmt.Errorf("userManagement.adminEmails: %q is not a valid address", raw)
+		}
+		set.adminEmails[e] = true
+	}
+
+	base, err := url.Parse(strings.TrimSpace(u.PublicBaseURL))
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
+		return nil, errors.New("userManagement.publicBaseUrl must be an absolute http(s) URL, e.g. https://corescope.example.org")
+	}
+	base.Path = strings.TrimRight(base.Path, "/")
+	base.RawQuery, base.Fragment = "", ""
+	set.baseURL = base
+	set.secureCookie = base.Scheme == "https"
+
+	days := u.SessionDays
+	if days <= 0 {
+		days = defaultSessionDays
+	}
+	if days > 365 {
+		days = 365
+	}
+	set.sessionTTL = time.Duration(days) * 24 * time.Hour
+	set.trustedProxies = parseCIDRList(u.TrustedProxies, "userManagement.trustedProxies")
+
+	set.provider = strings.ToLower(strings.TrimSpace(u.Mail.Provider))
+	if set.provider == "" {
+		set.provider = "brevo"
+	}
+	set.brevoAPIKey = envOrValue(getenv, "CORESCOPE_BREVO_API_KEY", u.Mail.BrevoAPIKey)
+	set.postalAPIKey = envOrValue(getenv, "CORESCOPE_POSTAL_API_KEY", u.Mail.PostalAPIKey)
+	webhookEnv := "CORESCOPE_BREVO_WEBHOOK_SECRET"
+	if set.provider == "postal" {
+		webhookEnv = "CORESCOPE_POSTAL_WEBHOOK_SECRET"
+	}
+	set.webhookSecret = envOrValue(getenv, webhookEnv, u.Mail.WebhookSecret)
+	from, err := users.NormalizeEmail(u.Mail.FromEmail)
+	if err != nil {
+		return nil, errors.New("userManagement.mail.fromEmail must be a valid address")
+	}
+	set.fromEmail = from
+	set.fromName = strings.TrimSpace(u.Mail.FromName)
+	if set.fromName == "" {
+		set.fromName = "CoreScope"
+	}
+
+	switch set.provider {
+	case "brevo":
+		if set.brevoAPIKey == "" {
+			return nil, errors.New("userManagement.mail: a Brevo API key is required (mail.brevoApiKey or CORESCOPE_BREVO_API_KEY)")
+		}
+	case "postal":
+		if set.postalAPIKey == "" {
+			return nil, errors.New("userManagement.mail: a Postal API key is required (mail.postalApiKey or CORESCOPE_POSTAL_API_KEY)")
+		}
+		if set.postalBaseURL, err = resolvePostalBaseURL(u.Mail.PostalBaseURL); err != nil {
+			return nil, err
+		}
+		// Postal sends the secret as HTTP Basic auth taken from the webhook
+		// URL, and its URL check allows only these characters there.
+		if set.webhookSecret != "" && !postalSecretRe.MatchString(set.webhookSecret) {
+			return nil, errors.New("userManagement.mail.webhookSecret may contain only letters, digits, '.', '_' and '-' with the postal provider")
+		}
+	case "fake":
+		if !fakeMailerAllowed {
+			return nil, errors.New(`userManagement.mail.provider "fake" is only available in e2etest builds`)
+		}
+	default:
+		return nil, fmt.Errorf("userManagement.mail.provider %q is not supported (use \"brevo\" or \"postal\")", u.Mail.Provider)
+	}
+	if set.webhookSecret != "" && len(set.webhookSecret) < 16 {
+		return nil, errors.New("userManagement.mail.webhookSecret must be at least 16 characters")
+	}
+	set.proposals = resolveProposals(u.ChannelProposals)
+	set.notify = resolveNotifications(u.Notifications)
+	if set.notify.enabled {
+		if set.notify.external, err = resolveExternalAlerts(u.Notifications.ExternalAlerts); err != nil {
+			return nil, err
+		}
+	}
+	set.backup = resolveBackup(u.Backup, set.dbPath)
+	if set.observerLogins, err = resolveObserverLogins(u.ObserverLogins, getenv); err != nil {
+		return nil, err
+	}
+	return set, nil
+}
+
+var postalSecretRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// resolvePostalBaseURL validates mail.postalBaseUrl. The API key travels in a
+// header, so plain http is allowed only to a loopback host.
+func resolvePostalBaseURL(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", errors.New("userManagement.mail.postalBaseUrl must be an absolute http(s) URL, e.g. https://postal.example.org")
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("userManagement.mail.postalBaseUrl must not contain credentials, a query or a fragment")
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return "", errors.New("userManagement.mail.postalBaseUrl must use https (http is allowed only for localhost)")
+		}
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	return u.String(), nil
+}
+
+func envOrValue(getenv func(string) string, key, fallback string) string {
+	if v := strings.TrimSpace(getenv(key)); v != "" {
+		return v
+	}
+	return strings.TrimSpace(fallback)
+}

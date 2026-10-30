@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -63,6 +64,7 @@ type Config struct {
 	ClientRxObservations *ClientRxObservationsConfig `json:"clientRxObservations,omitempty"`
 	ClientRfSamples      *ClientRfSamplesConfig      `json:"clientRfSamples,omitempty"`
 	ClientRegions        *ClientRegionsConfig        `json:"clientRegions,omitempty"`
+	ClientNodeNames      *ClientNodeNamesConfig      `json:"clientNodeNames,omitempty"`
 	GeoFilter            *GeoFilterConfig            `json:"geo_filter,omitempty"`
 	// PathTrust configures the minimum path-hash prefix length trusted as
 	// mapping/topology evidence (issue #1784).
@@ -110,6 +112,11 @@ type Config struct {
 	// (#1608). Received messages are drained once the write path is ready.
 	// 0 / unset => default. Bounded memory.
 	IngestBufferSize int `json:"ingestBufferSize,omitempty"`
+
+	// UserManagement is the part of the shared userManagement block the
+	// ingestor reads: where users.db is and whether approved hashtag channels
+	// are decrypted. Everything else in the block belongs to the server.
+	UserManagement *UserManagementConfig `json:"userManagement,omitempty"`
 }
 
 // NeighborEdgesDaysOrDefault returns the configured pruning window or 5.
@@ -158,6 +165,23 @@ func (f *ForeignAdvertConfig) IsDropMode() bool {
 // ClientRxCoverageConfig controls the opt-in mobile client-RX coverage feature.
 type ClientRxCoverageConfig struct {
 	Enabled bool `json:"enabled"`
+	// RequireLinkedCompanion drops every meshcore/client/<pubkey>/...
+	// message whose companion no user linked (linked_companions.go). In
+	// effect only with userManagement.enabled.
+	RequireLinkedCompanion bool `json:"requireLinkedCompanion,omitempty"`
+}
+
+// RequireLinkedCompanionSet reports whether
+// clientRxCoverage.requireLinkedCompanion is set, whatever userManagement
+// says (startup uses it to warn when the setting is ignored).
+func (c *Config) RequireLinkedCompanionSet() bool {
+	return c.ClientRxCoverage != nil && c.ClientRxCoverage.RequireLinkedCompanion
+}
+
+// RequireLinkedCompanion reports whether the linked-only filter is in
+// effect: the setting and userManagement.enabled both on.
+func (c *Config) RequireLinkedCompanion() bool {
+	return c.RequireLinkedCompanionSet() && c.UserManagement != nil && c.UserManagement.Enabled
 }
 
 // ClientRxCoverageEnabled reports whether the opt-in mobile client-RX coverage
@@ -200,6 +224,18 @@ func (c *Config) ClientRegionsEnabled() bool {
 	return c.ClientRegions != nil && c.ClientRegions.Enabled
 }
 
+// ClientNodeNamesConfig controls the opt-in node-name answer stream
+// (meshcore/client/<pubkey>/names).
+type ClientNodeNamesConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
+// ClientNodeNamesEnabled reports whether node-name answers are recorded.
+// Default false.
+func (c *Config) ClientNodeNamesEnabled() bool {
+	return c.ClientNodeNames != nil && c.ClientNodeNames.Enabled
+}
+
 // RetentionConfig controls how long stale nodes are kept before being moved to inactive_nodes.
 type RetentionConfig struct {
 	NodeDays     int `json:"nodeDays"`
@@ -231,6 +267,27 @@ type RetentionConfig struct {
 	// region-discovery stream would otherwise grow without limit. Consumed by
 	// Task 6's pruner.
 	ClientRegionsDays int `json:"clientRegionsDays"`
+	// ClientNodeNamesDays is the retention window (by observed_at) for the
+	// client_node_names table; 0 disables.
+	ClientNodeNamesDays int `json:"clientNodeNamesDays"`
+	// HopIndexDays turns on the observation_hops inverted index (the
+	// accelerator behind /api/nodes/{pk}/reach) and bounds it to this many
+	// days. 0 or unset = off: no table, no triggers, and a previously installed
+	// index is removed at startup. The index costs roughly 200 bytes per
+	// observation (about 30% of the observations table, measured on a real
+	// 10M-observation database; real paths average 10 to 12 hops) plus a
+	// trigger on every observation insert. Reach windows longer than this fall
+	// back to the substring scan.
+	HopIndexDays int `json:"hopIndexDays"`
+}
+
+// HopIndexDaysOrZero returns retention.hopIndexDays, or 0 (off) when unset.
+// LoadConfig rejects negative values, so none reach here from a config file.
+func (c *Config) HopIndexDaysOrZero() int {
+	if c.Retention != nil && c.Retention.HopIndexDays > 0 {
+		return c.Retention.HopIndexDays
+	}
+	return 0
 }
 
 // PacketDaysOrZero returns the configured retention.packetDays or 0
@@ -281,6 +338,15 @@ func (c *Config) ClientRfDaysOrZero() int {
 func (c *Config) ClientRegionsDaysOrZero() int {
 	if c.Retention != nil && c.Retention.ClientRegionsDays > 0 {
 		return c.Retention.ClientRegionsDays
+	}
+	return 0
+}
+
+// ClientNodeNamesDaysOrZero returns retention.clientNodeNamesDays or 0
+// (disabled) if not set.
+func (c *Config) ClientNodeNamesDaysOrZero() int {
+	if c.Retention != nil && c.Retention.ClientNodeNamesDays > 0 {
+		return c.Retention.ClientNodeNamesDays
 	}
 	return 0
 }
@@ -516,6 +582,11 @@ func LoadConfig(path string) (*Config, error) {
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			return nil, fmt.Errorf("parsing config %s: %w", path, err)
 		}
+		// observerDays reads -1 as "keep forever"; here a negative value would
+		// silently remove the index, so refuse it instead.
+		if cfg.Retention != nil && cfg.Retention.HopIndexDays < 0 {
+			return nil, fmt.Errorf("config %s: retention.hopIndexDays is %d; it must be 0 (off) or a number of days", path, cfg.Retention.HopIndexDays)
+		}
 	}
 
 	// Env var overrides
@@ -612,6 +683,50 @@ const autoRegionKeysDefaultMaxDerived = 256
 // with a companion app, or a 24h observer report), so minutes-scale staleness
 // is irrelevant and a tighter interval only burns queries.
 const autoRegionKeysDefaultRefreshMinutes = 15
+
+// UserManagementConfig is the ingestor's view of userManagement.
+type UserManagementConfig struct {
+	Enabled          bool                    `json:"enabled"`
+	DBPath           string                  `json:"dbPath,omitempty"`
+	ChannelProposals *ChannelProposalsConfig `json:"channelProposals,omitempty"`
+}
+
+// ChannelProposalsConfig is the ingestor's view of
+// userManagement.channelProposals.
+type ChannelProposalsConfig struct {
+	Enabled     bool `json:"enabled"`
+	MaxApproved int  `json:"maxApproved,omitempty"`
+}
+
+const defaultMaxApprovedChannels = 128
+
+// ApprovedChannelsEnabled reports whether approved hashtag channels from
+// users.db are decrypted: user management and channel proposals both on.
+func (c *Config) ApprovedChannelsEnabled() bool {
+	u := c.UserManagement
+	return u != nil && u.Enabled && u.ChannelProposals != nil && u.ChannelProposals.Enabled
+}
+
+// ApprovedChannelsMax caps the approved keys read from users.db; absent,
+// zero or negative means the default, as on the server.
+func (c *Config) ApprovedChannelsMax() int {
+	u := c.UserManagement
+	if u == nil || u.ChannelProposals == nil || u.ChannelProposals.MaxApproved <= 0 {
+		return defaultMaxApprovedChannels
+	}
+	return u.ChannelProposals.MaxApproved
+}
+
+// UsersDBPath resolves users.db with the server's rule: userManagement.dbPath,
+// else users.db next to the analyzer database.
+func (c *Config) UsersDBPath() string {
+	if c.UserManagement != nil {
+		if p := strings.TrimSpace(c.UserManagement.DBPath); p != "" {
+			return p
+		}
+	}
+	return filepath.Join(filepath.Dir(c.DBPath), "users.db")
+}
 
 // AutoRegionKeysEnabled reports whether region keys may be derived from
 // declared-region answers. Default false.

@@ -53,6 +53,8 @@ async function main() {
 
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page = await ctx.newPage();
+  // #2054: packet-detail icons need fixture rows even after the CI job passes 15 minutes.
+  await page.addInitScript(() => localStorage.setItem('meshcore-time-window', '1440'));
 
   // (a) /map — pane toggle + general sprite presence
   await gotoSpa(page, '/map');
@@ -104,16 +106,19 @@ async function main() {
 
   // (c) /packets — replay button renders Phosphor play sprite
   await gotoSpa(page, '/packets');
-  await page.waitForTimeout(1500);
-  // Click first packet row to render detail with replay button (if any).
-  await page.evaluate(() => {
-    const row = document.querySelector('table tbody tr, .pkt-row, .packet-row');
-    if (row) row.click();
-  });
-  await page.waitForTimeout(800);
+  await page.waitForSelector('#pktLeft[data-loaded="true"]', { state: 'attached' });
+  assert(await page.locator('#pktBody tr[data-hash]').count() > 0,
+    '(c) packet detail icons require a real packet row, not the empty-state row');
+  // View route is conditional on nonempty hops. Choose a single-observation
+  // row so the path shown in the table is also the path opened in detail.
+  const pathRow = page.locator('#pktBody tr[data-action="select-hash"]:has(.path-hops .hop)').first();
+  assert(await pathRow.count() > 0, '(c) fixture requires a packet with path hops');
+  await pathRow.locator('td.col-time').click();
+  await page.locator('#pktRight .replay-live-btn').waitFor();
+  await page.locator('#pktRight #viewRouteBtn').waitFor();
   const packets = await page.evaluate(() => {
     const replay = document.querySelector('.replay-live-btn');
-    const viewRoute = document.querySelector('#viewRouteBtn, .detail-map-link');
+    const viewRoute = document.querySelector('#viewRouteBtn');
     return {
       replaySprite: replay ? replay.querySelectorAll('svg.ph-icon use').length : null,
       replayText: replay ? replay.textContent : null,
@@ -121,18 +126,16 @@ async function main() {
       pageSprites: document.querySelectorAll('svg.ph-icon use').length,
     };
   });
-  if (packets.replaySprite === 0) {
-    fail('(c) /packets: replay button has no sprite');
-  } else if (packets.replaySprite > 0) {
-    pass(`(c) /packets: replay button has ${packets.replaySprite} sprite(s)`);
+  if (!(packets.replaySprite > 0)) {
+    fail('(c) /packets: replay button missing or has no sprite');
   } else {
-    console.warn('  ⚠ (c) /packets: replay button not present (no packet detail open)');
+    pass(`(c) /packets: replay button has ${packets.replaySprite} sprite(s)`);
   }
   if (packets.replayText && /[▶◀⏸]/.test(packets.replayText)) {
     fail(`(c) /packets: replay button still has play/pause char (${JSON.stringify(packets.replayText)})`);
   }
-  if (packets.viewRouteSprites === 0) fail('(c) /packets: View-route button missing sprite');
-  else if (packets.viewRouteSprites > 0) pass('(c) /packets: View-route button has sprite');
+  if (!(packets.viewRouteSprites > 0)) fail('(c) /packets: View-route button missing or has no sprite');
+  else pass('(c) /packets: View-route button has sprite');
   if (packets.pageSprites < 5) fail(`(c) /packets: only ${packets.pageSprites} sprite refs (expected ≥5)`);
   else pass(`(c) /packets: ${packets.pageSprites} sprite refs on page`);
 
@@ -158,9 +161,24 @@ async function main() {
   if (analytics.pageSprites < 10) fail(`(d) /analytics: only ${analytics.pageSprites} sprite refs`);
   else pass(`(d) /analytics: ${analytics.pageSprites} sprite refs on page`);
 
-  // Also check distance tab if reachable
+  // Distance tab. The distance index is built lazily (#1011): the API answers
+  // 202 "building" until the first request's build finishes. Wait for it here
+  // rather than relying on an earlier suite to have requested it, then expect
+  // a map-jump button whenever the data has a hop with both endpoints.
+  let distData = null;
+  for (let i = 0; i < 60 && !distData; i++) {
+    const res = await fetch(`${BASE}/api/analytics/distance`);
+    if (res.status === 200) distData = await res.json();
+    else await new Promise(r => setTimeout(r, 1000));
+  }
+  if (!distData) fail('(d) /analytics distance: index still building after 60s');
+  const expectBtn = !!distData && (distData.topHops || []).some(h => h.fromPk && h.toPk);
   await gotoSpa(page, '/analytics?tab=distance');
-  await page.waitForTimeout(2000);
+  if (expectBtn) {
+    await page.waitForSelector('.dist-map-hop, .dist-map-path', { timeout: 15000 }).catch(() => {});
+  } else {
+    await page.waitForTimeout(2000);
+  }
   const dist = await page.evaluate(() => {
     const btn = document.querySelector('.dist-map-hop, .dist-map-path');
     return {
@@ -169,7 +187,8 @@ async function main() {
   });
   if (dist.mapBtnSprites === 0) fail('(d) /analytics distance: map-jump button missing sprite');
   else if (dist.mapBtnSprites > 0) pass('(d) /analytics distance: map-jump button has sprite');
-  else console.warn('  ⚠ (d) /analytics distance: no map-jump button rendered (empty dataset)');
+  else if (expectBtn) fail('(d) /analytics distance: API has hops with both endpoints but no map-jump button rendered');
+  else console.warn('  ⚠ (d) /analytics distance: no map-jump button rendered (no hop with both endpoints)');
 
   // (e) /area-map (standalone HTML)
   await page.goto(`${BASE}/area-map.html`, { waitUntil: 'domcontentloaded' });

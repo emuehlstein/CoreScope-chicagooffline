@@ -28,6 +28,9 @@ type DBStats struct {
 	ObserverUpserts        atomic.Int64
 	WriteErrors            atomic.Int64
 	SignatureDrops         atomic.Int64
+	// ClientUnlinkedDropped counts meshcore/client/<pubkey>/... messages
+	// dropped by the linked-only filter (clientRxCoverage.requireLinkedCompanion).
+	ClientUnlinkedDropped atomic.Int64
 	// RelayTouches counts nodes.last_seen refreshes driven by relay
 	// participation rather than an ADVERT (#1598).
 	RelayTouches atomic.Int64
@@ -70,24 +73,39 @@ type Store struct {
 	db    *sql.DB
 	path  string // filesystem path to the SQLite DB (used to resolve queue dirs)
 	Stats DBStats
+	// plannerStatsAt is when RefreshPlannerStats last succeeded in this
+	// process, in Unix nanoseconds (0: not yet).
+	plannerStatsAt atomic.Int64
 
-	stmtGetTxByHash             *sql.Stmt
-	stmtInsertTransmission      *sql.Stmt
-	stmtUpdateTxFirstSeen       *sql.Stmt
-	stmtBumpTxLastSeen          *sql.Stmt
-	stmtInsertObservation       *sql.Stmt
-	stmtUpsertNode              *sql.Stmt
-	stmtIncrementAdvertCount    *sql.Stmt
-	stmtUpsertObserver          *sql.Stmt
-	stmtUpsertObserverNeighbors *sql.Stmt
-	stmtGetObserverRowid        *sql.Stmt
-	stmtUpdateObserverLastSeen  *sql.Stmt
-	stmtUpdateNodeTelemetry     *sql.Stmt
-	stmtTouchNodeLastSeen       *sql.Stmt
-	stmtUpsertMetrics           *sql.Stmt
+	// linkedCompanions is the linked-only ingest filter
+	// (linked_companions.go); nil means off.
+	linkedCompanions *linkedCompanionSet
+
+	stmtGetTxByHash            *sql.Stmt
+	stmtInsertTransmission     *sql.Stmt
+	stmtUpdateTxFirstSeen      *sql.Stmt
+	stmtBumpTxLastSeen         *sql.Stmt
+	stmtInsertObservation      *sql.Stmt
+	stmtInsertObservationRadio *sql.Stmt // #1869, sparse rx_radio_id
+	stmtInsertAdvertEvidence   *sql.Stmt
+	hopBackfillCancel          context.CancelFunc // stops the observation_hops backfill on Close
+	hopIndexDays               int                // retention.hopIndexDays; 0 = no hop index (see ConfigureObservationHops)
+	hopMaintMu                 sync.Mutex         // serializes the hop index backfill and trim
+	stmtUpsertNode             *sql.Stmt
+	stmtIncrementAdvertCount   *sql.Stmt
+	stmtUpsertObserver         *sql.Stmt
+	stmtGetObserverRowid       *sql.Stmt
+	stmtUpdateObserverLastSeen *sql.Stmt
+	stmtUpdateNodeTelemetry    *sql.Stmt
+	stmtTouchNodeLastSeen      *sql.Stmt
+	stmtUpsertMetrics          *sql.Stmt
+
+	stmtGetLegacyAdvertObservation *sql.Stmt
 
 	sampleIntervalSec int
 	backfillWg        sync.WaitGroup
+
+	advertEvidenceComplete atomic.Bool // restored from durable migration status
 
 	// prefixIdx holds the prefix → pubkey index used by the
 	// resolved_path writer (#1547). Rebuilt on startup and once per
@@ -214,6 +232,14 @@ func OpenStoreWithInterval(dbPath string, sampleIntervalSec int) (*Store, error)
 		log.Printf("[migration/async] scheduling tx_last_seen_backfill_v1 failed: %v", err)
 	}
 
+	// A missing/failed completion lookup leaves preservation enabled. This
+	// lifecycle state is restored on restart, independently of main's startup.
+	var evidenceStatus string
+	_ = db.QueryRow(`SELECT status FROM _async_migrations WHERE name='advert_route_evidence_v1'`).Scan(&evidenceStatus)
+	s.advertEvidenceComplete.Store(evidenceStatus == "done")
+	// The observation_hops backfill is deliberately NOT scheduled here; see
+	// ScheduleObservationHopsBackfill (called from main once ingest is live).
+
 	return s, nil
 }
 
@@ -266,11 +292,7 @@ func applySchema(db *sql.DB) error {
 			clock_skew_count_24h INTEGER DEFAULT 0,
 			clock_last_naive_at TEXT DEFAULT NULL,
 			can_relay INTEGER DEFAULT 1,
-			can_relay_seen INTEGER DEFAULT 0,
-			neighbors_last_report_at TEXT DEFAULT NULL,
-			neighbors_count INTEGER DEFAULT NULL,
-			neighbors_total INTEGER DEFAULT NULL,
-			neighbors_truncated INTEGER DEFAULT 0
+			can_relay_seen INTEGER DEFAULT 0
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen);
@@ -453,6 +475,27 @@ func applySchema(db *sql.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_ndr_target ON node_declared_regions(target, observed_at);
 		CREATE INDEX IF NOT EXISTS idx_ndr_prune  ON node_declared_regions(observed_at);
+
+		-- Node names reported by repeaters themselves via ANON_REQ_TYPE_OWNER,
+		-- asked by a mobile companion for a node this instance had no name for.
+		-- Observations, never state, like node_declared_regions: "current" is the
+		-- greatest observed_at for a target. The server falls back to it when
+		-- nodes has no name (cmd/server/client_names.go).
+		CREATE TABLE IF NOT EXISTS client_node_names (
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			target         TEXT NOT NULL,
+			rx_pubkey      TEXT NOT NULL,
+			observed_at    TEXT NOT NULL,
+			ingested_at    TEXT NOT NULL,
+			name           TEXT NOT NULL,
+			lat            REAL,
+			lon            REAL,
+			pos_acc_m      REAL,
+			repeater_clock INTEGER,
+			UNIQUE(target, rx_pubkey, observed_at)
+		);
+		CREATE INDEX IF NOT EXISTS idx_cnn_target ON client_node_names(target, observed_at);
+		CREATE INDEX IF NOT EXISTS idx_cnn_prune  ON client_node_names(observed_at);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("base schema: %w", err)
@@ -804,35 +847,6 @@ func applySchema(db *sql.DB) error {
 		log.Println("[migration] observers.clock_naive columns added")
 	}
 
-	// Migration: add MQTT neighbor-report columns to observers.
-	//
-	// These are populated ONLY from the firmware's dedicated
-	// meshcore/<iata>/<observer>/neighbors topic — they are deliberately
-	// NOT derived from neighbor_edges, which is inferred from observation
-	// co-reception and would conflate "we computed this topology" with
-	// "this observer reported its own neighbor table".
-	//
-	// All nullable / default-NULL so observers that have never sent a
-	// neighbors report stay distinguishable from ones reporting zero
-	// neighbors (same tri-state rationale as can_relay, #1290).
-	row = db.QueryRow("SELECT 1 FROM _migrations WHERE name = 'observers_neighbor_reports_v1'")
-	if row.Scan(&migDone) != nil {
-		log.Println("[migration] Adding neighbor-report columns to observers...")
-		// Each ALTER is independent — ignore "duplicate column" so reruns are safe.
-		for _, stmt := range []string{
-			`ALTER TABLE observers ADD COLUMN neighbors_last_report_at TEXT DEFAULT NULL`,
-			`ALTER TABLE observers ADD COLUMN neighbors_count INTEGER DEFAULT NULL`,
-			`ALTER TABLE observers ADD COLUMN neighbors_total INTEGER DEFAULT NULL`,
-			`ALTER TABLE observers ADD COLUMN neighbors_truncated INTEGER DEFAULT 0`,
-		} {
-			if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
-				return fmt.Errorf("neighbor_reports migration: %w", err)
-			}
-		}
-		db.Exec(`INSERT INTO _migrations (name) VALUES ('observers_neighbor_reports_v1')`)
-		log.Println("[migration] observers neighbor-report columns added")
-	}
-
 	// Migration: backfill observations.path_json from raw_hex (#888)
 	// NOTE: This runs ASYNC via BackfillPathJSONAsync() to avoid blocking MQTT startup.
 	// See staging outage where ~502K rows blocked ingest for 15+ hours.
@@ -940,6 +954,14 @@ func applySchema(db *sql.DB) error {
 
 func (s *Store) prepareStatements() error {
 	var err error
+	s.stmtInsertAdvertEvidence, err = s.db.Prepare(insertAdvertEvidenceSQL)
+	if err != nil {
+		return err
+	}
+	s.stmtGetLegacyAdvertObservation, err = s.db.Prepare(legacyAdvertObservationSQL)
+	if err != nil {
+		return err
+	}
 
 	s.stmtGetTxByHash, err = s.db.Prepare("SELECT id, first_seen FROM transmissions WHERE hash = ?")
 	if err != nil {
@@ -988,7 +1010,14 @@ func (s *Store) prepareStatements() error {
 			score         = COALESCE(excluded.score,         score),
 			raw_hex       = COALESCE(excluded.raw_hex,       raw_hex),
 			resolved_path = COALESCE(excluded.resolved_path, resolved_path)
+		RETURNING id
 	`)
+	if err != nil {
+		return err
+	}
+
+	s.stmtInsertObservationRadio, err = s.db.Prepare(`
+		INSERT OR REPLACE INTO observation_radios (observation_id, radio_id) VALUES (?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -1031,29 +1060,6 @@ func (s *Store) prepareStatements() error {
 			noise_floor = COALESCE(?, noise_floor),
 			can_relay = COALESCE(?, can_relay),
 			can_relay_seen = CASE WHEN ? IS NULL THEN can_relay_seen ELSE 1 END
-	`)
-	if err != nil {
-		return err
-	}
-
-	// Neighbor-report upsert. Separate from stmtUpsertObserver on purpose:
-	// the neighbors topic is its own publication with its own cadence
-	// (firmware default 24h), so folding it into the /status upsert would
-	// mean every status message had to pass NULLs for these columns and
-	// packet_count would be incremented by a neighbors report.
-	//
-	// INSERT branch covers the case where a neighbors report is the first
-	// thing we ever hear from an observer. packet_count stays 0 there —
-	// a neighbors report is not a packet observation.
-	s.stmtUpsertObserverNeighbors, err = s.db.Prepare(`
-		INSERT INTO observers (id, iata, first_seen, packet_count, neighbors_last_report_at, neighbors_count, neighbors_total, neighbors_truncated)
-		VALUES (?, ?, ?, 0, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			iata = COALESCE(NULLIF(?, ''), iata),
-			neighbors_last_report_at = ?,
-			neighbors_count = ?,
-			neighbors_total = ?,
-			neighbors_truncated = ?
 	`)
 	if err != nil {
 		return err
@@ -1163,6 +1169,18 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 	if !isNew {
 		s.Stats.DuplicateTransmissions.Add(1)
 	}
+	// Capture route evidence BEFORE the observation conflict update can erase
+	// a different route. Duplicate evidence is a read-only indexed probe.
+	// Analytics failures must not drop core observations or liveness updates;
+	// known evidence is a lower bound when an evidence read/write fails.
+	if data.PayloadType == 4 {
+		if bit := packetpath.AdvertRouteEvidence(data.RawHex); bit != 0 {
+			if _, err := s.stmtInsertAdvertEvidence.Exec(txID, bit, txID, bit); err != nil {
+				s.Stats.WriteErrors.Add(1)
+				log.Printf("[db] record advert route evidence (non-fatal): %v", err)
+			}
+		}
+	}
 
 	// Resolve observer_idx and update last_seen
 	var observerIdx *int64
@@ -1179,6 +1197,17 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 		}
 	}
 
+	// Until backfill commits this observation's evidence, preserve its old
+	// frame before UPSERT can destroy it. writerMu also guards checkpoints.
+	// Run even for malformed incoming raw: the surviving old frame is valid
+	// evidence independently of whether the new frame contributes a bit.
+	if !isNew && data.PayloadType == 4 && observerIdx != nil && data.RawHex != "" {
+		if err := s.preserveLegacyAdvertObservation(txID, *observerIdx, data.PathJSON); err != nil {
+			s.Stats.WriteErrors.Add(1)
+			log.Printf("[db] preserve legacy advert evidence (non-fatal): %v", err)
+		}
+	}
+
 	// Insert observation
 	epochTs := time.Now().Unix()
 	if t, err := time.Parse(time.RFC3339, rxTime); err == nil {
@@ -1191,29 +1220,38 @@ func (s *Store) InsertTransmission(data *PacketData) (bool, error) {
 	// 1-byte prefix collisions are disambiguated via NeighborGraph
 	// adjacency (anchored on from_pubkey for ADVERTs, previous hop
 	// otherwise). Empty resolved JSON → NULL via nilIfEmpty.
+	hops := parsePathArray(data.PathJSON)
+	prefixIdx := s.prefixIdx.load()
 	resolved := resolvePathWithContext(
-		parsePathArray(data.PathJSON),
+		hops,
 		strings.ToLower(data.FromPubkey),
 		s.neighborGraph.load(),
-		s.prefixIdx.load(),
+		prefixIdx,
 	)
 	resolvedJSON := marshalResolvedPath(resolved)
 
-	_, err = s.stmtInsertObservation.Exec(
+	// RETURNING id: the upsert's DO UPDATE runs on every conflict, so the row
+	// id comes back for a new and for an existing observation alike (#1869).
+	var obsID int64
+	err = s.stmtInsertObservation.QueryRow(
 		txID, observerIdx, data.Direction,
 		data.SNR, data.RSSI, data.Score,
 		data.PathJSON, epochTs, nilIfEmpty(data.RawHex),
 		nilIfEmpty(resolvedJSON),
-	)
+	).Scan(&obsID)
 	if err != nil {
 		s.Stats.WriteErrors.Add(1)
 		log.Printf("[db] observation insert (non-fatal): %v", err)
 	} else {
 		s.Stats.ObservationsInserted.Add(1)
-		// #1598: a resolved hop proves the node was forwarding traffic at
-		// rxTime. Refresh its last_seen so staleness/eviction logic sees
-		// relay activity, not just ADVERTs.
-		s.touchRelayNodesLocked(resolvedPubkeys(resolved), rxTime)
+		s.recordObservationRadio(obsID, data.RxRadioID)
+		// #1598: refresh last_seen from flood relay activity, not just ADVERTs.
+		// #2329: adjacency can resolve a path for display but cannot prove
+		// which colliding node transmitted. Use only unique prefixes for
+		// liveness, with the same prefix snapshot as the stored path.
+		if pathHopsTransmitted(data) {
+			s.touchRelayNodesLocked(resolvedPubkeys(resolvePath(hops, prefixIdx)), rxTime)
+		}
 		// #1690: bump transmissions.last_seen so cold-load can filter on
 		// effective recency. Conditional `last_seen < ?` so we never go
 		// backwards on out-of-order ingest.
@@ -1426,47 +1464,13 @@ func observerMetaColumns(meta *ObserverMeta) (model, firmware, clientVersion, ra
 	return model, firmware, clientVersion, radio, batteryMv, uptimeSecs, noiseFloor, canRelay
 }
 
-// UpsertObserverNeighborReport records an observer-reported neighbor table
-// from the meshcore/<iata>/<observer>/neighbors topic.
-//
-// Deliberately does NOT touch last_seen or packet_count: a neighbors report
-// is observer self-metadata on its own (24h-default) cadence, not a packet
-// observation, and letting it bump last_seen would make a silent observer
-// look alive once a day. It also does not reactivate an inactive observer,
-// for the same reason.
-//
-// report must be non-nil; a zero-neighbor report is valid and meaningful
-// ("reporting, currently hears nobody") and is stored as count 0, which is
-// distinct from NULL ("never reported").
-func (s *Store) UpsertObserverNeighborReport(id, iata string, report *NeighborReport) error {
-	if report == nil {
-		return nil
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	normalizedIATA := strings.TrimSpace(strings.ToUpper(iata))
-
-	var total interface{}
-	if report.Total != nil {
-		total = *report.Total
-	}
-	truncated := 0
-	if report.Truncated {
-		truncated = 1
-	}
-
-	_, err := s.stmtUpsertObserverNeighbors.Exec(
-		id, normalizedIATA, now, now, report.Count, total, truncated,
-		normalizedIATA, now, report.Count, total, truncated,
-	)
-	if err != nil {
-		s.Stats.WriteErrors.Add(1)
-		return err
-	}
-	return nil
-}
-
 // Close checkpoints the WAL and closes the database.
 func (s *Store) Close() error {
+	// Long resumable backfills must not hold shutdown hostage; they pick up
+	// from their stored progress on the next boot.
+	if s.hopBackfillCancel != nil {
+		s.hopBackfillCancel()
+	}
 	s.backfillWg.Wait()
 	s.Checkpoint()
 	return s.db.Close()
@@ -1657,6 +1661,7 @@ func (s *Store) RefreshPlannerStats(analysisLimit int) bool {
 		return false
 	}
 	elapsed := time.Since(start).Round(time.Millisecond)
+	s.recordPlannerStatsRefresh(time.Now())
 	if first {
 		log.Printf("[analyze] planner statistics built in %v (analysis_limit=%d, first run against this database)", elapsed, analysisLimit)
 	} else {
@@ -1689,10 +1694,11 @@ func (s *Store) RefreshPlannerStats(analysisLimit int) bool {
 // dropped. Hence the warning below, so an operator watching a first deploy can
 // tell this apart from a hang.
 //
-// That cost belongs to the first ANALYZE, not to running it here. The refresh
-// ticker would pay exactly the same 3m44s two minutes later; this only moves it
-// earlier, where it overlaps the startup burst the ingest buffer is already
-// sized for.
+// That cost belongs to the first ANALYZE, not to running it here. The daily
+// refresh would otherwise pay exactly the same 3m44s two minutes later; this
+// moves it earlier, where it overlaps the startup burst the ingest buffer is
+// already sized for. It also records the refresh time, so the daily refresh
+// then waits 24 hours (#2146).
 func (s *Store) EnsurePlannerStats(analysisLimit int) bool {
 	if s.hasPlannerStats() {
 		return false
@@ -1701,6 +1707,77 @@ func (s *Store) EnsurePlannerStats(analysisLimit int) bool {
 		"ANALYZE holds the single write connection until it finishes (3m43.9s measured on 9.4 GB, cold), " +
 		"so ingest will buffer and catch up. Once per database, not once per restart.")
 	return s.RefreshPlannerStats(analysisLimit)
+}
+
+// plannerStatsInterval is how often the planner statistics are refreshed, and
+// plannerStatsStagger how long after startup the first refresh waits at least.
+const (
+	plannerStatsInterval = 24 * time.Hour
+	plannerStatsStagger  = 2 * time.Minute
+)
+
+// nextPlannerStatsRefresh returns how long to wait before the next refresh,
+// given when the previous one succeeded (zero if never): until it is
+// plannerStatsInterval old, but at least plannerStatsStagger and at most
+// plannerStatsInterval.
+//
+// Before #2146 the first refresh ran plannerStatsStagger after every start.
+// On a cold page cache that ANALYZE took 6 to 9 minutes on a 10-11 GB
+// database, holding the single write connection, so each restart stalled
+// ingest that long for statistics that were hours old at most.
+func nextPlannerStatsRefresh(last, now time.Time) time.Duration {
+	if last.IsZero() {
+		return plannerStatsStagger
+	}
+	d := last.Add(plannerStatsInterval).Sub(now)
+	if d < plannerStatsStagger {
+		return plannerStatsStagger
+	}
+	if d > plannerStatsInterval {
+		return plannerStatsInterval
+	}
+	return d
+}
+
+// plannerStatsStampPath is the file next to the database that records when
+// the planner statistics were last refreshed.
+func (s *Store) plannerStatsStampPath() string {
+	return s.path + ".planner-stats-refreshed"
+}
+
+// lastPlannerStatsRefresh returns when RefreshPlannerStats last succeeded on
+// this database, or the zero time when that is not known: the later of the
+// time this process remembers and the time recorded in the file.
+func (s *Store) lastPlannerStatsRefresh() time.Time {
+	var last time.Time
+	if ns := s.plannerStatsAt.Load(); ns != 0 {
+		last = time.Unix(0, ns)
+	}
+	b, err := os.ReadFile(s.plannerStatsStampPath())
+	if err != nil {
+		return last
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(string(b)))
+	if err != nil || t.Before(last) {
+		return last
+	}
+	return t
+}
+
+// recordPlannerStatsRefresh remembers when the statistics were refreshed and
+// writes it next to the database for the next start. If the write fails, this
+// process still waits the full interval; only the first refresh after the
+// next restart comes early.
+func (s *Store) recordPlannerStatsRefresh(at time.Time) {
+	s.plannerStatsAt.Store(at.UnixNano())
+	tmp := s.plannerStatsStampPath() + ".tmp"
+	if err := os.WriteFile(tmp, []byte(at.UTC().Format(time.RFC3339)), 0o644); err != nil {
+		log.Printf("[analyze] could not record the refresh time: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, s.plannerStatsStampPath()); err != nil {
+		log.Printf("[analyze] could not record the refresh time: %v", err)
+	}
 }
 
 // hasPlannerStats reports whether ANALYZE has ever run against this database.
@@ -2006,6 +2083,19 @@ func (s *Store) LogStats() {
 	)
 }
 
+// pathHopsTransmitted reports whether data's path lists relays that already
+// transmitted the packet: a flood route whose path bytes are hop hashes.
+// Direct-route paths list the hops still to come (Mesh::removeSelfFromPath),
+// and a TRACE's path_json is the route it was asked to take, its header path
+// bytes being SNR, so neither proves a hop transmitted. Same rule as the
+// server's certain liveness (cmd/server/certain_heard.go relayHopHexLen).
+func pathHopsTransmitted(data *PacketData) bool {
+	if !packetpath.PathBytesAreHops(byte(data.PayloadType)) {
+		return false
+	}
+	return data.RouteType == packetpath.RouteFlood || data.RouteType == packetpath.RouteTransportFlood
+}
+
 // touchRelayNodesLocked refreshes nodes.last_seen for nodes observed as
 // relay hops, so a node that forwards traffic stays fresh even when it
 // adverts rarely or not at all.
@@ -2019,10 +2109,9 @@ func (s *Store) LogStats() {
 // failing on every call since that refactor and is removed in this change.
 // cmd/server/readonly_invariant_test.go now guards against reintroduction.
 //
-// Callers pass the resolved pubkeys already computed for
-// observations.resolved_path (#1547/#1560) — only unambiguously resolved
-// hops reach this function, so a 1-byte prefix collision cannot keep a
-// silent node alive. resolvedPubkeys already dedups, so no second pass here.
+// Callers pass only unique-prefix results from resolvePath, deduplicated by
+// resolvedPubkeys. Contextual resolution for observations.resolved_path must
+// not refresh liveness for a colliding prefix.
 //
 // Never inserts: the UPDATE matches an existing row or does nothing.
 // Never rewinds: the last_seen guard makes out-of-order ingest a no-op.
@@ -2171,6 +2260,16 @@ func (s *Store) PurgeStaleObservers(purgeDays int) (int64, error) {
 	purged, _ := result.RowsAffected()
 	if purged > 0 {
 		log.Printf("Purged %d inactive observer(s) with no remaining data (not seen in %d days)", purged, purgeDays)
+		// Their radio history goes with them (#1869).
+		if _, err := s.instrumentedExec("purge_observers",
+			`DELETE FROM observer_radios WHERE observer_id NOT IN (SELECT id FROM observers)`); err != nil {
+			log.Printf("[purge] observer radio history: %v", err)
+		}
+		// And so do their /neighbors reports (#2330).
+		if _, err := s.instrumentedExec("purge_observers",
+			`DELETE FROM observer_neighbor_reports WHERE observer_id NOT IN (SELECT id FROM observers)`); err != nil {
+			log.Printf("[purge] observer neighbor reports: %v", err)
+		}
 	}
 	return purged, nil
 }
@@ -2241,6 +2340,7 @@ type PacketData struct {
 	Region            string // observer region: payload > topic > source config (#788)
 	Foreign           bool   // true when ADVERT GPS lies outside configured geofilter (#730)
 	FromPubkey        string // pubkey of the originating node, for exact-match attribution (#1143)
+	RxRadioID         string // multi-radio observer: which of its radios heard it (#1869), "" otherwise
 }
 
 // nilIfEmpty returns nil for empty strings (for nullable DB columns).
@@ -2376,10 +2476,19 @@ func (s *Store) UpdateNodeConfiguredScope(pubkey, scope, reportedAt string) erro
 	// chronological, not lexicographic (see normalizeReportTS). Stored values
 	// are therefore always canonical or empty.
 	reportedAt = normalizeReportTS(reportedAt)
+	// The report's timestamp is chosen by the publisher. Last-write-wins
+	// below means a report stamped far in the future would be written once
+	// and then block every genuine later report, so drop those.
+	if reportTooFarInFuture(reportedAt) {
+		return nil
+	}
 	// Canonicalise the scope syntax for the same reason: a value that is stored
 	// differently from default_scope cannot be compared against it (see
 	// normalizeScopeList).
 	scope = normalizeScopeList(scope)
+	if len(scope) > maxConfiguredScopeLen {
+		return nil
+	}
 	// Last-write-wins: skip if the stored confirmation is newer-or-equal.
 	if reportedAt != "" {
 		var curAt sql.NullString
@@ -2441,8 +2550,9 @@ type MQTTPacketMessage struct {
 	Score     *float64 `json:"score"`
 	Direction *string  `json:"direction"`
 	Origin    string   `json:"origin"`
-	Region    string   `json:"region,omitempty"`    // optional region override (#788)
-	Timestamp string   `json:"timestamp,omitempty"` // observer receive time, resolved by handler
+	Region    string   `json:"region,omitempty"`      // optional region override (#788)
+	Timestamp string   `json:"timestamp,omitempty"`   // observer receive time, resolved by handler
+	RxRadioID string   `json:"rx_radio_id,omitempty"` // multi-radio observer: radio that heard it (#1869)
 }
 
 // BuildPacketData constructs a PacketData from a decoded packet and MQTT message.
@@ -2489,6 +2599,7 @@ func BuildPacketData(msg *MQTTPacketMessage, decoded *DecodedPacket, observerID,
 		PayloadType:    decoded.Header.PayloadType,
 		PayloadVersion: decoded.Header.PayloadVersion,
 		PathJSON:       pathJSON,
+		RxRadioID:      msg.RxRadioID,
 		DecodedJSON:    PayloadJSON(&decoded.Payload),
 	}
 

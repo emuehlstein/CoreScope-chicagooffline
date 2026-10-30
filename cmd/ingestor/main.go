@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -25,6 +26,15 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
+
+// finishIngestStartup keeps required migrations ahead of ingestion, but lets
+// buffered writes use the writer gaps between packet-retention batches.
+// The sweep stays synchronous: this introduces no background shutdown owner.
+func finishIngestStartup(store *Store, ready func(), prunePackets func() (int64, error)) (int64, error) {
+	store.WaitForAsyncMigrations()
+	ready()
+	return prunePackets()
+}
 
 func main() {
 	// pprof profiling — off by default, enable with ENABLE_PPROF=true
@@ -102,6 +112,19 @@ func main() {
 		log.Printf("No channel keys loaded — GRP_TXT packets will not be decrypted")
 	}
 
+	keySet := newChannelKeySet(channelKeys, cfg.UsersDBPath(), cfg.ApprovedChannelsMax())
+	if cfg.ApprovedChannelsEnabled() {
+		logApprovedChannelsSource(cfg.UsersDBPath())
+		keySet.refresh()
+	}
+
+	// Linked-only ingest (clientRxCoverage.requireLinkedCompanion): nil when
+	// off or ignored. Installed before any MQTT source connects.
+	if lc := newLinkedCompanionFilter(cfg); lc != nil {
+		store.linkedCompanions = lc
+		go lc.refreshLoop()
+	}
+
 	regionSet := newRegionKeySet(cfg)
 	if cfg.AutoRegionKeysEnabled() {
 		// Fill the derived tier before the first packet is matched, so a
@@ -112,6 +135,21 @@ func main() {
 	}
 	store.BackfillDefaultScopeAsync(regionSet)
 	store.BackfillTransportCodesAsync()
+
+	// #2107: re-decides unresolved GRP_TXT and scope rows whenever either key
+	// set grows. Built here so the approved-channels refresh can kick it;
+	// started below, once the write path is ready.
+	keyBackfill := newKeyBackfiller(store, keySet, regionSet)
+	if cfg.ApprovedChannelsEnabled() {
+		go func() {
+			t := time.NewTicker(approvedChannelsRefresh)
+			defer t.Stop()
+			for range t.C {
+				keySet.refresh()
+				keyBackfill.Kick() // two small SELECTs unless an approval brought a new key
+			}
+		}()
+	}
 
 	// Subscribe-early + buffer (#1608): the MQTT subscription is brought up
 	// before startup maintenance so no packets are missed while the single
@@ -189,7 +227,7 @@ func main() {
 			markReceiptForTag(tag, time.Now())
 			status.MarkPacket(time.Now())
 			ingestBuffer.Submit(func() {
-				handleMessage(store, tag, src, m, channelKeys, regionSet, cfg)
+				handleMessage(store, tag, src, m, keySet.Snapshot(), regionSet, cfg)
 			})
 		})
 
@@ -253,6 +291,14 @@ func main() {
 		log.Printf("Running — %d MQTT source(s) connected", connectedCount)
 	}
 
+	// Opt-in reach hop index: installs it, or removes it when off (the default).
+	// Here, with the MQTT subscription up and the ingest gate still closed: a
+	// removal holds the single writer for about a minute on a large database,
+	// and the buffer keeps that minute's packets instead of losing them.
+	if err := store.ConfigureObservationHops(cfg.HopIndexDaysOrZero()); err != nil {
+		log.Fatalf("db: hop index: %v", err)
+	}
+
 	// Node retention: move stale nodes to inactive_nodes on startup
 	nodeDays := cfg.NodeDaysOrDefault()
 	store.MoveStaleNodes(nodeDays)
@@ -277,13 +323,14 @@ func main() {
 	// Packet (transmissions) retention: previously lived in cmd/server,
 	// moved to ingestor in #1283 to eliminate cross-process write
 	// contention (SQLITE_BUSY). 0 = disabled.
+	// The initial sweep runs after the ingestion gate opens below.
 	packetDays := cfg.PacketDaysOrZero()
-	if packetDays > 0 {
-		if n, err := store.PruneOldPackets(packetDays); err != nil {
-			log.Printf("[prune] error: %v", err)
-		} else if n > 0 {
-			log.Printf("[prune] startup pruned %d transmissions older than %d days", n, packetDays)
-		}
+
+	// Keep observation_hops bounded to its window (no-op when the index is off).
+	if n, err := store.TrimObservationHops(); err != nil {
+		log.Printf("[hop-index] trim error: %v", err)
+	} else if n > 0 {
+		log.Printf("[hop-index] startup trimmed %d hop rows", n)
 	}
 
 	// Client-RX coverage retention: bound the opt-in coverage tables (#1727).
@@ -333,20 +380,53 @@ func main() {
 		}
 	}
 
+	// Node-name retention: bounds the opt-in client_node_names table.
+	// 0 = disabled.
+	clientNodeNamesDays := cfg.ClientNodeNamesDaysOrZero()
+	if clientNodeNamesDays > 0 {
+		if n, err := store.PruneOldClientNodeNames(clientNodeNamesDays); err != nil {
+			log.Printf("[prune] client_node_names: %v", err)
+		} else if n > 0 {
+			log.Printf("[prune] startup pruned %d client_node_names older than %d days", n, clientNodeNamesDays)
+		}
+	}
+
 	vacuumPages := cfg.IncrementalVacuumPages()
 	store.RunIncrementalVacuum(vacuumPages)
 
-	// Gate open: the synchronous startup writes above cannot return until the
-	// single SQLite writer is free, which means any blocking async migration
-	// (e.g. the CREATE INDEX) has finished. WaitForAsyncMigrations() makes that
-	// explicit. Now drain everything the subscription buffered during startup.
-	store.WaitForAsyncMigrations()
-	ingestBuffer.Ready()
-	if d := ingestBuffer.Dropped(); d > 0 {
-		log.Printf("[ingest-buffer] write path ready; draining backlog (dropped %d during startup — consider raising ingestBufferSize)", d)
-	} else {
-		log.Printf("[ingest-buffer] write path ready; draining backlog (0 dropped)")
+	// Keep all required startup work ahead of the gate. Packet retention is
+	// already chunked and yields the writer between batches; open ingestion
+	// first so buffered MQTT work can actually use those gaps (#2325).
+	if n, err := finishIngestStartup(store, func() {
+		ingestBuffer.Ready()
+		if d := ingestBuffer.Dropped(); d > 0 {
+			log.Printf("[ingest-buffer] write path ready; draining backlog (dropped %d during startup — consider raising ingestBufferSize)", d)
+		} else {
+			log.Printf("[ingest-buffer] write path ready; draining backlog (0 dropped)")
+		}
+	}, func() (int64, error) {
+		return store.PruneOldPackets(packetDays)
+	}); err != nil {
+		log.Printf("[prune] error: %v", err)
+	} else if n > 0 {
+		log.Printf("[prune] startup pruned %d transmissions older than %d days", n, packetDays)
 	}
+	// History recovery must not join the startup readiness wait above.
+	// Its known evidence is a lower bound: old UPSERTs erased some frames.
+	evidenceCtx, stopEvidenceBackfill := context.WithCancel(context.Background())
+	defer stopEvidenceBackfill()
+	if err := store.RunAsyncMigration(evidenceCtx, "advert_route_evidence_v1", store.backfillAdvertEvidence); err != nil {
+		log.Printf("[migration] scheduling advert evidence backfill: %v", err)
+	}
+	// #2107: re-decide unresolved GRP_TXT and scope rows whenever the key set
+	// grows. Starts after the write path is ready, like the evidence backfill
+	// above; it yields the writer between bounded batches.
+	keyBackfillCtx, stopKeyBackfill := context.WithCancel(context.Background())
+	defer stopKeyBackfill()
+	keyBackfillDone := keyBackfill.Start(keyBackfillCtx)
+	// After the gate: ingest is live, the backfill yields to it between chunks.
+	// No-op when the index is off or already covers its window.
+	store.ScheduleObservationHopsBackfill()
 
 	// Daily ticker for node retention
 	retentionTicker := time.NewTicker(1 * time.Hour)
@@ -381,6 +461,19 @@ func main() {
 		}
 	}()
 
+	// Daily trim of the reach hop index, independent of packet retention.
+	if cfg.HopIndexDaysOrZero() > 0 {
+		go func() {
+			for range time.Tick(24 * time.Hour) {
+				if n, err := store.TrimObservationHops(); err != nil {
+					log.Printf("[hop-index] trim error: %v", err)
+				} else if n > 0 {
+					log.Printf("[hop-index] trimmed %d hop rows", n)
+				}
+			}
+		}()
+	}
+
 	// Daily ticker for transmission retention (#1283).
 	var packetRetentionTicker *time.Ticker
 	if packetDays > 0 {
@@ -402,7 +495,7 @@ func main() {
 	// node_declared_regions retention (Task 6) rather than starting a second
 	// ticker — the four flags are independent (0 disables each separately),
 	// so the ticker itself must run when any is set.
-	if clientRxDays > 0 || clientRxObsDays > 0 || clientRfDays > 0 || clientRegionsDays > 0 {
+	if clientRxDays > 0 || clientRxObsDays > 0 || clientRfDays > 0 || clientRegionsDays > 0 || clientNodeNamesDays > 0 {
 		clientRxRetentionTicker := time.NewTicker(24 * time.Hour)
 		go func() {
 			for range clientRxRetentionTicker.C {
@@ -434,6 +527,13 @@ func main() {
 						store.RunIncrementalVacuum(vacuumPages)
 					}
 				}
+				if clientNodeNamesDays > 0 {
+					if n, err := store.PruneOldClientNodeNames(clientNodeNamesDays); err != nil {
+						log.Printf("[prune] client_node_names: %v", err)
+					} else if n > 0 {
+						store.RunIncrementalVacuum(vacuumPages)
+					}
+				}
 			}
 		}()
 		if clientRxDays > 0 {
@@ -448,6 +548,9 @@ func main() {
 		if clientRegionsDays > 0 {
 			log.Printf("[prune] auto-prune enabled: node_declared_regions older than %d days will be removed daily", clientRegionsDays)
 		}
+		if clientNodeNamesDays > 0 {
+			log.Printf("[prune] auto-prune enabled: client_node_names older than %d days will be removed daily", clientNodeNamesDays)
+		}
 	}
 
 	// Derived region keys refresh on their own ticker rather than the daily
@@ -461,6 +564,7 @@ func main() {
 			for range regionRefreshTicker.C {
 				regionSet.refreshFromStore(store)
 				logScopeMatchCounters()
+				keyBackfill.Kick() // no-op unless the refresh brought a new key
 			}
 		}()
 		log.Printf("[regions] auto-derived region keys enabled: refreshing every %v, cap %d", interval, cfg.AutoRegionKeysMaxDerived())
@@ -483,7 +587,8 @@ func main() {
 
 	// Daily planner statistics refresh (#2058), in two parts.
 	//
-	// The routine refresh is staggered 2 minutes past startup for the same reason
+	// The routine refresh runs 24 hours after the previous one, recorded next to
+	// the database (#2146), and is staggered at least 2 minutes past startup for the same reason
 	// as the checkpoint above: it takes the write lock, and by then the initial
 	// ingest burst has passed, so it also sees the rows that burst added.
 	//
@@ -500,17 +605,24 @@ func main() {
 		if analysisLimit < 0 {
 			log.Printf("[analyze] planner statistics refresh disabled (db.analysisLimit=%d)", analysisLimit)
 		} else {
-			analyzeTicker := time.NewTicker(24 * time.Hour)
 			go func() {
 				// Before the stagger, and only on a database that has never been
 				// analyzed: the stagger is a 2 minute window in which the first
 				// query would otherwise run on no statistics at all. A restart
 				// finds sqlite_stat1 already in the file and skips this.
 				store.EnsurePlannerStats(analysisLimit)
-				time.Sleep(2 * time.Minute)
-				store.RefreshPlannerStats(analysisLimit)
-				for range analyzeTicker.C {
-					store.RefreshPlannerStats(analysisLimit)
+				// Each refresh waits until the previous one is 24h old, also
+				// across restarts (#2146): a restart no longer pays a cold
+				// ANALYZE for statistics that are hours old at most.
+				for {
+					wait := nextPlannerStatsRefresh(store.lastPlannerStatsRefresh(), time.Now())
+					log.Printf("[analyze] next planner statistics refresh in %v", wait.Round(time.Minute))
+					time.Sleep(wait)
+					if !store.RefreshPlannerStats(analysisLimit) {
+						// Not recorded, so the next wait would be the 2 minute
+						// stagger; keep the daily rhythm instead of retrying.
+						time.Sleep(plannerStatsInterval)
+					}
 				}
 			}()
 			log.Printf("[analyze] planner statistics refresh scheduled every 24h (analysis_limit=%d)", analysisLimit)
@@ -616,6 +728,13 @@ func main() {
 	<-sig
 
 	log.Println("Shutting down...")
+	stopEvidenceBackfill()
+	stopKeyBackfill()
+	select { // let an in-flight batch commit or roll back cleanly
+	case <-keyBackfillDone:
+	case <-time.After(5 * time.Second):
+		log.Printf("[key-backfill] still running at shutdown; its last committed batch is where it resumes")
+	}
 	retentionTicker.Stop()
 	metricsRetentionTicker.Stop()
 	if packetRetentionTicker != nil {
@@ -804,7 +923,8 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 
 	// Mobile client topics: meshcore/client/{PUBLIC_KEY}/packets (RX coverage),
 	// meshcore/client/{PUBLIC_KEY}/rf (RF environment samples), and
-	// meshcore/client/{PUBLIC_KEY}/regions (declared-region answers). A
+	// meshcore/client/{PUBLIC_KEY}/regions (declared-region answers), and
+	// meshcore/client/{PUBLIC_KEY}/names (a repeater's own name). A
 	// roaming companion reports where it directly heard a node, its own
 	// radio's counters, or a repeater's declared region list; all three are
 	// handled in isolation from the observer/observations path. EMQX ACL
@@ -827,6 +947,11 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 			log.Printf("MQTT [%s] client %.8s blacklisted, dropping", tag, parts[2])
 			return
 		}
+		// Linked-only ingest (clientRxCoverage.requireLinkedCompanion): an
+		// unlinked companion is dropped before any client handler runs.
+		if !store.allowClientPubkey(parts[2]) {
+			return
+		}
 		switch parts[3] {
 		case "packets":
 			if cfg.ClientRxCoverageEnabled() {
@@ -839,6 +964,10 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		case "regions":
 			if cfg.ClientRegionsEnabled() {
 				handleClientRegions(store, cfg, tag, parts[2], msg)
+			}
+		case "names":
+			if cfg.ClientNodeNamesEnabled() {
+				handleClientNodeNames(store, tag, parts[2], msg)
 			}
 		}
 		return
@@ -870,30 +999,18 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		return
 	}
 
-	// Neighbors report topic: meshcore/<region>/<observer_id>/neighbors.
-	// Two independent consumers of the same publication, kept deliberately
-	// separate:
-	//   - handleNeighborsReport (upstream #1865): parses `self` + each
-	//     zero-hop neighbor's OTA scope query result and records CONFIRMED
-	//     region scopes into nodes.configured_scope.
-	//   - extractNeighborReport/UpsertObserverNeighborReport (fork #2):
-	//     the authoritative "who is actually reporting neighbors" signal —
-	//     count/total/truncated bookkeeping on the observers table. Kept
-	//     distinct from neighbor_edges, which is INFERRED from observation
-	//     co-reception by neighbor_builder.go, and distinct from #1865's
-	//     scope-confirmation concern.
-	//
-	// Like /status, the per-source IATA filter does not gate this: it is
-	// observer self-metadata, not packet ingestion.
+	// Neighbors report topic: meshcore/<region>/<observer_id>/neighbors (#1865).
+	// The ESP32 observer firmware emits a periodic neighbor report carrying its
+	// own configured region scopes (`self`) plus, for each zero-hop neighbor,
+	// the scopes fetched via an OTA scope query. Like /status this is observer
+	// metadata (region-independent), so the per-source packet IATA filter below
+	// does not apply.
 	if len(parts) >= 4 && parts[3] == "neighbors" {
-		observerID := parts[2]
-		handleNeighborsReport(store, tag, observerID, msg)
-		if report := extractNeighborReport(msg); report != nil {
-			// Malformed / unrecognized payload shape — don't write a
-			// report timestamp we can't substantiate.
-			if err := store.UpsertObserverNeighborReport(observerID, parts[1], report); err != nil {
-				log.Printf("MQTT [%s] observer neighbors error: %v", tag, err)
-			}
+		handleNeighborsReport(store, tag, parts[2], msg)
+		// #2270/#2271: keep the report itself for the observer pages. A
+		// retained replay must not pose as a fresh report.
+		if err := store.UpsertNeighborReport(clampObserverField(parts[2], maxObserverIDLen), msg, m.Retained(), time.Now()); err != nil {
+			log.Printf("MQTT [%s] neighbors report store error: %v", tag, err)
 		}
 		return
 	}
@@ -903,9 +1020,10 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 	// is region-independent and should be accepted from all observers regardless of
 	// which IATA regions are configured for packet ingestion.
 	if len(parts) >= 4 && parts[3] == "status" {
-		observerID := parts[2]
+		observerID := clampObserverField(parts[2], maxObserverIDLen)
 		name, _ := msg["origin"].(string)
-		iata := parts[1]
+		name = clampObserverField(name, maxObserverTextLen)
+		iata := clampObserverField(parts[1], maxObserverIATALen)
 		meta := extractObserverMeta(msg)
 		// A replayed status message is the broker handing us the observer's
 		// last published snapshot — it is not evidence the observer is alive
@@ -929,6 +1047,9 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		// (which can be stale/skewed even when well-formed). See #1465.
 		if err := store.UpsertObserverAt(observerID, name, iata, meta, ""); err != nil {
 			log.Printf("MQTT [%s] observer status error: %v", tag, err)
+		}
+		if err := store.RecordObserverRadios(observerID, extractRadioReports(msg), time.Now()); err != nil {
+			log.Printf("MQTT [%s] observer radio history error: %v", tag, err)
 		}
 		// Insert metrics sample from status message
 		if meta != nil {
@@ -1000,10 +1121,10 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		observerID := ""
 		region := ""
 		if len(parts) > 2 {
-			observerID = parts[2]
+			observerID = clampObserverField(parts[2], maxObserverIDLen)
 		}
 		if len(parts) > 1 {
-			region = parts[1]
+			region = clampObserverField(parts[1], maxObserverIATALen)
 		}
 		// Fallback to source-level region config when topic has no region (#788)
 		if region == "" && source.Region != "" {
@@ -1057,6 +1178,9 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		}
 		if v, ok := msg["origin"].(string); ok {
 			mqttMsg.Origin = v
+		}
+		if v, ok := msg["rx_radio_id"].(string); ok {
+			mqttMsg.RxRadioID = clampObserverField(strings.TrimSpace(v), maxRadioIDLen)
 		}
 
 		// For ADVERT packets with known coordinates, enforce geo_filter before
@@ -1151,6 +1275,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		// Upsert observer
 		if observerID != "" {
 			origin, _ := msg["origin"].(string)
+			origin = clampObserverField(origin, maxObserverTextLen)
 			// Use effective region: payload > topic > source config (#788)
 			effectiveRegion := region
 			if mqttMsg.Region != "" {
@@ -1402,69 +1527,6 @@ func stripUnitSuffix(s string) string {
 	return s
 }
 
-// NeighborReport is a parsed observer-reported neighbor table from the
-// meshcore/<iata>/<observer>/neighbors topic.
-//
-// Count is the number of entries actually present in this message.
-// Total is the observer's own reported table size (total_neighbors), which
-// can exceed Count when the firmware truncates the payload to fit MTU.
-// Total is nil when the firmware did not send the field.
-type NeighborReport struct {
-	Count     int
-	Total     *int
-	Truncated bool
-}
-
-// extractNeighborReport parses a neighbors-topic payload.
-//
-// Returns nil when the payload has no recognizable neighbors array, so the
-// caller can avoid recording a report timestamp it cannot substantiate. A
-// well-formed report of zero neighbors IS valid and returns Count=0 — that
-// is meaningfully different from "never reported".
-//
-// Firmware shape (MQTTPayloadBuilder.cpp): top-level "neighbors" array of
-// {pubkey, snr, heard_secs_ago, scopes, status}, plus optional
-// total_neighbors / queried_neighbors / truncated.
-func extractNeighborReport(msg map[string]interface{}) *NeighborReport {
-	raw, ok := msg["neighbors"]
-	if !ok {
-		return nil
-	}
-	arr, ok := raw.([]interface{})
-	if !ok {
-		return nil
-	}
-
-	report := &NeighborReport{Count: len(arr)}
-
-	if v := msg["total_neighbors"]; v != nil {
-		if f, ok := toFloat64(v); ok {
-			iv := int(math.Round(f))
-			// Guard against a nonsense total below the entries we can see.
-			if iv >= report.Count {
-				report.Total = &iv
-			}
-		}
-	}
-
-	switch t := msg["truncated"].(type) {
-	case bool:
-		report.Truncated = t
-	case string:
-		report.Truncated = strings.EqualFold(strings.TrimSpace(t), "true")
-	default:
-		if f, ok := toFloat64(msg["truncated"]); ok {
-			report.Truncated = f != 0
-		}
-	}
-	// A total larger than what arrived is truncation regardless of the flag.
-	if report.Total != nil && *report.Total > report.Count {
-		report.Truncated = true
-	}
-
-	return report
-}
-
 // extractObserverMeta extracts hardware metadata from an MQTT status message.
 // Casts battery_mv and uptime_secs to integers (they're always whole numbers).
 func extractObserverMeta(msg map[string]interface{}) *ObserverMeta {
@@ -1472,26 +1534,32 @@ func extractObserverMeta(msg map[string]interface{}) *ObserverMeta {
 	hasData := false
 
 	if v, ok := msg["model"].(string); ok && v != "" {
+		v = clampObserverField(v, maxObserverTextLen)
 		meta.Model = &v
 		hasData = true
 	}
 	if v, ok := msg["firmware"].(string); ok && v != "" {
+		v = clampObserverField(v, maxObserverTextLen)
 		meta.Firmware = &v
 		hasData = true
 	}
 	if v, ok := msg["firmware_version"].(string); ok && v != "" {
+		v = clampObserverField(v, maxObserverTextLen)
 		meta.Firmware = &v
 		hasData = true
 	}
 	if v, ok := msg["client_version"].(string); ok && v != "" {
+		v = clampObserverField(v, maxObserverTextLen)
 		meta.ClientVersion = &v
 		hasData = true
 	}
 	if v, ok := msg["clientVersion"].(string); ok && v != "" {
+		v = clampObserverField(v, maxObserverTextLen)
 		meta.ClientVersion = &v
 		hasData = true
 	}
 	if v, ok := msg["radio"].(string); ok && v != "" {
+		v = clampObserverField(v, maxObserverTextLen)
 		meta.Radio = &v
 		hasData = true
 	}
@@ -1928,6 +1996,12 @@ func handleNeighborsReport(store *Store, tag string, observerID string, msg map[
 		originID = observerID
 	}
 	originID = strings.ToLower(originID)
+	// The report is unauthenticated: any publisher can name any key. Only a
+	// 64-hex node key can match a nodes row, so drop anything else here
+	// instead of running UPDATEs that can never match.
+	if !targetPubkeyRe.MatchString(originID) {
+		originID = ""
+	}
 	if self, ok := msg["self"].(map[string]interface{}); ok && originID != "" {
 		if sc, ok := self["scopes"].(string); ok {
 			if err := store.UpdateNodeConfiguredScope(originID, sc, reportedAt); err != nil {
@@ -1948,7 +2022,7 @@ func handleNeighborsReport(store *Store, tag string, observerID string, msg map[
 		}
 		pubkey, _ := n["pubkey"].(string)
 		pubkey = strings.ToLower(pubkey)
-		if pubkey == "" {
+		if !targetPubkeyRe.MatchString(pubkey) {
 			continue
 		}
 		scopes, _ := n["scopes"].(string)

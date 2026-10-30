@@ -2,6 +2,66 @@
 
 ## [Unreleased]
 
+## [3.16.0] - 2026-10-29
+
+See [docs/release-notes/v3.16.0.md](docs/release-notes/v3.16.0.md) for the full notes. 47 commits since v3.15.0: 23 fix, 9 feat, 6 docs, 2 test, 2 perf, 2 ci, 1 ui, 1 deps, 1 chore.
+
+### Highlights
+- **Relay hops refresh Last Heard only when they can be one node alone** (#2334, #2308, #2298) - the ingestor now uses the same rule as the server, and only flood hops count. On a 1-byte mesh relay hops practically stop refreshing Last Heard (0 of 506,545 one-byte hop instances in a production sample had a unique prefix). "Actively relaying" needs certain evidence (#2336). **Operator awareness required.**
+- **`users.db` migrates to schema v8 with user accounts on** (#2306, #2348) - a v3.15.x binary refuses it afterwards, so keep the pre-upgrade backup for a rollback.
+- **Go 1.26 to build from source, runtime image on Alpine 3.24** (#2297) - dependency updates for security advisories.
+- **Optional personal MQTT logins for observers** (#2306, #2347, #2348, #2349) - per-user broker logins through EMQX hooks, a credentials mail per uploader, and a lock-out of the shared login for moved observers.
+- **Observer neighbour reports and the radio setting per observation** (#2300, #2292) - created automatically; Leaflet and Chart.js are served from `vendor/` instead of unpkg.com (#2299).
+
+No manual migration step: three new analyzer tables are created at the first start.
+
+## [3.15.0] - 2026-10-22
+
+See [docs/release-notes/v3.15.0.md](docs/release-notes/v3.15.0.md) for the full notes. 77 commits since v3.14.0: 27 fix, 23 perf, 19 feat, 3 test, 2 ci, 2 docs, 1 chore.
+
+### Highlights
+- **Last Heard and node status count only certain evidence** (#2261, #2262, closes #2260) - a shared 1-byte relay hop no longer keeps a silent repeater "Active". New status `uncertain`. **Operator awareness required**: statuses, `last_heard` and offline mails change after the upgrade.
+- **`users.db` migrates to schema v6 with user accounts on** (#2174) - a v3.14.x binary refuses it afterwards, so keep the pre-upgrade backup for a rollback.
+- **The ingestor runs a key backfill at every start** (#2133) and refreshes planner statistics at most once per 24 h (#2158).
+- **Optional LoRa radio settings per node** (#2209, #2210), observer TX airtime (#2208), companion linking (#2174 to #2176), adaptive offline mails (#2262).
+- **Packet store memory and request latency** (#2146 and 23 perf commits) - e.g. startup to ready 31 s to 21 s (#2181), `/api/nodes` p95 165.4 to 114.4 ms (#2165).
+
+No manual migration step.
+
+## [3.14.0] - 2026-10-08
+
+See [docs/release-notes/v3.14.0.md](docs/release-notes/v3.14.0.md) for the full notes. 23 commits since v3.13.1: 13 fix, 8 feat, 1 ci, 1 docs.
+
+### Highlights
+- **Optional user accounts, off by default** (#2129, #2130, #2138 to #2141) - accounts and roles, settings sync across devices, an admin area with an audit log, hashtag channel proposals with admin approval, mail notifications for watched nodes, data export and daily `users.db` backups. Setup: `docs/user-guide/accounts.md`.
+- **New limits on unauthenticated endpoints** (#2119, #2120, #2122, #2123, #2127) - requests above them now get 400 or 429 instead of an answer. **Operator awareness required** for API clients that send long `nodes=` lists.
+- **`traffic_share_score` drops after the upgrade and no longer drifts with uptime** (#2117).
+- **Regional `/api/nodes` queries no longer exhaust the database pool** (#2114, #2115) - 154.8 s to 37 ms for an uncached region set.
+
+No manual migration step. With user management off, no new file or table is created.
+
+## [3.13.1] - 2026-10-04
+
+See [docs/release-notes/v3.13.1.md](docs/release-notes/v3.13.1.md) for the full notes. 1 commit since v3.13.0: 1 fix.
+
+### Highlights
+- **Node-discover replies count as coverage** (#2111) - a CoreDrive RX companion's discover replies were dropped from `client_receptions`, so the coverage page showed nothing for them. On a deployment that has had the fix since August they are 44% of coverage rows over 7 days. Replies received before the upgrade are not recovered.
+
+No manual migration step, no configuration change.
+
+## [3.13.0] - 2026-10-04
+
+See [docs/release-notes/v3.13.0.md](docs/release-notes/v3.13.0.md) for the full notes. 16 commits since v3.12.0: 10 fix, 4 test, 2 feat.
+
+### Highlights
+- **The first start backfills advert route evidence in the background, and flood counts read low until it finishes** (#2088) - measured at 24m 1s on 16.8M observations and 36m 23s on 16.5M on a busier host. Startup and ingest do not wait for it. Runs once per database and resumes after a restart. **Operator awareness required.**
+- **Adverts are split by the route they arrived on** (#2088, #2085) - flood, direct with an empty path, or mixed, in Analytics and on node detail.
+- **Path hops are resolved with the observer that heard them** (#2099) - with one per-path warning in the packets list when hops stay ambiguous.
+- **A compact packets table with a Full Names toggle** (#2090).
+- **Channel unread counts and key-only channels survive a list refresh** (#2096).
+
+No manual migration step: `advert_route_evidence` is created at boot.
+
 ## [3.12.0] - 2026-09-26
 
 See [docs/release-notes/v3.12.0.md](docs/release-notes/v3.12.0.md) for the full notes. 29 commits since v3.11.0: 15 fix, 5 test, 3 perf, 3 feat, 2 ci, 1 chore.

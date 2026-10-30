@@ -140,6 +140,8 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
   let _fetchedAt = 0; // #1562: ms epoch when the current `observers` payload was received
   let _loadObserversReqId = 0; // #1563: monotonic id; resolutions older than the latest are discarded
   let obsSkewMap = {}; // observerID → {offsetSec, samples}
+  let obsAirtimeMap = {}; // #661 observerID → tx_airtime_pct_1h
+  let obsAirtimeWarnPct; // #661 duty_cycle_warn_pct from the summary
   let wsHandler = null;
   let refreshTimer = null;
   let regionChangeHandler = null;
@@ -255,6 +257,7 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
     _mqttPanelTeardown = null;
     observers = [];
     obsSkewMap = {};
+    obsAirtimeMap = {};
   }
 
   async function loadObservers(opts) {
@@ -265,13 +268,20 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
     // (or vice versa) with stale data + a misleading "0s ago" pill.
     var myId = ++_loadObserversReqId;
     try {
-      const [data, skewData] = await Promise.all([
+      const [data, skewData, airData] = await Promise.all([
         api('/observers', { ttl: CLIENT_TTL.observers, bust: bust }),
-        api('/observers/clock-skew', { ttl: 30000 }).catch(function() { return []; })
+        api('/observers/clock-skew', { ttl: 30000 }).catch(function() { return []; }),
+        // #661 — rolling 1 h TX airtime; one bulk call, not per observer.
+        api('/observers/metrics/summary?window=1h', { ttl: 30000 }).catch(function() { return {}; })
       ]);
       if (myId !== _loadObserversReqId) return; // stale resolve, newer in-flight
       observers = data.observers || [];
       _fetchedAt = Date.now(); // #1562: stamp freshness for the header label
+      obsAirtimeMap = {};
+      obsAirtimeWarnPct = airData && airData.duty_cycle_warn_pct;
+      ((airData && airData.observers) || []).forEach(function(a) {
+        if (a && a.observer_id) obsAirtimeMap[a.observer_id] = a.tx_airtime_pct_1h;
+      });
       obsSkewMap = {};
       (Array.isArray(skewData) ? skewData : []).forEach(function(s) {
         if (s && s.observerID) obsSkewMap[s.observerID] = s;
@@ -307,6 +317,11 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
   // parallel thresholds, the new ObserversSummary regression test breaks.
   window.observerHealthStatus = healthStatus;
 
+  // #2270: latest /neighbors report, shared with the observer page.
+  function neighborsCell(o) {
+    return window.ObserverNeighbors ? window.ObserverNeighbors.cell(o) : '<span class="text-muted">—</span>';
+  }
+
   function packetBadge(o) {
     const warnIcon = '<svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-warning"></use></svg>';
     const broadcastIcon = '<svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-broadcast"></use></svg>';
@@ -338,67 +353,6 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
     if (d > 0) return `${d}d ${h}h`;
     const m = Math.floor((ms % 3600000) / 60000);
     return h > 0 ? `${h}h ${m}m` : `${m}m`;
-  }
-
-  // Renders the observer-reported MQTT neighbor table cell.
-  //
-  // Tri-state, mirroring the can_relay badge rationale (#1290):
-  //   never reported            → em-dash (blank), NOT "0"
-  //   reported, hears nobody    → "0" + freshness
-  //   reported N                → "N" (+ "of TOTAL" when truncated) + freshness
-  //
-  // Freshness matters more than the raw count here: firmware publishes on a
-  // 24h default interval, so a stale report is the interesting failure mode
-  // (node stopped reporting) and is visually flagged past 48h.
-  function renderNeighborsCell(o) {
-    if (!o || !o.neighbors_last_report_at) {
-      return '<span class="text-muted" title="No neighbors report received. Either mqtt.neighbors is off, the firmware predates the feature, or the first report (24h default interval) has not landed yet.">—</span>';
-    }
-    const ts = new Date(o.neighbors_last_report_at).getTime();
-    const count = (o.neighbors_count != null) ? o.neighbors_count : null;
-    const total = (o.neighbors_total != null) ? o.neighbors_total : null;
-
-    // #1648 M1 forbids emoji / misc-icon codepoints in this file, so the
-    // "report received, no count" case uses the Phosphor sprite instead of a
-    // bare check glyph. The wrapping span carries the descriptive title.
-    let labelHtml;
-    if (count == null && total == null) {
-      labelHtml = '<svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-check"></use></svg>';
-    } else if (o.neighbors_truncated && total != null && count != null && total > count) {
-      labelHtml = escapeHtml(`${count} of ${total}`);
-    } else {
-      labelHtml = escapeHtml(String(total != null ? total : count));
-    }
-
-    let ageStr = '';
-    let stale = false;
-    if (!isNaN(ts)) {
-      const ms = Date.now() - ts;
-      stale = ms > 172800000; // 48h = 2 missed 24h intervals
-      const h = Math.floor(ms / 3600000);
-      if (h < 1) ageStr = `${Math.max(0, Math.floor(ms / 60000))}m`;
-      else if (h < 48) ageStr = `${h}h`;
-      else ageStr = `${Math.floor(h / 24)}d`;
-    }
-
-    const title = escapeHtml(
-      `Observer-reported neighbor table (mqtt.neighbors)`
-      + (total != null ? ` — reported ${total} neighbor(s)` : '')
-      + (o.neighbors_truncated ? `, payload truncated to ${count} entries` : '')
-      + (isNaN(ts) ? '' : `. Last report ${new Date(o.neighbors_last_report_at).toISOString()}`)
-      + (stale ? '. STALE: no report in over 48h (expected every 24h).' : '')
-    );
-
-    // `.text-muted` is the only muted text class in style.css; there is no
-    // `.text-warn`. For the stale case reuse the amber treatment already
-    // defined for .badge-listener so the cell tracks the active palette
-    // instead of hardcoding a hex.
-    const ageHtml = ageStr
-      ? (stale
-          ? ` <span style="font-size:11px;color:var(--transport-badge-fg,#d97706);font-weight:700">${escapeHtml(ageStr)}</span>`
-          : ` <span class="text-muted" style="font-size:11px">${escapeHtml(ageStr)}</span>`)
-      : '';
-    return `<span title="${title}">${labelHtml}${ageHtml}</span>`;
   }
 
   function sparkBar(count, max) {
@@ -444,8 +398,8 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
       <div class="obs-table-scroll table-fluid-wrap"><table class="data-table obs-table" id="obsTable">
         <caption class="sr-only">Observer status and statistics</caption>
         <thead><tr>
-          <th scope="col" data-priority="1" data-sort-key="status" data-type="numeric">Status</th><th scope="col" data-priority="1" data-sort-key="name">Name</th><th scope="col" data-priority="3" data-sort-key="region">Region</th><th scope="col" data-priority="2" data-sort-key="last_seen" data-type="numeric">Last Status</th><th scope="col" data-priority="2" data-sort-key="last_packet_at" data-type="numeric">Last Packet</th>
-          <th scope="col" data-priority="3" data-sort-key="packet_health" data-type="numeric">Packet Health</th><th scope="col" data-priority="4" data-sort-key="packet_count" data-type="numeric">Total Packets</th><th scope="col" data-priority="3" data-sort-key="packets_hour" data-type="numeric">Packets/Hour</th><th scope="col" data-priority="4" data-sort-key="clock_offset" data-type="numeric">Clock Offset</th><th scope="col" data-priority="4" data-sort-key="uptime" data-type="numeric">Uptime</th><th scope="col" data-priority="4" data-sort-key="neighbors" data-type="numeric" title="Observer-reported MQTT neighbor table (mqtt.neighbors). Blank = this observer has never published a neighbors report.">Neighbors</th><th scope="col" data-priority="4" data-sort-key="firmware">Firmware</th><th scope="col" data-priority="4" data-sort-key="client_version">Client</th>
+          <th scope="col" data-priority="1" data-sort-key="status" data-type="numeric">Status</th><th scope="col" data-priority="1" data-sort-key="name">Name</th><th scope="col" data-priority="3" data-sort-key="region">Region</th><th scope="col" data-priority="2" data-sort-key="last_seen" data-type="numeric">Last Status</th><th scope="col" data-priority="2" data-sort-key="last_packet_at" data-type="numeric">Last Packet</th><th scope="col" data-priority="3" data-sort-key="neighbors" data-type="numeric" title="Latest /neighbors report: when it arrived and how many neighbors it named">Neighbors</th>
+          <th scope="col" data-priority="3" data-sort-key="packet_health" data-type="numeric">Packet Health</th><th scope="col" data-priority="4" data-sort-key="packet_count" data-type="numeric">Total Packets</th><th scope="col" data-priority="3" data-sort-key="packets_hour" data-type="numeric">Packets/Hour</th><th scope="col" data-priority="3" data-sort-key="airtime_1h" data-type="numeric" title="TX airtime share over the last hour (duty cycle)">TX 1h</th><th scope="col" data-priority="4" data-sort-key="clock_offset" data-type="numeric">Clock Offset</th><th scope="col" data-priority="4" data-sort-key="uptime" data-type="numeric">Uptime</th><th scope="col" data-priority="4" data-sort-key="firmware">Firmware</th><th scope="col" data-priority="4" data-sort-key="client_version">Client</th>
           <th scope="col" data-priority="1" class="col-compare-select" style="width:32px"><span class="sr-only">Select for compare</span></th>
         </tr></thead>
         <tbody>${filtered.map(o => {
@@ -460,17 +414,11 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
           // NaN last). Empty string ⇒ NaN ⇒ missing-sorts-last.
           const _lastSeenMs  = o.last_seen      ? new Date(o.last_seen).getTime()      : '';
           const _lastPktMs   = o.last_packet_at ? new Date(o.last_packet_at).getTime() : '';
+          const _neighborsMs = o.neighbors_report_at ? new Date(o.neighbors_report_at).getTime() : '';
           const _firstSeenMs = o.first_seen     ? new Date(o.first_seen).getTime()     : 0;
           const _uptimeMs    = _firstSeenMs ? (Date.now() - _firstSeenMs) : '';
           const _skewSec = (obsSkewMap[o.id] && obsSkewMap[o.id].samples)
             ? Math.abs(Number(obsSkewMap[o.id].offsetSec) || 0)
-            : '';
-          // Neighbors sort key: reported table size (prefer the observer's own
-          // total over the possibly-truncated entry count). '' ⇒ NaN ⇒ the
-          // never-reported rows sort last instead of masquerading as zero.
-          const _neighborsSort = o.neighbors_last_report_at
-            ? (o.neighbors_total != null ? o.neighbors_total
-               : (o.neighbors_count != null ? o.neighbors_count : 0))
             : '';
           // #1641 r1 finding #1: Packet Health sortable rank must differ
           // from Last Packet — use the health bucket, not the timestamp.
@@ -481,12 +429,14 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
           return `<tr style="cursor:pointer" tabindex="0" role="row" data-action="navigate" data-value="#/observers/${encodeURIComponent(o.id)}" data-observer-id="${escapeHtml(o.id)}" onclick="location.hash='#/observers/${encodeURIComponent(o.id)}'">
             <td data-value="${_healthRank}"><span class="health-dot ${h.cls}" title="${h.label}">${shapeIcon}</span> ${h.label}</td>
             <td data-testid="obs-cell-name" data-value="${escapeHtml(String(o.name || o.id))}" class="mono">${escapeHtml(o.name || o.id)}${window.ObserversNaiveChip.render(o)}${o.can_relay === false ? ' <span class="badge-listener" title="Firmware reported repeat:off — listener-only; excluded from path-hop disambiguator (issue #1290)">listener</span>' : (o.can_relay === true ? ' <span class="badge-repeater" title="Firmware reported repeat:on — eligible as a path hop">repeater</span>' : '')}</td>
-            <td data-value="${escapeHtml(o.iata || '')}">${o.iata ? `<span class="badge-region">${o.iata}</span>` : '—'}</td>
+            <td data-value="${escapeHtml(o.iata || '')}">${o.iata ? `<span class="badge-region">${escapeHtml(o.iata)}</span>` : '—'}</td>
             <td data-value="${_lastSeenMs}">${timeAgo(o.last_seen)}</td>
             <td data-testid="obs-cell-last-packet" data-value="${_lastPktMs}">${o.last_packet_at ? timeAgo(o.last_packet_at) : '<span class="text-muted">—</span>'}</td>
+            <td data-testid="obs-cell-neighbors" data-value="${_neighborsMs}">${neighborsCell(o)}</td>
             <td data-value="${_healthRank}">${packetBadge(o)}</td>
             <td data-testid="obs-cell-packet-count" data-value="${_packetCount}">${(o.packet_count || 0).toLocaleString()}</td>
             <td data-value="${_packetsHour}">${sparkBar(o.packetsLastHour || 0, maxPktsHr)}</td>
+            <td data-testid="obs-cell-airtime" data-value="${obsAirtimeMap[o.id] != null ? obsAirtimeMap[o.id] : ''}">${window.ObserverAirtime.badge(obsAirtimeMap[o.id], obsAirtimeWarnPct)}</td>
             <td data-value="${_skewSec}">${(function() {
               var sk = obsSkewMap[o.id];
               if (!sk || sk.samples == null || sk.samples === 0) return '<span class="text-muted">—</span>';
@@ -494,7 +444,6 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
               return renderSkewBadge(sev, sk.offsetSec) + ' <span class="text-muted" title="Computed from ' + sk.samples + ' multi-observer packets. Positive = observer ahead of consensus.">(' + sk.samples + ')</span>';
             })()}</td>
             <td data-value="${_uptimeMs}">${uptimeStr(o.first_seen)}</td>
-            <td data-testid="obs-cell-neighbors" data-value="${_neighborsSort}" class="mono">${renderNeighborsCell(o)}</td>
             <td data-testid="obs-cell-firmware" data-value="${escapeHtml(String(o.firmware || ''))}" class="mono"${o.firmware ? ` title="${escapeHtml(String(o.firmware))}"` : ''}>${o.firmware ? escapeHtml(truncateBuildSuffix(String(o.firmware))) : '<span class="text-muted">—</span>'}</td>
             <td data-testid="obs-cell-client-version" data-value="${escapeHtml(String(o.client_version || ''))}" class="mono"${o.client_version ? ` title="${escapeHtml(String(o.client_version))}"` : ''}>${o.client_version ? escapeHtml(String(o.client_version)) : '<span class="text-muted">—</span>'}</td>
             <td class="col-compare-select" onclick="event.stopPropagation()" style="text-align:center">
@@ -595,9 +544,10 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
       (naiveChipHTML ? '<div style="margin-bottom:10px">' + naiveChipHTML + ' <span class="text-muted">Clock is naive — per-packet timing clamped to ingest time. Clears itself 24h after the last skew event.</span></div>' : '') +
       '<dl class="slide-over-dl" style="margin:0;display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-size:13px">' +
         '<dt>Status</dt><dd><span class="health-dot ' + h.cls + '"><svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-circle-fill"></use></svg></span> ' + h.label + '</dd>' +
-        '<dt>Region</dt><dd>' + (o.iata ? '<span class="badge-region">' + o.iata + '</span>' : '—') + '</dd>' +
+        '<dt>Region</dt><dd>' + (o.iata ? '<span class="badge-region">' + escapeHtml(o.iata) + '</span>' : '—') + '</dd>' +
         '<dt>Last status</dt><dd>' + timeAgo(o.last_seen) + '</dd>' +
         '<dt>Last packet</dt><dd>' + (o.last_packet_at ? timeAgo(o.last_packet_at) : '—') + '</dd>' +
+        '<dt>Neighbors</dt><dd>' + neighborsCell(o) + '</dd>' +
         '<dt>Total packets</dt><dd>' + (o.packet_count || 0).toLocaleString() + '</dd>' +
         '<dt>Packets/hr</dt><dd>' + pkts + '</dd>' +
         '<dt>Clock offset</dt><dd>' + skewLine + '</dd>' +

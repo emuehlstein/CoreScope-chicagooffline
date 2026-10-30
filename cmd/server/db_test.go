@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ import (
 )
 
 // setupTestDB creates an in-memory SQLite database with the v3 schema.
-func setupTestDB(t *testing.T) *DB {
+func setupTestDB(t testing.TB) *DB {
 	t.Helper()
 	conn, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
@@ -188,6 +189,33 @@ func seedTestData(t *testing.T, db *DB) {
 		VALUES (2, 1, 15.0, -85, '[]', ?)`, yesterdayEpoch)
 	db.conn.Exec(`INSERT INTO observations (transmission_id, observer_idx, snr, rssi, path_json, timestamp, resolved_path)
 		VALUES (3, 1, 10.0, -92, '["cc"]', ?, '["1122334455667788"]')`, yesterdayEpoch)
+}
+
+// The topology endpoint takes uniqueNodes from CountActiveNodes, so it must
+// count what GetStats reports as totalNodes: nodes seen in the last 7 days.
+func TestCountActiveNodes(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	now := time.Now().UTC()
+	for i, seen := range []time.Time{now.Add(-time.Hour), now.Add(-6 * 24 * time.Hour), now.Add(-8 * 24 * time.Hour)} {
+		db.conn.Exec(`INSERT INTO nodes (public_key, name, last_seen) VALUES (?, ?, ?)`,
+			"pk"+strconv.Itoa(i), "n"+strconv.Itoa(i), seen.Format(time.RFC3339))
+	}
+
+	got, err := db.CountActiveNodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Errorf("CountActiveNodes = %d, want 2 (the node seen 8 days ago is not active)", got)
+	}
+	stats, err := db.GetStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != stats.TotalNodes {
+		t.Errorf("CountActiveNodes = %d, GetStats().TotalNodes = %d", got, stats.TotalNodes)
+	}
 }
 
 func TestGetStats(t *testing.T) {
@@ -1044,7 +1072,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	seedTestData(t, db)
 
 	t.Run("role filter", func(t *testing.T) {
-		nodes, total, _, err := db.GetNodes(50, 0, "repeater", "", "", "", "", "")
+		nodes, total, _, err := db.GetNodes(NodeQuery{Limit: 50, Role: "repeater"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1057,7 +1085,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("search filter", func(t *testing.T) {
-		nodes, _, _, err := db.GetNodes(50, 0, "", "Companion", "", "", "", "")
+		nodes, _, _, err := db.GetNodes(NodeQuery{Limit: 50, Search: "Companion"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1067,7 +1095,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("sort by name", func(t *testing.T) {
-		nodes, _, _, err := db.GetNodes(50, 0, "", "", "", "", "name", "")
+		nodes, _, _, err := db.GetNodes(NodeQuery{Limit: 50, SortBy: "name"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1077,7 +1105,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("sort by packetCount", func(t *testing.T) {
-		nodes, _, _, err := db.GetNodes(50, 0, "", "", "", "", "packetCount", "")
+		nodes, _, _, err := db.GetNodes(NodeQuery{Limit: 50, SortBy: "packetCount"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1087,7 +1115,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("sort by lastSeen", func(t *testing.T) {
-		nodes, _, _, err := db.GetNodes(50, 0, "", "", "", "", "lastSeen", "")
+		nodes, _, _, err := db.GetNodes(NodeQuery{Limit: 50, SortBy: "lastSeen"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1099,7 +1127,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	t.Run("lastHeard filter 30d", func(t *testing.T) {
 		// The filter works by computing since = now - 30d; seed data last_seen may or may not match.
 		// Just verify the filter runs without error.
-		_, _, _, err := db.GetNodes(50, 0, "", "", "", "30d", "", "")
+		_, _, _, err := db.GetNodes(NodeQuery{Limit: 50, LastHeard: "30d"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1107,7 +1135,7 @@ func TestGetNodesFiltering(t *testing.T) {
 
 	t.Run("lastHeard filter various", func(t *testing.T) {
 		for _, lh := range []string{"1h", "6h", "24h", "7d", "30d", "invalid"} {
-			_, _, _, err := db.GetNodes(50, 0, "", "", "", lh, "", "")
+			_, _, _, err := db.GetNodes(NodeQuery{Limit: 50, LastHeard: lh})
 			if err != nil {
 				t.Fatalf("lastHeard=%s failed: %v", lh, err)
 			}
@@ -1115,7 +1143,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("default limit", func(t *testing.T) {
-		nodes, _, _, err := db.GetNodes(0, 0, "", "", "", "", "", "")
+		nodes, _, _, err := db.GetNodes(NodeQuery{Limit: 0})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1125,7 +1153,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("before filter", func(t *testing.T) {
-		_, total, _, err := db.GetNodes(50, 0, "", "", "2026-01-02T00:00:00Z", "", "", "")
+		_, total, _, err := db.GetNodes(NodeQuery{Limit: 50, Before: "2026-01-02T00:00:00Z"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1135,7 +1163,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("offset", func(t *testing.T) {
-		nodes, total, _, err := db.GetNodes(1, 1, "", "", "", "", "", "")
+		nodes, total, _, err := db.GetNodes(NodeQuery{Limit: 1, Offset: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1148,7 +1176,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("region filter SJC", func(t *testing.T) {
-		nodes, total, _, err := db.GetNodes(50, 0, "", "", "", "", "", "SJC")
+		nodes, total, _, err := db.GetNodes(NodeQuery{Limit: 50, Region: "SJC"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1164,7 +1192,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("region filter SFO", func(t *testing.T) {
-		_, total, _, err := db.GetNodes(50, 0, "", "", "", "", "", "SFO")
+		_, total, _, err := db.GetNodes(NodeQuery{Limit: 50, Region: "SFO"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1174,7 +1202,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("region filter multi", func(t *testing.T) {
-		_, total, _, err := db.GetNodes(50, 0, "", "", "", "", "", "SJC,SFO")
+		_, total, _, err := db.GetNodes(NodeQuery{Limit: 50, Region: "SJC,SFO"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1184,7 +1212,7 @@ func TestGetNodesFiltering(t *testing.T) {
 	})
 
 	t.Run("region filter unknown", func(t *testing.T) {
-		_, total, _, err := db.GetNodes(50, 0, "", "", "", "", "", "AMS")
+		_, total, _, err := db.GetNodes(NodeQuery{Limit: 50, Region: "AMS"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1303,7 +1331,7 @@ func TestGetNodesRegionFilterV2(t *testing.T) {
 		VALUES (1, 'obs-v2-1', 'V2 Observer', 10.0, -90, '[]', ?)`, recentEpoch)
 
 	t.Run("v2 region filter match", func(t *testing.T) {
-		nodes, total, _, err := db.GetNodes(50, 0, "", "", "", "", "", "LAX")
+		nodes, total, _, err := db.GetNodes(NodeQuery{Limit: 50, Region: "LAX"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1319,7 +1347,7 @@ func TestGetNodesRegionFilterV2(t *testing.T) {
 	})
 
 	t.Run("v2 region filter no match", func(t *testing.T) {
-		_, total, _, err := db.GetNodes(50, 0, "", "", "", "", "", "JFK")
+		_, total, _, err := db.GetNodes(NodeQuery{Limit: 50, Region: "JFK"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1789,7 +1817,7 @@ func TestNodeTelemetryFields(t *testing.T) {
 	}
 
 	// Test via GetNodes
-	nodes, _, _, err := db.GetNodes(50, 0, "sensor", "", "", "", "", "")
+	nodes, _, _, err := db.GetNodes(NodeQuery{Limit: 50, Role: "sensor"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1890,7 +1918,7 @@ func TestGetMetricsSummary(t *testing.T) {
 		"obs2", t1, -115.0)
 
 	since := now.Add(-24 * time.Hour).Format(time.RFC3339)
-	summary, err := db.GetMetricsSummary(since)
+	summary, err := db.GetMetricsSummary(since, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2220,18 +2248,13 @@ func TestPerObservationRawHexEnrich(t *testing.T) {
 
 	// Check enriched observations
 	for _, obs := range tx.Observations {
-		m := store.enrichObs(obs)
+		m := store.enrichObsWithTx(obs, store.byTxID[obs.TransmissionID])
 		rh, _ := m["raw_hex"].(string)
-		if obs.RawHex != "" {
-			// Observer A: should get per-observation raw_hex
-			if rh != obsAHex {
-				t.Errorf("obs with own raw_hex: got %q, want %q", rh, obsAHex)
-			}
-		} else {
-			// Observer B: should fall back to transmission raw_hex
-			if rh != txHex {
-				t.Errorf("obs without raw_hex: got %q, want %q (tx fallback)", rh, txHex)
-			}
+		ceAssertNoRaw(t, obs)
+		// Hot-store enrichment uses the representative frame for both.
+		// The packet-detail endpoint retrieves original frames separately.
+		if rh != txHex {
+			t.Errorf("obs without raw_hex: got %q, want %q (tx fallback)", rh, txHex)
 		}
 	}
 }
@@ -2602,5 +2625,43 @@ func TestGetChannelsPreviewRespectsRegionFilter(t *testing.T) {
 	}
 	if got := all[0]["lastSender"]; got != "Bob" {
 		t.Errorf("unfiltered preview sender = %v, want Bob (the newest message)", got)
+	}
+}
+
+// #2146: /api/perf counted every row of transmissions, observations, nodes
+// and observers on each call (116 ms for the observations count on an
+// 18M-row database). The counts are cached for perfRowCountsTTL.
+func TestGetDBSizeStatsTypedCachesRowCounts(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	seedTestData(t, db)
+
+	first := db.GetDBSizeStatsTyped().Rows.Transmissions
+	db.conn.Exec(`INSERT INTO transmissions (raw_hex, hash, first_seen) VALUES ('AA', 'perfcache0000001', '2026-01-01T00:00:00Z')`)
+	if got := db.GetDBSizeStatsTyped().Rows.Transmissions; got != first {
+		t.Fatalf("within the TTL the cached count must be served: got %d, want %d", got, first)
+	}
+
+	db.rowCountsMu.Lock()
+	db.rowCountsAt = time.Now().Add(-2 * perfRowCountsTTL)
+	db.rowCountsMu.Unlock()
+	if got := db.GetDBSizeStatsTyped().Rows.Transmissions; got != first+1 {
+		t.Fatalf("after the TTL the count must be refreshed: got %d, want %d", got, first+1)
+	}
+}
+
+// A failed count is not cached, so the next /api/perf counts again.
+func TestGetDBSizeStatsTypedDoesNotCacheFailedCounts(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	if _, err := db.conn.Exec(`DROP TABLE observers`); err != nil {
+		t.Fatal(err)
+	}
+	db.GetDBSizeStatsTyped()
+	db.rowCountsMu.Lock()
+	cached := db.rowCounts != nil
+	db.rowCountsMu.Unlock()
+	if cached {
+		t.Fatal("row counts with a failed COUNT(*) must not be cached")
 	}
 }

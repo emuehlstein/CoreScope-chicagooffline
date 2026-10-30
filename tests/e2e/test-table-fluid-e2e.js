@@ -46,6 +46,13 @@ function expectHidden(pageName, w) {
   return vp ? vp.expectHidden : false;
 }
 
+async function waitForAnalyticsTables(page) {
+  // The initial theme-refresh replaces the Nodes tab's tables. Wait for that
+  // lifecycle event and the handles on the resulting render before measuring.
+  await page.waitForFunction(() => window.__columnResizeThemeReady &&
+    document.querySelector('#analyticsContent .analytics-table .col-resize-handle'));
+}
+
 (async () => {
   const browser = await chromium.launch({
     headless: true,
@@ -54,6 +61,112 @@ function expectHidden(pageName, w) {
   });
 
   console.log(`\n=== #1056 fluid tables E2E against ${BASE} ===`);
+
+  for (const width of [1250, 375]) {
+    await step(`#2217: analytics resize handles stay on their headers at ${width}px`, async () => {
+      const ctx = await browser.newContext({ viewport: { width, height: 900 } });
+      try {
+        await ctx.addInitScript(() => {
+          window.addEventListener('theme-refresh', () => { window.__columnResizeThemeReady = true; }, { once: true });
+        });
+        const page = await ctx.newPage();
+        await page.goto(BASE + '/#/analytics?tab=nodes', { waitUntil: 'domcontentloaded' });
+        await waitForAnalyticsTables(page);
+        const geometry = await page.evaluate(() => ({
+          overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+          handles: Array.from(document.querySelectorAll('#analyticsContent .col-resize-handle')).map(handle => {
+            const header = handle.parentElement;
+            const h = header.getBoundingClientRect(), r = handle.getBoundingClientRect();
+            return { anchored: handle.offsetParent === header, height: r.height,
+              top: r.top - h.top, edge: r.left + r.width / 2 - h.right };
+          }),
+        }));
+        assert(geometry.handles.length > 0, 'expected analytics resize handles');
+        assert(geometry.handles.every(h => h.anchored), 'resize handle has the page as its containing block');
+        assert(geometry.handles.every(h => h.height > 0 && Math.abs(h.top) <= 2 && Math.abs(h.edge) <= 2),
+          'resize handles must follow the header edge: ' + JSON.stringify(geometry.handles));
+        assert(geometry.overflow <= 1, `analytics page overflows by ${geometry.overflow}px`);
+
+        if (width === 1250) {
+          const selector = '#analyticsContent .analytics-table thead th:first-child';
+          const header = page.locator(selector).first();
+          await header.scrollIntoViewIfNeeded();
+          const before = await header.evaluate(th => {
+            const r = th.getBoundingClientRect();
+            return { width: th.offsetWidth, x: r.right - 2, y: r.top + r.height / 2 };
+          });
+          await page.mouse.move(before.x, before.y);
+          await page.mouse.down();
+          await page.mouse.move(before.x + 40, before.y, { steps: 4 });
+          await page.mouse.up();
+          const dragged = await header.evaluate(th => ({
+            width: th.offsetWidth,
+            percent: th.offsetWidth / th.closest('table').offsetWidth * 100,
+            saved: JSON.parse(localStorage.getItem('meshcore-analytics-nodes-0-col-widths')),
+          }));
+          assert(dragged.width > before.width + 20, 'dragging must resize the analytics column');
+          assert(Array.isArray(dragged.saved), 'drag must save column widths');
+          assert(Math.abs(dragged.saved[0] - dragged.percent) < 1, 'saved percentage must match dragged width');
+          await page.reload({ waitUntil: 'domcontentloaded' });
+          await waitForAnalyticsTables(page);
+          const restored = await header.evaluate(th => ({
+            percent: th.offsetWidth / th.closest('table').offsetWidth * 100,
+            anchored: th.querySelector('.col-resize-handle').offsetParent === th,
+          }));
+          assert(Math.abs(restored.percent - dragged.saved[0]) < 1, 'reload must restore the saved column width');
+          assert(restored.anchored, 'restored widths must still anchor the resize handle to its header');
+        }
+      } finally {
+        await ctx.close();
+      }
+    });
+  }
+
+  await step('#2079: responsive columns preserve full-width status and spacer rows', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 375, height: 900 } });
+    try {
+      const page = await ctx.newPage();
+      await page.goto(BASE + '/#/home', { waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(() => !!window.TableResponsive);
+      const result = await page.evaluate(() => {
+        const table = document.createElement('table');
+        table.id = 'responsiveSpanFixture';
+        table.className = 'data-table';
+        table.innerHTML = '<thead><tr><th>Kept</th><th data-priority="5">Hidden</th>' +
+          '<th data-priority="5">Hidden</th><th>Kept</th></tr></thead>' +
+          '<tbody><tr data-normal><td>A</td><td>B</td><td>C</td><td>D</td></tr>' +
+          '<tr data-status="empty"><td colspan="4">No packets found</td></tr>' +
+          '<tr data-status="error"><td colspan="4">Failed to load packets</td></tr>' +
+          '<tr data-status="spacer"><td colspan="4" style="height:48px;padding:0"></td></tr>' +
+          '<tr data-partial><td>A</td><td colspan="2">Partial span</td><td>D</td></tr></tbody>';
+        document.getElementById('app').appendChild(table);
+        window.TableResponsive.apply(table);
+        return {
+          normalHidden: Array.from(table.querySelector('[data-normal]').children)
+            .map(cell => getComputedStyle(cell).display === 'none'),
+          partialHidden: getComputedStyle(table.querySelector('[data-partial] td[colspan]')).display === 'none',
+          status: Array.from(table.querySelectorAll('[data-status]')).map(row => ({
+            name: row.dataset.status,
+            visible: getComputedStyle(row.firstElementChild).display !== 'none',
+            height: row.firstElementChild.getBoundingClientRect().height,
+          })),
+        };
+      });
+      assert(JSON.stringify(result.normalHidden) === '[false,true,true,false]',
+        'ordinary priority cells must still hide: ' + JSON.stringify(result));
+      assert(result.partialHidden, 'a partial span must retain column-index mapping');
+      for (const row of result.status) {
+        assert(row.visible && row.height > 0, row.name + ' full-width row must remain visible');
+      }
+      assert(result.status.find(row => row.name === 'spacer').height >= 48,
+        'virtual-scroll spacer must retain its height');
+      await page.locator('#responsiveSpanFixture .col-hidden-pill').click();
+      assert(await page.locator('#responsiveSpanFixture .col-hidden').count() === 0,
+        'reveal must still restore ordinary and partial-span cells');
+    } finally {
+      await ctx.close();
+    }
+  });
 
   for (const vp of VIEWPORTS) {
     const ctx = await browser.newContext({ viewport: { width: vp.w, height: vp.h } });
@@ -87,6 +200,18 @@ function expectHidden(pageName, w) {
         }, p.tableSel);
         assert(overflow.ok, `table overflows: tableW=${overflow.tableW} wrapW=${overflow.wrapW}`);
       });
+
+      if (p.name === 'nodes') {
+        await step(`${tag}: resize handles preserve sticky headers (#2217)`, async () => {
+          const headers = await page.$$eval('#nodesTable th', ths => ths
+            .filter(th => th.offsetParent !== null && th.querySelector('.col-resize-handle'))
+            .map(th => ({ position: getComputedStyle(th).position,
+              anchored: th.querySelector('.col-resize-handle').offsetParent === th })));
+          assert(headers.length > 0, 'expected visible Nodes resize handles');
+          assert(headers.every(h => h.position === 'sticky' && h.anchored),
+            'Nodes headers must remain sticky and contain their handles: ' + JSON.stringify(headers));
+        });
+      }
 
       await step(`${tag}: +N hidden pill state matches hidden columns`, async () => {
         const info = await page.evaluate((sel) => {

@@ -78,6 +78,8 @@ docker run -d --name corescope \
 | `-e DISABLE_MOSQUITTO=true` | No | Skip the internal Mosquitto broker (use your own) |
 | `-e DISABLE_CADDY=true` | No | Skip the built-in Caddy reverse proxy |
 | `-e MQTT_BROKER=mqtt://host:1883` | No | Override MQTT broker URL |
+| `-e RUN_AS_UID=1000` | No | Run the Go services as this uid instead of root — see [Running the Go services unprivileged](#running-the-go-services-unprivileged) |
+| `-e RUN_AS_GID=1000` | No | Group for `RUN_AS_UID` (defaults to it) |
 
 #### `/app/data/.env` convenience file
 
@@ -91,6 +93,19 @@ MQTT_BROKER=mqtt://my-broker:1883
 ```
 
 The entrypoint sources this file before starting services. This works with any launch method (`docker run`, compose, or manage.sh).
+
+Two exceptions, both because the entrypoint runs this file as root from a
+directory the Go services can write once they run unprivileged:
+
+- `RUN_AS_UID` and `RUN_AS_GID` are never taken from `.env`. Set them with
+  `-e` or in compose's `environment:`.
+- With `RUN_AS_UID` set, `.env` is read only if it is owned by root and
+  writable by no one else (`sudo chown root:root .env && sudo chmod 644 .env`).
+  Otherwise the log says it was skipped, and why. "Owned by root" means uid 0
+  inside the container. With rootless Docker or a user-namespace remap
+  (`userns-remap`), host root is not that uid: look at the owner the container
+  reports (`docker exec <container> stat -c '%u' /app/data/.env`) and give the host
+  file whichever owner id maps to container uid 0.
 
 ### Docker Compose (legacy alternative)
 
@@ -141,6 +156,84 @@ docker run -d --name corescope ... # same flags as before
 ```
 
 Data is preserved in the volume — updates are non-destructive.
+
+### Running the Go services unprivileged
+
+`corescope-server` and `corescope-ingestor` can run as a normal user instead of
+root, so that a code-execution bug in either one does not land as root in a
+container that has your data directory and `config.json` mounted. `supervisord`
+itself stays root, because mosquitto and caddy still need to bind their ports.
+
+It is opt-in, with `RUN_AS_UID`:
+
+| `RUN_AS_UID` | Services run as |
+|--------------|-----------------|
+| unset (the default) | root — as in earlier releases |
+| set | `RUN_AS_UID` / `RUN_AS_GID` |
+
+Nothing about an upgrade changes until you set it: the container does not pick a
+uid for you, and does not change the owner of anything on your host. That is
+deliberate rather than cautious. Every release before this one ran as root, so
+the `meshcore.db` in your data directory — with its `-wal` and `-shm`, `users.db`
+and the backups beside them — is root-owned. Switching user without also handing
+those files over leaves the services unable to write the database, so the switch
+has to be something you ask for.
+
+**To turn it on**, pick the uid you want and restart. Setting `RUN_AS_UID` is
+taken as permission to `chown` the data directory, and what an earlier root-run
+container left in it, to that uid. This happens at every start, so a file
+created there later as root (with `docker exec`, say) is handed over at the
+next restart:
+
+```bash
+docker run -d --name corescope \
+  -e RUN_AS_UID=1000 -e RUN_AS_GID=1000 \
+  -v /your/data:/app/data \
+  ... # same flags as before
+  ghcr.io/kpa-clawbot/corescope:latest
+```
+
+Check which user it picked:
+
+```bash
+docker logs corescope 2>&1 | grep '\[entrypoint\] Go services run as'
+# [entrypoint] Go services run as corescope (uid=1000 gid=1000)
+```
+
+If you would rather the container never `chown` anything, do the hand-over
+yourself first. Then there is nothing left for it to change:
+
+```bash
+docker stop corescope
+sudo chown -R 1000:1000 /your/data     # uid of your own account is usually 1000
+docker start corescope                 # with RUN_AS_UID=1000 set as above
+```
+
+To go back, unset `RUN_AS_UID` and `chown -R root:root /your/data`.
+
+Notes:
+
+- `RUN_AS_GID` defaults to `RUN_AS_UID` when omitted. `RUN_AS_UID=0` is the
+  same as leaving it unset.
+- If the uid already belongs to another account inside the image (`caddy` is
+  uid 100, `mosquitto` 101), that account is used as it is, keeping its own
+  group, and the log says so. Pick a different uid if you need `RUN_AS_GID`
+  honoured.
+- With `RUN_AS_UID` set to a uid the container cannot use, startup fails rather
+  than quietly falling back to root.
+- What the hand-over leaves alone: anything mounted into the data directory on
+  its own, such as `-v ./config.json:/app/data/config.json:ro`, which keeps the
+  owner it has on your host (make sure the uid can read it), and `.env` (see
+  above). Each mount it skips is named in the log.
+- If the hand-over cannot change a file, for example on NFS with
+  `root_squash`, the log says how many and which. Fix their owner on the host.
+- `/app` stays root's. The services write only to the data directory and
+  `/tmp`.
+- A fresh install is root-owned and so starts as root, like any other. Set
+  `RUN_AS_UID` from the first run to avoid a hand-over later.
+
+The uid selection lives in `docker/select-service-user.sh`, with its branches
+covered by `docker/test-select-service-user.sh`.
 
 ---
 
@@ -546,39 +639,79 @@ docker stats corescope
 
 ### Backup
 
-All persistent data lives in `/app/data`. The critical file is the SQLite database:
+Use **`GET /api/backup`** for the telemetry database. It uses SQLite's
+[`VACUUM INTO`](https://www.sqlite.org/lang_vacuum.html) to produce a consistent
+snapshot while the ingestor is running, including committed data in the WAL.
+Do not copy the live `meshcore.db` file: a checkpoint followed by a file copy
+also races new writes. Allow room for a full snapshot in the server's temporary
+directory and at the download destination; large snapshots cost CPU and disk I/O.
+
+When accounts are enabled, sign in as an administrator and open `/api/backup`
+on the same site to download a snapshot. For command-line or scheduled backups,
+configure a strong `apiKey` in `config.json` (at least 16 characters). Create a
+private header file, `~/.config/corescope/backup.header`, containing one line:
+`X-API-Key: <your configured key>`. Set its permissions to `600`; keep the key out
+of shell history, URLs, and scripts checked into Git.
+
+On the backup host, install `curl` and the `sqlite3` CLI. Replace the example
+HTTPS origin below with your instance. The download is published as a `.db`
+only after it is complete, nonempty, and passes SQLite's consistency check:
 
 ```bash
-# Copy from the Docker volume
-docker cp corescope:/app/data/meshcore.db ./backup-$(date +%Y%m%d).db
-
-# Or if using a bind mount
-cp ./data/meshcore.db ./backup-$(date +%Y%m%d).db
+(
+  set -eu
+  umask 077
+  backup_dir="$HOME/corescope-backups"
+  mkdir -p "$backup_dir"
+  tmp=$(mktemp "$backup_dir/corescope-$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX.part")
+  trap 'rm -f "$tmp"' EXIT
+  curl -q --fail --silent --show-error \
+    --header "@$HOME/.config/corescope/backup.header" \
+    --output "$tmp" https://corescope.example.org/api/backup
+  test -s "$tmp"
+  test "$(sqlite3 -readonly "$tmp" 'PRAGMA quick_check;')" = ok
+  mv "$tmp" "${tmp%.part}.db"
+)
 ```
 
-Optional files to back up:
-- `config.json` — custom configuration
-- `theme.json` — custom theme/branding
+This is a point-in-time telemetry snapshot, not continuous replication or a full
+instance backup. Keep protected copies off the CoreScope host, and also preserve:
+- `config.json`, `theme.json`, deployment settings, and any configured keys/secrets.
+- When accounts are enabled, **`users.db` separately**: use the
+  [account backup and restore guide](user-guide/accounts.md#backups), which covers
+  its own snapshot endpoint and scheduled backups. Do not copy that database live.
 
 ### Restore
 
-```bash
-# Stop the container
-docker stop corescope
+1. Verify the downloaded file is nonempty and run
+   `sqlite3 -readonly backup.db 'PRAGMA quick_check;'`; the result must be `ok`.
+   Keep an untouched copy of this snapshot.
+2. Stop **every server and ingestor using the target database**, including any
+   separate instances. For the single-container example, use `docker stop corescope`;
+   for `docker-compose.example.yml`, use
+   `docker compose -f docker-compose.example.yml stop corescope`.
+3. Locate the host directory or named volume mounted at `/app/data`. For the
+   example Compose file, this is `DATA_DIR` (default `./data`). While all database
+   users remain stopped, move the old `meshcore.db` **and any matching `-wal`,
+   `-shm`, and `-journal` files together** into a separate recovery directory.
+   Keep that set intact; never leave an old WAL beside the replacement database.
+4. Copy the checked snapshot into that data mount as `meshcore.db`. Preserve the
+   previous database's owner and permissions so the configured service user can
+   read and write it. Leave configuration, keys, and `users.db` in place.
+5. Start the stopped services (`docker start corescope`, or the matching Compose
+   `start corescope` command). Check the logs, `/api/healthz`, and expected historical
+   packets in the dashboard. Keep the recovery directory until these checks pass.
 
-# Replace the database
-docker cp ./backup.db corescope:/app/data/meshcore.db
-
-# Restart
-docker start corescope
-```
+To roll back, stop all database users again, move the replacement database and
+its sidecars aside, then restore the entire original file set before restarting.
 
 ### Automated backups
 
-```bash
-# cron: daily backup at 3 AM, keep 7 days
-0 3 * * * docker cp corescope:/app/data/meshcore.db /backups/corescope-$(date +\%Y\%m\%d).db && find /backups -name "corescope-*.db" -mtime +7 -delete
-```
+Run the checked-download block above from a private script using cron or a
+systemd timer. Use absolute paths and the backup user's protected header file;
+schedule one run at a time during quieter hours. Alert on nonzero exit status.
+Prune old **completed `.db` snapshots only after a new backup succeeds**, according
+to your retention policy, and periodically test a restore in an isolated instance.
 
 ---
 

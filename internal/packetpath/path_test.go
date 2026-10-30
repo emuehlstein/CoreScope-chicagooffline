@@ -3,6 +3,7 @@ package packetpath
 import (
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -146,5 +147,68 @@ func TestDecodeHopsForPayload_TraceReturnsError(t *testing.T) {
 	}
 	if hops != nil {
 		t.Errorf("expected nil hops for TRACE, got %v", hops)
+	}
+}
+
+// TestHashSize runs the cases shared with pathHashSize in public/app.js
+// (tests/unit/test-frontend-helpers.js reads the same file), so the Go and JS
+// implementations cannot drift apart without one of the two suites failing.
+func TestHashSize(t *testing.T) {
+	data, err := os.ReadFile("../../test-fixtures/path-hash-size-cases.json")
+	if err != nil {
+		t.Fatalf("read shared cases: %v", err)
+	}
+	var fixture struct {
+		Cases []struct {
+			Name string `json:"name"`
+			Raw  string `json:"raw"`
+			Want int    `json:"want"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatalf("parse shared cases: %v", err)
+	}
+	if len(fixture.Cases) == 0 {
+		t.Fatal("shared cases file has no cases")
+	}
+	for _, c := range fixture.Cases {
+		if got := HashSize(c.Raw); got != c.Want {
+			t.Errorf("%s: HashSize(%q) = %d, want %d", c.Name, c.Raw, got, c.Want)
+		}
+	}
+}
+
+// #2225: transport routes put four transport-code bytes before the path
+// byte, so it is byte 5 for routes 0 and 3 and byte 1 for routes 1 and 2.
+func TestPathByte(t *testing.T) {
+	cases := []struct {
+		raw       string
+		wantRoute int
+		wantPB    byte
+		wantOK    bool
+	}{
+		{"1240aabb", RouteDirect, 0x40, true},
+		{"1141aabb", RouteFlood, 0x41, true},
+		{"13aabbccdd40aabb", RouteTransportDirect, 0x40, true},
+		{"13AABBCCDD7FAABB", RouteTransportDirect, 0x7F, true}, // upper-case hex
+		{"10aabbccdd42aabb", RouteTransportFlood, 0x42, true},
+		{"13aabbccdd", RouteTransportDirect, 0, false}, // codes but no path byte
+		{"12", RouteDirect, 0, false},
+		{"", 0, 0, false},
+		{"zz40", 0, 0, false},
+		{"12zz", RouteDirect, 0, false},
+	}
+	for _, c := range cases {
+		route, pb, ok := PathByte(c.raw)
+		if ok != c.wantOK || (ok && (route != c.wantRoute || pb != c.wantPB)) {
+			t.Errorf("PathByte(%q) = (%d, 0x%02X, %v), want (%d, 0x%02X, %v)",
+				c.raw, route, pb, ok, c.wantRoute, c.wantPB, c.wantOK)
+		}
+	}
+}
+
+func TestPathByteDoesNotAllocate(t *testing.T) {
+	if n := testing.AllocsPerRun(100, func() { PathByte("13aabbccdd40aabb") }); n != 0 {
+		t.Errorf("PathByte allocates %v times per call, want 0", n)
 	}
 }

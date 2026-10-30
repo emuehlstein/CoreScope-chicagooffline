@@ -64,11 +64,11 @@ func (s *Server) heardKeyResolverFor(rows []coverageRow) nodeResolver {
 }
 
 // batchResolveHeardKeys resolves many heard_keys (2-3 byte prefixes or full
-// pubkeys) to their canonical (pubkey, name) in a single round-trip per chunk: a
-// UNION ALL of one LIMIT-2 prefix lookup each, so per-key work stays bounded
-// (2 rows) and the whole set costs one query, not N. A unique match returns
-// [pubkey, name]; unknown / ambiguous / blacklisted / hidden-prefix keys (#15,
-// #1181) return [heardKey, ""].
+// pubkeys) to their canonical (pubkey, name) in a single round-trip per chunk
+// (lookupPrefixes), so the whole set costs one query, not N. A unique match
+// returns [pubkey, name], where name falls back to the repeater's own reported
+// name (client_node_names) when nodes has none; unknown / ambiguous /
+// blacklisted / hidden-prefix keys (#15, #1181) return [heardKey, ""].
 func (s *Server) batchResolveHeardKeys(keys []string) map[string][2]string {
 	res := make(map[string][2]string, len(keys))
 	valid := make([]string, 0, len(keys))
@@ -84,60 +84,12 @@ func (s *Server) batchResolveHeardKeys(keys []string) map[string][2]string {
 		}
 		valid = append(valid, k)
 	}
-	// SQLITE_MAX_COMPOUND_SELECT is 500 by default; chunk well under it.
-	const chunk = 200
-	for i := 0; i < len(valid); i += chunk {
-		end := i + chunk
-		if end > len(valid) {
-			end = len(valid)
-		}
-		batch := valid[i:end]
-		parts := make([]string, len(batch))
-		args := make([]interface{}, 0, len(batch)*2)
-		for j, k := range batch {
-			// Parameterized: the prefix flows in as bound args, never interpolated,
-			// so this stays injection-safe regardless of how hexPrefixRe later
-			// evolves. The per-prefix LIMIT 2 lives in a subquery because a bare
-			// LIMIT on a UNION ALL term is a SQLite syntax error.
-			parts[j] = "SELECT * FROM (SELECT ? AS pfx, public_key, COALESCE(name,'') AS nm FROM nodes WHERE public_key LIKE ? LIMIT 2)"
-			args = append(args, k, k+"%")
-		}
-		rows, err := s.db.conn.Query(strings.Join(parts, " UNION ALL "), args...)
-		if err != nil {
-			// Don't fail the request, but don't fail silently either: a swallowed
-			// error here presents as "every name is ambiguous" with no signal.
-			log.Printf("WARN batchResolveHeardKeys: %v", err)
-			for _, k := range batch {
-				res[k] = [2]string{k, ""}
-			}
-			continue
-		}
-		type agg struct {
-			pk, name string
-			cnt      int
-		}
-		acc := map[string]*agg{}
-		for rows.Next() {
-			var pfx, pk, nm string
-			if err := rows.Scan(&pfx, &pk, &nm); err != nil {
-				continue
-			}
-			a := acc[pfx]
-			if a == nil {
-				a = &agg{}
-				acc[pfx] = a
-			}
-			a.cnt++
-			a.pk, a.name = pk, nm
-		}
-		rows.Close()
-		for _, k := range batch {
-			a := acc[k]
-			if a != nil && a.cnt == 1 && !s.cfg.IsBlacklisted(a.pk) && !s.cfg.IsNameHidden(a.name) {
-				res[k] = [2]string{a.pk, a.name}
-			} else {
-				res[k] = [2]string{k, ""}
-			}
+	hits := s.lookupPrefixes(valid)
+	for _, k := range valid {
+		if h, ok := hits[k]; ok && s.visible(h) {
+			res[k] = [2]string{h.pubkey, h.name}
+		} else {
+			res[k] = [2]string{k, ""}
 		}
 	}
 	return res
@@ -157,7 +109,12 @@ func (s *Server) resolveHeardKey(heardKey string) (string, string) {
 // queryCoverageFiltered returns coverage rows within a bbox, optionally filtered
 // by heard node (prefix/pubkey), contributing client (rx_pubkey), and time window
 // (days; 0 = all time). Powers the global and per-observer coverage maps.
-func (s *Server) queryCoverageFiltered(node, rx string, days int, b bbox) ([]coverageRow, error) {
+// rxIn, when non-nil, keeps only receptions by those companions (rx_pubkey,
+// lowercase); an empty non-nil rxIn matches nothing.
+func (s *Server) queryCoverageFiltered(node, rx string, rxIn []string, days int, b bbox) ([]coverageRow, error) {
+	if rxIn != nil && len(rxIn) == 0 {
+		return nil, nil
+	}
 	where := []string{"lat BETWEEN ? AND ?", "lon BETWEEN ? AND ?"}
 	args := []interface{}{b.MinLat, b.MaxLat, b.MinLon, b.MaxLon}
 	if node != "" {
@@ -169,10 +126,7 @@ func (s *Server) queryCoverageFiltered(node, rx string, days int, b bbox) ([]cov
 			args = append(args, c)
 		}
 	}
-	if rx != "" {
-		where = append(where, "rx_pubkey = ?")
-		args = append(args, strings.ToLower(rx))
-	}
+	where, args = appendRxFilter(where, args, "rx_pubkey", rx, rxIn)
 	if days > 0 {
 		since := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
 		where = append(where, "rx_at >= ?")
@@ -184,6 +138,23 @@ func (s *Server) queryCoverageFiltered(node, rx string, days int, b bbox) ([]cov
 	}
 	defer rows.Close()
 	return scanCoverageRows(rows)
+}
+
+// appendRxFilter narrows a client_* table query to one companion (rx) and/or
+// to a set of companions (rxIn, lowercase; see myCompanionPubkeys). col is
+// the table's rx_pubkey column. Callers return early on an empty non-nil rxIn.
+func appendRxFilter(where []string, args []interface{}, col, rx string, rxIn []string) ([]string, []interface{}) {
+	if rx != "" {
+		where = append(where, col+" = ?")
+		args = append(args, strings.ToLower(rx))
+	}
+	if len(rxIn) > 0 {
+		where = append(where, col+" IN ("+sqlPlaceholders(len(rxIn))+")")
+		for _, pk := range rxIn {
+			args = append(args, pk)
+		}
+	}
+	return where, args
 }
 
 // handleRxCoverage serves global (or per-observer via ?rx=) coverage as GeoJSON
@@ -206,6 +177,13 @@ func (s *Server) handleRxCoverage(w http.ResponseWriter, r *http.Request) {
 	if !s.requireClientRxCoverage(w, r) {
 		return
 	}
+	var mine []string
+	if r.URL.Query().Get("mine") == "1" {
+		var ok bool
+		if mine, ok = s.myCompanionPubkeys(w, r); !ok {
+			return
+		}
+	}
 	b, ok := parseBBox(r.URL.Query().Get("bbox"))
 	if !ok {
 		http.Error(w, "bbox required as minLat,minLon,maxLat,maxLon", http.StatusBadRequest)
@@ -217,14 +195,58 @@ func (s *Server) handleRxCoverage(w http.ResponseWriter, r *http.Request) {
 	}
 	days := clampDays(atoiDefault(r.URL.Query().Get("days"), 7))
 	z, _ := strconv.Atoi(r.URL.Query().Get("z"))
-	rows, err := s.queryCoverageFiltered(r.URL.Query().Get("node"), r.URL.Query().Get("rx"), days, b)
+	node, rx := r.URL.Query().Get("node"), r.URL.Query().Get("rx")
+	rows, err := s.queryCoverageFiltered(node, rx, mine, days, b)
 	if err != nil {
 		http.Error(w, "query failed", http.StatusInternalServerError)
 		return
 	}
 	fc := aggregateCoverage(rows, zoomToHexRes(z), s.heardKeyResolverFor(rows))
+	// "Nothing received" cells need the track, so only with the RF sample
+	// stream on; with ?node= the question would be "this node not heard",
+	// which these cells do not answer. Not with ?mine=1 either: the track
+	// query cannot narrow to a set of companions yet.
+	if r.URL.Query().Get("gaps") == "1" && node == "" && mine == nil && s.cfg.ClientRfSamplesEnabled() {
+		track, err := s.queryTrackPoints(rx, days, b)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+		fc.Gaps, fc.GapsTruncated = aggregateGaps(track, rows, zoomToHexRes(z))
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(fc)
+}
+
+// myCompanionPubkeys resolves ?mine=1 to the caller's linked companions
+// (never nil, so an empty list filters everything out). Browser session
+// only: 404 with user management off, 403 for a bearer token (coverage is
+// outside its scope), 401 without a session.
+func (s *Server) myCompanionPubkeys(w http.ResponseWriter, r *http.Request) ([]string, bool) {
+	if s.auth == nil {
+		http.NotFound(w, r)
+		return nil, false
+	}
+	if _, ok := bearerToken(r); ok {
+		writeBearerFail(w, http.StatusForbidden)
+		return nil, false
+	}
+	u, _ := s.auth.currentUser(w, r)
+	if u == nil {
+		writeError(w, http.StatusUnauthorized, "not logged in")
+		return nil, false
+	}
+	links, err := s.auth.st.ListCompanionLinks(u.ID)
+	if err != nil {
+		log.Printf("[users] coverage mine for user #%d: %v", u.ID, err)
+		http.Error(w, "query failed", http.StatusInternalServerError)
+		return nil, false
+	}
+	out := make([]string, 0, len(links))
+	for _, l := range links {
+		out = append(out, l.Pubkey)
+	}
+	return out, true
 }
 
 // --- Leaderboard (top mobile observers) ---

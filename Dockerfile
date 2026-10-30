@@ -65,6 +65,9 @@ COPY internal/prunequeue/ ../../internal/prunequeue/
 COPY internal/perfio/ ../../internal/perfio/
 COPY internal/mbcapqueue/ ../../internal/mbcapqueue/
 COPY internal/lora/ ../../internal/lora/
+COPY internal/users/ ../../internal/users/
+COPY internal/channel/ ../../internal/channel/
+COPY internal/mailer/ ../../internal/mailer/
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/tmp/zig-cache \
@@ -81,6 +84,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # Build ingestor
 WORKDIR /build/ingestor
 COPY cmd/ingestor/go.mod cmd/ingestor/go.sum ./
+COPY internal/channel/ ../../internal/channel/
 COPY internal/geofilter/ ../../internal/geofilter/
 COPY internal/sigvalidate/ ../../internal/sigvalidate/
 COPY internal/packetpath/ ../../internal/packetpath/
@@ -120,9 +124,26 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -o /corescope-decrypt .
 
 # Runtime image
-FROM alpine:3.20
+FROM alpine:3.24
 
 RUN apk add --no-cache mosquitto mosquitto-clients supervisor caddy wget
+
+# Account for the Go services when a deployment opts into running them
+# unprivileged with RUN_AS_UID=1000, the usual choice. Creating it costs
+# nothing when it goes unused, and saves the entrypoint creating one at start.
+#
+# Nothing in the image is given to it here. -H matters for that: without it
+# busybox adduser creates the home directory itself, and /app would be
+# corescope-owned mode 2755 — the setgid bit then giving gid 1000 to /app/data
+# and to every file written into it, which Docker copies into each new named
+# volume. The home field still points at /app; only the directory is left to
+# the WORKDIR below, root-owned as in earlier releases.
+RUN addgroup -S -g 1000 corescope && \
+    adduser -S -u 1000 -G corescope -H -h /app -s /sbin/nologin corescope
+
+# Default: the services run as root, exactly as in earlier releases. The
+# entrypoint overrides this when RUN_AS_UID asks for an unprivileged account.
+ENV CORESCOPE_SERVICE_USER=root
 
 WORKDIR /app
 
@@ -151,6 +172,8 @@ RUN mkdir -p /app/data /var/lib/mosquitto /data/caddy && \
 
 # Entrypoint
 COPY docker/entrypoint-go.sh /entrypoint.sh
+# Sourced by the entrypoint, so deliberately not executable.
+COPY docker/select-service-user.sh /select-service-user.sh
 RUN chmod +x /entrypoint.sh
 
 EXPOSE 80 443 1883

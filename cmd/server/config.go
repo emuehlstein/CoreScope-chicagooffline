@@ -104,6 +104,15 @@ type Config struct {
 
 	Regions map[string]string `json:"regions"`
 
+	// RegionQuickPicks are named groups of region (IATA) codes offered as
+	// one-tap choices in the region filter, e.g. a country's observers. See
+	// NormalizedRegionQuickPicks and config.example.json.
+	RegionQuickPicks []RegionQuickPick `json:"regionQuickPicks,omitempty"`
+
+	// RegionFallback tunes how the /api/nodes region filter places nodes
+	// never heard zero-hop (#1879). See RegionFallbackMaxHops.
+	RegionFallback *RegionFallbackConfig `json:"regionFallback,omitempty"`
+
 	Roles            map[string]interface{} `json:"roles"`
 	HealthThresholds *HealthThresholds      `json:"healthThresholds"`
 	PathTrust        *PathTrustConfig       `json:"pathTrust,omitempty"`
@@ -173,6 +182,25 @@ type Config struct {
 	// ⇒ off; see ClientRxCoverageEnabled.
 	ClientRxCoverage *ClientRxCoverageConfig `json:"clientRxCoverage,omitempty"`
 
+	// ClientRfSamples gates the opt-in RF environment sample stream (companion
+	// radio noise-floor/counters paired with GPS, table client_rf_samples).
+	// This is the same flag cmd/ingestor checks before recording samples;
+	// mirrored here so the server can gate reading them back. Absent/nil ⇒
+	// off; see ClientRfSamplesEnabled.
+	ClientRfSamples *ClientRfSamplesConfig `json:"clientRfSamples,omitempty"`
+
+	// UserManagement gates optional accounts
+	// (docs/specs/2026-10-06-user-management-design.md). Absent/nil means off;
+	// see UserManagementEnabled.
+	UserManagement *UserManagementConfig `json:"userManagement,omitempty"`
+
+	// HashChannels and ChannelKeys are the ingestor's channel configuration,
+	// read here for the names only: a channel proposal for a configured name
+	// is refused (see configuredChannelNames). ChannelKeys drops the key
+	// values while unmarshalling, so the server never holds key material.
+	HashChannels []string        `json:"hashChannels,omitempty"`
+	ChannelKeys  channelKeyNames `json:"channelKeys,omitempty"`
+
 	ResolvedPath  *ResolvedPathConfig  `json:"resolvedPath,omitempty"`
 	NeighborGraph *NeighborGraphConfig `json:"neighborGraph,omitempty"`
 
@@ -185,6 +213,10 @@ type Config struct {
 	// BatteryThresholds: voltage cutoffs for low/critical alerts (#663).
 	BatteryThresholds *BatteryThresholdsConfig `json:"batteryThresholds,omitempty"`
 
+	// DutyCycleWarnPct: rolling 1 h TX airtime share (percent) at which the
+	// RF Health view and observer list warn. 0/missing => 10 (EU g3, #661).
+	DutyCycleWarnPct float64 `json:"dutyCycleWarnPct,omitempty"`
+
 	// Customizer controls operator-side knobs for the in-app customizer modal
 	// (theme/branding/etc.). See CustomizerConfig and issue #1508.
 	Customizer *CustomizerConfig `json:"customizer,omitempty"`
@@ -195,6 +227,10 @@ type Config struct {
 	KnownChannelsURL string `json:"knownChannelsUrl,omitempty"`
 	// Refresh interval in milliseconds. 0/missing => default 24h.
 	KnownChannelsRefreshMs int64 `json:"knownChannelsRefreshMs,omitempty"`
+
+	// LoRa RF parameters per node from the MeshCore map (issue #1268).
+	// OPT-IN: nil or an empty nodesUrl starts no fetch.
+	RfParams *RfParamsConfig `json:"rfParams,omitempty"`
 }
 
 // CustomizerConfig holds operator-side knobs for the in-app customizer modal.
@@ -265,12 +301,36 @@ func (c *Config) GZipEnabled() bool {
 // ClientRxCoverageConfig gates the opt-in mobile client-RX coverage feature.
 type ClientRxCoverageConfig struct {
 	Enabled bool `json:"enabled"`
+	// RequireLinkedCompanion (companion linking): the ingestor drops client
+	// messages from companions no user linked. Only with userManagement.enabled.
+	RequireLinkedCompanion bool `json:"requireLinkedCompanion,omitempty"`
 }
 
 // ClientRxCoverageEnabled reports whether the opt-in mobile client-RX coverage
 // feature is on. Nil config or absent/nil section ⇒ off (the safe default).
 func (c *Config) ClientRxCoverageEnabled() bool {
 	return c != nil && c.ClientRxCoverage != nil && c.ClientRxCoverage.Enabled
+}
+
+// ClientRxRequireLinkedCompanionSet reports whether the operator set
+// clientRxCoverage.requireLinkedCompanion (in effect only with user
+// management on).
+func (c *Config) ClientRxRequireLinkedCompanionSet() bool {
+	return c != nil && c.ClientRxCoverage != nil && c.ClientRxCoverage.RequireLinkedCompanion
+}
+
+// ClientRfSamplesConfig gates the opt-in RF environment sample stream.
+// Mirrors cmd/ingestor's ClientRfSamplesConfig (same JSON section, read by
+// both binaries from the same config.json).
+type ClientRfSamplesConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
+// ClientRfSamplesEnabled reports whether the opt-in RF environment sample
+// stream is on. Nil config or absent/nil section ⇒ off (the safe default),
+// mirroring ClientRxCoverageEnabled.
+func (c *Config) ClientRfSamplesEnabled() bool {
+	return c != nil && c.ClientRfSamples != nil && c.ClientRfSamples.Enabled
 }
 
 // WSCompressionEnabled returns true when WebSocket permessage-deflate is explicitly enabled.
@@ -290,8 +350,10 @@ type NeighborGraphConfig struct {
 
 	// CacheRecomputeIntervalSeconds: cadence for the background
 	// recomputer that rebuilds the default-shape neighbor-graph
-	// response (#1481 P0-1). 0/missing = default 300 (5 min).
-	// Lower = fresher data, more CPU per minute. #1483.
+	// response (#1481 P0-1) and the neighbor graph itself, which
+	// /api/nodes/{pk}/neighbors serves until the next tick (#2221).
+	// 0/missing = default 300 (5 min). Lower = fresher data, and a
+	// full graph build on every tick. #1483.
 	CacheRecomputeIntervalSeconds int `json:"cacheRecomputeIntervalSeconds,omitempty"`
 }
 
@@ -424,9 +486,8 @@ type HealthThresholds struct {
 	InfraSilentHours   float64 `json:"infraSilentHours"`
 	NodeDegradedHours  float64 `json:"nodeDegradedHours"`
 	NodeSilentHours    float64 `json:"nodeSilentHours"`
-	// RelayActiveHours: how recent a path-hop appearance must be for a
-	// repeater to be considered "actively relaying" vs only "alive
-	// (advert-only)". See issue #662. Defaults to 24h.
+	// RelayActiveHours: window for the legacy attributed relay_active API
+	// field and the UI's certain-relay indicator (#2331). Defaults to 24h.
 	RelayActiveHours float64 `json:"relayActiveHours"`
 	// Issue #1552 — observer health classification thresholds (minutes).
 	// Defaults match prior hardcoded behavior in public/observers.js (10/60).
@@ -697,6 +758,7 @@ func (h HealthThresholds) ToClientMs() map[string]int {
 		"infraSilentMs":    int(h.InfraSilentHours * hourMs),
 		"nodeDegradedMs":   int(h.NodeDegradedHours * hourMs),
 		"nodeSilentMs":     int(h.NodeSilentHours * hourMs),
+		"relayActiveMs":    int(h.RelayActiveHours * hourMs),
 		"observerOnlineMs": h.ObserverOnlineMinutes * minMs,
 		"observerStaleMs":  h.ObserverStaleMinutes * minMs,
 	}
@@ -833,6 +895,67 @@ func (c *Config) BlacklistGeneration() uint64 {
 	return c.blacklistGen.Load()
 }
 
+// RegionQuickPick is one named group of region codes for the region filter.
+type RegionQuickPick struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description,omitempty"`
+	Regions     []string `json:"regions"`
+}
+
+// Limits on the configured quick picks, so a typo in config.json cannot put
+// thousands of buttons or codes into every page.
+const (
+	maxRegionQuickPicks       = 20
+	maxRegionQuickPickRegions = 200
+)
+
+// NormalizedRegionQuickPicks returns the configured quick picks, cleaned up:
+// names, descriptions and codes trimmed, codes upper-cased and de-duplicated
+// in their configured order, picks without a name or any code dropped, and at
+// most maxRegionQuickPicks picks of maxRegionQuickPickRegions codes each.
+// Never nil, so the API always answers with a list.
+func (c *Config) NormalizedRegionQuickPicks() []RegionQuickPick {
+	out := []RegionQuickPick{}
+	if c == nil {
+		return out
+	}
+	for _, p := range c.RegionQuickPicks {
+		if len(out) >= maxRegionQuickPicks {
+			break
+		}
+		name := strings.TrimSpace(p.Name)
+		if name == "" {
+			continue
+		}
+		codes := normalizeQuickPickCodes(p.Regions)
+		if len(codes) == 0 {
+			continue
+		}
+		out = append(out, RegionQuickPick{Name: name, Description: strings.TrimSpace(p.Description), Regions: codes})
+	}
+	return out
+}
+
+// normalizeQuickPickCodes trims and upper-cases a pick's codes, drops empty
+// and repeated ones in their configured order, and keeps at most
+// maxRegionQuickPickRegions.
+func normalizeQuickPickCodes(regions []string) []string {
+	seen := make(map[string]bool, len(regions))
+	codes := make([]string, 0, len(regions))
+	for _, r := range regions {
+		code := strings.ToUpper(strings.TrimSpace(r))
+		if code == "" || seen[code] {
+			continue
+		}
+		if len(codes) >= maxRegionQuickPickRegions {
+			break
+		}
+		seen[code] = true
+		codes = append(codes, code)
+	}
+	return codes
+}
+
 // IsBlacklisted returns true if the given public key is in the nodeBlacklist.
 // Hot read path: a single atomic pointer load + map lookup. No locks, no
 // sync.Once. The in-memory set is populated either via SetNodeBlacklist or
@@ -943,6 +1066,26 @@ func SaveGeoFilter(configDir string, gf *GeoFilterConfig) error {
 		return fmt.Errorf("config.json not found in %s", configDir)
 	}
 
+	// Follow a symlink at configPath to the file it points at before the
+	// tmp+rename below. In the Docker image /app/config.json is a symlink to
+	// the bind-mounted /app/data/config.json (docker/entrypoint-go.sh), and
+	// os.Rename onto the link path would replace the link with a regular
+	// file inside the container: the mounted file would keep the old
+	// geo_filter, the saved one would be invisible on the host and would go
+	// away with the container. Resolving first keeps the write atomic and
+	// the result where the operator (and the next container) will read it.
+	//
+	// Unlike the stats file (writeStatsAtomic, refs #1170), replacing a
+	// symlink at the destination is not wanted here: this path is not
+	// world-writable, and the link is one the image itself creates. Only a
+	// regular file is followed, so a link to a device or a fifo is left
+	// alone and handled as before.
+	if resolved, err := filepath.EvalSymlinks(configPath); err == nil && resolved != configPath {
+		if fi, err := os.Lstat(resolved); err == nil && fi.Mode().IsRegular() {
+			configPath = resolved
+		}
+	}
+
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
@@ -970,10 +1113,25 @@ func SaveGeoFilter(configDir string, gf *GeoFilterConfig) error {
 	}
 	out = append(out, '\n')
 
-	// Atomic write: temp file + rename.
+	// Atomic write: temp file + rename. Keep the original file's mode:
+	// config.json holds the API key and broker passwords, and an operator
+	// who made it 0600 should not find it 0644 after a geo-filter save.
+	mode := os.FileMode(0644)
+	orig, origErr := os.Stat(configPath)
+	if origErr == nil {
+		mode = orig.Mode().Perm()
+	}
 	tmp := configPath + ".tmp"
-	if err := os.WriteFile(tmp, out, 0644); err != nil {
+	if err := os.WriteFile(tmp, out, mode); err != nil {
 		return fmt.Errorf("write config: %w", err)
+	}
+	// Keep the owner as well. The image runs the server as root by default,
+	// and without this the rename would hand the operator's bind-mounted
+	// config.json to root:root, which at 0600 they could no longer edit
+	// without sudo. Best effort: a server that may not chown leaves the file
+	// as it was created.
+	if origErr == nil {
+		copyOwner(tmp, orig)
 	}
 	if err := os.Rename(tmp, configPath); err != nil {
 		os.Remove(tmp)
@@ -1023,6 +1181,11 @@ func (c *Config) IsObserverBlacklisted(id string) bool {
 type AnalyticsConfig struct {
 	DefaultIntervalSeconds   int            `json:"defaultIntervalSeconds,omitempty"`
 	RecomputeIntervalSeconds map[string]int `json:"recomputeIntervalSeconds,omitempty"`
+	// PauseWhenIdle skips a scheduled recompute when nothing has read that
+	// endpoint's snapshot since the previous recompute. The first read
+	// after a pause is served the existing snapshot at once and starts a
+	// refresh. Off by default (always recompute on the interval).
+	PauseWhenIdle bool `json:"pauseWhenIdle,omitempty"`
 	// LoRaPreset is the assumed PHY preset used by the relay-airtime-share
 	// metric to compute true Time-on-Air (issue #1768). Defaults to the
 	// EU MeshCore deployment: 869.6 MHz / BW 62.5 kHz / SF 8 / CR 4/5.
@@ -1049,11 +1212,16 @@ func (c *Config) AnalyticsDefaultRecomputeInterval() time.Duration {
 	return 5 * time.Minute
 }
 
+// AnalyticsPauseWhenIdle reports whether idle analytics recomputes are skipped.
+func (c *Config) AnalyticsPauseWhenIdle() bool {
+	return c != nil && c.Analytics != nil && c.Analytics.PauseWhenIdle
+}
+
 // AnalyticsRecomputeIntervals returns the per-endpoint override map.
 // Returns the zero value (all defaults) if the analytics block is
 // absent or empty.
 func (c *Config) AnalyticsRecomputeIntervals() AnalyticsRecomputeIntervals {
-	out := AnalyticsRecomputeIntervals{}
+	out := AnalyticsRecomputeIntervals{PauseWhenIdle: c.AnalyticsPauseWhenIdle()}
 	if c == nil || c.Analytics == nil || c.Analytics.RecomputeIntervalSeconds == nil {
 		return out
 	}
@@ -1074,4 +1242,72 @@ func (c *Config) AnalyticsRecomputeIntervals() AnalyticsRecomputeIntervals {
 	out.ObserversClockSkew = get("observersClockSkew")
 	out.NodesClockSkew = get("nodesClockSkew")
 	return out
+}
+
+// channelKeyNames is config.json channelKeys ({name: hexKey}) reduced to the
+// names; the key values are discarded during unmarshalling. A value that is
+// not an object is ignored with a log line instead of failing: LoadConfig
+// falls back to pure defaults on any parse error, and this field must not
+// change config loading for deployments without channel proposals.
+type channelKeyNames []string
+
+func (n *channelKeyNames) UnmarshalJSON(b []byte) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		log.Printf("[config] channelKeys is not an object; ignoring it for channel-proposal checks")
+		*n = nil
+		return nil
+	}
+	names := make(channelKeyNames, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	*n = names
+	return nil
+}
+
+// configuredChannelNames is the set of channel names the ingestor already
+// decrypts from config.json, normalised as cmd/ingestor's loadChannelKeys
+// does: hashChannels trimmed and prefixed with '#', channelKeys names as
+// written except the well-known casing fix (public becomes Public).
+// Case-sensitive, like the ingestor's key map.
+func (c *Config) configuredChannelNames() map[string]bool {
+	names := map[string]bool{}
+	if c == nil {
+		return names
+	}
+	for _, raw := range c.HashChannels {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if !strings.HasPrefix(name, "#") {
+			name = "#" + name
+		}
+		names[name] = true
+	}
+	for _, name := range c.ChannelKeys {
+		if strings.EqualFold(name, "public") {
+			name = "Public"
+		}
+		names[name] = true
+	}
+	return names
+}
+
+// RegionFallbackConfig is the regionFallback block (#1879).
+type RegionFallbackConfig struct {
+	// MaxHops caps the fallback for nodes never heard zero-hop: a node whose
+	// closest hearing took more hops than this is in no region. Default 3.
+	MaxHops *int `json:"maxHops,omitempty"`
+}
+
+// RegionFallbackMaxHops returns regionFallback.maxHops, or the default
+// (regionFallbackMaxHopsDefault, 3) when it is unset or negative. 0 is valid:
+// only nodes some observer heard over an empty path are placed.
+func (c *Config) RegionFallbackMaxHops() int {
+	if c != nil && c.RegionFallback != nil && c.RegionFallback.MaxHops != nil && *c.RegionFallback.MaxHops >= 0 {
+		return *c.RegionFallback.MaxHops
+	}
+	return regionFallbackMaxHopsDefault
 }

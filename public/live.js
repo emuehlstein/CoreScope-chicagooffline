@@ -17,8 +17,7 @@
   function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
   function statusGreen() { return cssVar('--status-green') || '#22c55e'; }
 
-  let map, wsHandler, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer, clickablePathsLayer, wardrivingLayer;
-  const _wardriveCars = {}; // sender → { marker, ageTimer, expireTimer }
+  let map, wsHandler, nodesLayer, pathsLayer, animLayer, heatLayer, geoFilterLayer, clickablePathsLayer;
   // New animation canvas
   let animCanvas, animCtx;
   let _dprMedia = null;
@@ -307,11 +306,7 @@
     }
     const d = isoLike ? new Date(isoLike) : null;
     const iso = d && isFinite(d.getTime()) ? d.toISOString() : null;
-    const f = formatTimestampWithTooltip(iso, getTimestampMode());
-    const warn = f.isFuture
-      ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>'
-      : '';
-    return `<span class="timestamp-text" title="${escapeHtml(f.tooltip)}">${escapeHtml(f.text)}</span>${warn}`;
+    return renderTimestampHtml(iso);
   }
 
   function initResizeHandler() {
@@ -471,7 +466,7 @@
     loadNodes(targetTs);
 
     // Fetch packets from scrub point forward (ASC order, no limit clipping from the wrong end)
-    fetch(`/api/packets?limit=10000&grouped=false&expand=observations&since=${encodeURIComponent(fetchFrom)}&order=asc`)
+    CSApi.fetch(`/api/packets?limit=10000&grouped=false&expand=observations&since=${encodeURIComponent(fetchFrom)}&order=asc`)
       .then(r => r.json())
       .then(data => {
         const pkts = data.packets || [];
@@ -532,7 +527,7 @@
     // Fetch packets from DB for the time window
     const now = Date.now();
     const from = new Date(now - ms).toISOString();
-    fetch(`/api/packets?limit=${window.LIVE_MAP_MAX_NODES}&grouped=false&expand=observations&since=${encodeURIComponent(from)}`)
+    CSApi.fetch(`/api/packets?limit=${window.LIVE_MAP_MAX_NODES}&grouped=false&expand=observations&since=${encodeURIComponent(from)}`)
       .then(r => r.json())
       .then(data => {
         const pkts = (data.packets || []).reverse(); // oldest first
@@ -606,7 +601,7 @@
     if (!last) return Promise.resolve(false);
     var gen = VCR.replayGen;
     const since = new Date(last.ts + 1).toISOString(); // +1ms to avoid dupe
-    return fetch(`/api/packets?limit=10000&grouped=false&expand=observations&since=${encodeURIComponent(since)}&order=asc`)
+    return CSApi.fetch(`/api/packets?limit=10000&grouped=false&expand=observations&since=${encodeURIComponent(since)}&order=asc`)
       .then(r => r.json())
       .then(data => {
         const pkts = data.packets || [];
@@ -997,7 +992,7 @@
     if (scopeMs === VCR.timelineFetchedScope) return;
     const since = new Date(Date.now() - scopeMs).toISOString();
     try {
-      const resp = await fetch(`/api/packets/timestamps?since=${encodeURIComponent(since)}`);
+      const resp = await CSApi.fetch(`/api/packets/timestamps?since=${encodeURIComponent(since)}`);
       if (resp.ok) {
         const timestamps = await resp.json(); // array of ISO strings
         VCR.timelineTimestamps = timestamps.map(t => new Date(t).getTime());
@@ -1401,7 +1396,7 @@
     let mapCenter = [37.45, -122.0];
     let mapZoom = 9;
     try {
-      const mapCfg = await (await fetch('/api/config/map')).json();
+      const mapCfg = await (await CSApi.fetch('/api/config/map')).json();
       if (Array.isArray(mapCfg.center) && mapCfg.center.length === 2) mapCenter = mapCfg.center;
       if (typeof mapCfg.zoom === 'number') mapZoom = mapCfg.zoom;
     } catch { }
@@ -1550,35 +1545,124 @@
     }
     _rebindDPRListener();
 
-    const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-      (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    
-    // Use CO_BASEMAP if available for consistent basemap selection across pages
-    if (window.CO_BASEMAP) {
-      window.CO_BASEMAP.init(map, isDark);
-      // Watch for theme changes and update basemap
-      const _themeObs = new MutationObserver(function () {
-        const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-          (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-        window.CO_BASEMAP.onThemeChange(dark);
-      });
-      _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
-    } else {
-      let tileLayer = L.tileLayer(isDark ? TILE_DARK : TILE_LIGHT, { maxZoom: 19 }).addTo(map);
-      // Swap tiles when theme changes
-      const _themeObs = new MutationObserver(function () {
-        const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-          (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-        tileLayer.setUrl(dark ? TILE_DARK : TILE_LIGHT);
-      });
-      _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    const isDark = window.MC_isDarkTheme();
+    // #1420 — multi-provider dark-tile picker. Light mode unchanged (live page).
+    let _liveDarkRefLayer = null;
+    // Single shared registry resolver (map-tile-providers.js loads before this
+    // file; there is deliberately no second fallback body here — AGENTS.md DRY).
+    function _liveResolveTile(dark) {
+      const r = window.MC_resolveTile(!!dark);
+      return { url: r.url, attribution: r.attribution, refUrl: r.refUrl, maxZoom: r.maxZoom };
     }
+    const liveAutoLayerGroup = L.layerGroup().addTo(map);
+
+    function _liveSyncDarkTiles(dark) {
+      const r = _liveResolveTile(dark);
+      tileLayer.setUrl(r.url);
+      if (tileLayer.options) tileLayer.options.attribution = r.attribution;
+      if (dark && r.refUrl) {
+        if (!_liveDarkRefLayer) {
+          _liveDarkRefLayer = L.tileLayer(r.refUrl, { maxZoom: 19, attribution: r.attribution }).addTo(liveAutoLayerGroup);
+        } else {
+          _liveDarkRefLayer.setUrl(r.refUrl);
+          if (!liveAutoLayerGroup.hasLayer(_liveDarkRefLayer)) _liveDarkRefLayer.addTo(liveAutoLayerGroup);
+        }
+      } else if (_liveDarkRefLayer) {
+        liveAutoLayerGroup.removeLayer(_liveDarkRefLayer);
+        _liveDarkRefLayer = null;
+      }
+      if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
+      // #1420 parity with map.js — refresh visible attribution credit after provider swap.
+      // Make sure the map is loaded before trying to update the ui
+      if (map && map.attributionControl) {
+        try { map.attributionControl._update && map.attributionControl._update(); } catch (_) {}
+      }
+    }
+    const _liveInitTile = _liveResolveTile(isDark);
+    let tileLayer = L.tileLayer(_liveInitTile.url, { maxZoom: _liveInitTile.maxZoom || 19, attribution: _liveInitTile.attribution }).addTo(liveAutoLayerGroup);
+    if (isDark && _liveInitTile.refUrl) {
+      _liveDarkRefLayer = L.tileLayer(_liveInitTile.refUrl, { maxZoom: _liveInitTile.maxZoom || 19, attribution: _liveInitTile.attribution }).addTo(liveAutoLayerGroup);
+    }
+    if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
+  
+    // Add Zoom Control
     L.control.zoom({ position: 'topright' }).addTo(map);
 
+    // Add Layer Control, passing 'topright' to put it on the right
+    if (typeof window.MC_createLayerControl === 'function') {
+      window.MC_createLayerControl(map, liveAutoLayerGroup, 'topright');
+    }
+
+    // Add custom Leaflet Control for Fullscreen
+    const LiveFullscreenControl = L.Control.extend({
+      options: { position: 'topright' },
+      onAdd: function() {
+        const container = L.DomUtil.create('div', 'leaflet-bar leaflet-control live-leaflet-toggle');
+        const btn = L.DomUtil.create('a', '', container);
+        btn.href = 'javascript:void(0)';
+        btn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-arrows-out"/></svg>';
+        btn.id = 'liveFullscreenToggle';
+        btn.title = 'Fullscreen (F)';
+        btn.setAttribute('aria-label', 'Toggle fullscreen');
+        btn.setAttribute('role', 'button');
+        btn.setAttribute('aria-pressed', 'false');
+        L.DomEvent.disableClickPropagation(btn);
+        return container;
+      }
+    });
+    map.addControl(new LiveFullscreenControl());
+
+    // Add custom Leaflet Control for Settings
+    const LiveSettingsControl = L.Control.extend({
+      options: { position: 'topright' },
+      onAdd: function() {
+        const container = L.DomUtil.create('div', 'leaflet-bar leaflet-control live-leaflet-toggle');
+        const btn = L.DomUtil.create('a', 'live-controls-toggle', container);
+        btn.href = 'javascript:void(0)';
+        btn.innerHTML = '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-gear"/></svg>';
+        btn.id = 'liveControlsToggle';
+        btn.setAttribute('data-live-controls-toggle', '');
+        btn.title = 'Settings';
+        btn.setAttribute('aria-label', 'Show live controls');
+        btn.setAttribute('role', 'button');
+        btn.setAttribute('aria-expanded', 'false');
+        btn.setAttribute('aria-controls', 'liveControlsBody');
+        L.DomEvent.disableClickPropagation(btn);
+        return container;
+      }
+    });
+    map.addControl(new LiveSettingsControl());
+
+
+
+    // Swap tiles when theme changes
+    const _themeObs = new MutationObserver(function () {
+      _liveSyncDarkTiles(window.MC_isDarkTheme());
+    });
+    _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    // #1420 — re-render on customizer change.
+    window.addEventListener('mc-tile-provider-changed', function (e) {
+      const dark = window.MC_isDarkTheme();
+      if (e && e.detail && e.detail.type && e.detail.type !== (dark ? 'dark' : 'light')) return;
+      _liveSyncDarkTiles(dark);
+    });
+
+    // #1485 — animations + trails need their own pane above markerPane.
+    // PR #1334 moved node markers from L.circleMarker (overlayPane @ 400)
+    // to L.marker+divIcon (markerPane @ 600); animations stayed in the
+    // default overlayPane and were occluded by every node marker. Custom
+    // pane @ 650 puts them strictly above all nodes. (tooltipPane shares
+    // 650 — tooltips are user-triggered, harmless to share.)
+    map.createPane('liveAnimPane');
+    map.getPane('liveAnimPane').style.zIndex = 650;
+    // Pointer-events default to none so the pane doesn't steal clicks
+    // from the marker pane underneath (clickablePathsLayer handles that).
+    map.getPane('liveAnimPane').style.pointerEvents = 'none';
+
     nodesLayer = L.layerGroup().addTo(map);
-    pathsLayer = L.layerGroup().addTo(map);
-    animLayer = L.layerGroup().addTo(map);
-    wardrivingLayer = L.layerGroup().addTo(map);
+    pathsLayer = L.layerGroup({ pane: 'liveAnimPane' }).addTo(map);
+    animLayer = L.layerGroup({ pane: 'liveAnimPane' }).addTo(map);
+    clickablePathsLayer = L.layerGroup().addTo(map);
 
     injectSVGFilters();
     AreaFilter.init(document.getElementById('liveAreaFilter'));
@@ -1628,7 +1712,7 @@
       // (cmd/server/types.go ObserverListResponse) — NOT a top-level array.
       // Bug #1136: previously parsed as array → map empty → region filter
       // dropped every packet.
-      fetch('/api/observers').then(function(r) { return r.json(); }).then(function(data) {
+      CSApi.fetch('/api/observers').then(function(r) { return r.json(); }).then(function(data) {
         setObserverIataMap(buildObserverIataMap(data));
       }).catch(function() { /* leave map empty; filter will hide all when active */ });
       RegionFilter.init(rfEl, { dropdown: true });
@@ -1723,7 +1807,7 @@
         if (!nodeFilterDropdown) return;
         if (!q || q.length < 1) { hideDropdown(); return; }
         try {
-          const resp = await fetch('/api/nodes/search?q=' + encodeURIComponent(q));
+          const resp = await CSApi.fetch('/api/nodes/search?q=' + encodeURIComponent(q));
           if (!resp.ok) { hideDropdown(); return; }
           const data = await resp.json();
           const nodes = (data && data.nodes) || [];
@@ -2225,10 +2309,10 @@
     if (urlVp) {
       map.setView([urlVp.lat, urlVp.lon], urlVp.zoom);
     } else {
-    const savedView = localStorage.getItem('live-map-view');
-    if (savedView) {
-      try { const v = JSON.parse(savedView); map.setView([v.lat, v.lng], v.zoom); } catch {}
-    }
+      const savedView = localStorage.getItem('live-map-view');
+      if (savedView) {
+        try { const v = JSON.parse(savedView); map.setView([v.lat, v.lng], v.zoom); } catch {}
+      }
     }
     map.on('moveend', () => {
       const c = map.getCenter();
@@ -2505,10 +2589,15 @@
       const roleColor = ROLE_COLORS[n.role] || '#6b7280';
       const roleLabel = (ROLE_LABELS[n.role] || n.role || 'unknown').replace(/s$/, '');
       const hasLoc = n.lat != null && n.lon != null;
-      const lastSeen = formatLiveTimestampHtml(n.last_seen);
-      const health = getHealthStatus(n.role, n.last_seen);
-      const statusDot = health === 'healthy' ? 'health-green' : health === 'degraded' ? 'health-yellow' : 'health-red';
-      const statusLabel = health === 'healthy' ? 'Online' : health === 'degraded' ? 'Degraded' : 'Offline';
+      // Both endpoints carry certain activity; use the newest without changing
+      // the cached node. Shared-prefix relay traffic alone remains uncertain.
+      const activityNode = Object.assign({}, n, { _lastHeard: stats.lastHeard });
+      const heardMs = window.getEffectiveHeardMs(activityNode);
+      const lastActivity = formatLiveTimestampHtml(heardMs);
+      const health = getHealthStatus(n.role, heardMs);
+      const uncertain = getNodeStatus(activityNode) === 'uncertain';
+      const statusDot = uncertain ? 'text-muted' : health === 'healthy' ? 'health-green' : health === 'degraded' ? 'health-yellow' : 'health-red';
+      const statusLabel = uncertain ? 'Uncertain' : health === 'healthy' ? 'Online' : health === 'degraded' ? 'Degraded' : 'Offline';
 
       let html = `
         <div style="padding:16px;">
@@ -2524,7 +2613,7 @@
             <code style="font-size:10px;word-break:break-all;">${escapeHtml(n.public_key)}</code>
           </div>
           <table style="font-size:12px;width:100%;border-collapse:collapse;">
-            <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Last Seen</td><td>${lastSeen}</td></tr>
+            <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Last Activity</td><td>${lastActivity}</td></tr>
             <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Adverts</td><td>${n.advert_count || 0}</td></tr>
             ${'configured_scope' in n && n.configured_scope !== null ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;" title="Region scopes this node has configured, confirmed via an observer /neighbors report (status=responded) — concrete evidence (#1865).${n.configured_scope_at ? ' Last confirmed ' + escapeHtml(String(n.configured_scope_at)) + '.' : ''}">Configured scope <span style="color:var(--status-green-text)" role="img" aria-label="confirmed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check"/></svg></span></td><td>${n.configured_scope === '' ? '<span style="color:var(--text-muted)">none configured</span>' : `<code style="color:var(--link-color)">${escapeHtml(n.configured_scope)}</code>`}</td></tr>` : ''}
             ${'default_scope' in n ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Scope</td><td>${n.default_scope === null ? '<span style="color:var(--text-muted)">—</span>'
@@ -2712,7 +2801,7 @@
 
   async function fetchAffinityData() {
     try {
-      const resp = await fetch('/api/analytics/neighbor-graph');
+      const resp = await CSApi.fetch('/api/analytics/neighbor-graph');
       const graph = await resp.json();
       if (window.HopResolver && HopResolver.setAffinity) {
         HopResolver.setAffinity(graph);
@@ -3176,7 +3265,7 @@
   async function replayRecent() {
     try {
       // Single bulk fetch with expand=observations — no N+1 calls
-      const resp = await fetch('/api/packets?limit=8&expand=observations');
+      const resp = await CSApi.fetch('/api/packets?limit=8&expand=observations');
       const data = await resp.json();
       const groups = (data.packets || []).reverse();
 
@@ -3321,81 +3410,6 @@
       }
     }
     const _el2 = document.getElementById('liveNodeCount'); if (_el2) _el2.textContent = Object.keys(nodeMarkers).length;
-
-    // --- Wardriving car markers — parse @[MapperBot] pings from #wardriving channel ---
-    (function () {
-      var _wdDecoded = first.decoded || {};
-      // DB-loaded packets nest fields under .payload; WS packets have them directly on .decoded
-      var _wdPayload = _wdDecoded.payload || _wdDecoded;
-      var _wdChan = _wdPayload.channel || '';
-      if (!_wdChan || _wdChan.toLowerCase() !== '#wardriving') return;
-      var _wdMatch = (_wdPayload.text || '').match(/@\[MapperBot\]\s*([\-\d.]+),\s*([\-\d.]+)/);
-      if (!_wdMatch) return;
-      var _wdLat = parseFloat(_wdMatch[1]), _wdLon = parseFloat(_wdMatch[2]);
-      if (isNaN(_wdLat) || isNaN(_wdLon)) return;
-      var _wdSender = _wdPayload.sender || 'unknown';
-
-      function _wdGhostIcon(color) {
-        var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="28" viewBox="0 0 24 28">'
-          + '<path d="M12 1C7 1 3 5 3 10L3 23Q5 20.5 6.5 23Q8 20.5 9.5 23Q11 20.5 12 23Q13 20.5 14.5 23Q16 20.5 17.5 23Q19 20.5 21 23L21 10C21 5 17 1 12 1Z" '
-          + 'fill="' + color + '" fill-opacity="0.9" stroke="#fff" stroke-width="1"/>'
-          + '<circle cx="9" cy="9.5" r="2" fill="#fff"/><circle cx="15" cy="9.5" r="2" fill="#fff"/>'
-          + '<circle cx="9.7" cy="9.2" r="1" fill="#000"/><circle cx="15.7" cy="9.2" r="1" fill="#000"/>'
-          + '</svg>';
-        return L.divIcon({
-          className: '',
-          html: '<div style="filter:drop-shadow(0 0 4px ' + color + ');" title="' + _wdSender + '">' + svg + '</div>',
-          iconSize: [24, 28],
-          iconAnchor: [12, 24],
-        });
-      }
-
-      // Compute age relative to VCR reference time (replay-safe)
-      var _wdPktTs = first._ts || (first.timestamp ? new Date(first.timestamp).getTime() : 0) || Date.now();
-      var _wdNow = VCR.frozenNow || Date.now();
-      var _wdAge = _wdNow - _wdPktTs;
-      var _wdExpireMs = 300000; // 5 min
-      var _wdAgeMs = 60000;     // 60s until orange
-
-      // In LIVE mode, skip truly old packets; in replay, show everything
-      if (VCR.mode === 'LIVE' && _wdAge >= _wdExpireMs) return;
-
-      // Pick initial color based on age (clamp negative ages to fresh)
-      if (_wdAge < 0) _wdAge = 0;
-      var _wdColor = _wdAge >= _wdAgeMs ? '#FFB300' : '#39FF14';
-
-      if (_wardriveCars[_wdSender]) {
-        clearTimeout(_wardriveCars[_wdSender].ageTimer);
-        clearTimeout(_wardriveCars[_wdSender].expireTimer);
-        _wardriveCars[_wdSender].marker.setLatLng([_wdLat, _wdLon]);
-        _wardriveCars[_wdSender].marker.setIcon(_wdGhostIcon(_wdColor));
-      } else {
-        var _wdMarker = L.marker([_wdLat, _wdLon], { icon: _wdGhostIcon(_wdColor), zIndexOffset: 500 })
-          .bindTooltip(_wdSender, { permanent: false, direction: 'top' })
-          .addTo(wardrivingLayer);
-        _wardriveCars[_wdSender] = { marker: _wdMarker };
-      }
-
-      // Timers only apply in LIVE mode — during replay, markers persist until cleared
-      if (VCR.mode === 'LIVE') {
-        // Orange after 60s (only if not already stale)
-        var _wdAgeRemaining = _wdAgeMs - _wdAge;
-        if (_wdAgeRemaining > 0) {
-          _wardriveCars[_wdSender].ageTimer = setTimeout(function() {
-            if (_wardriveCars[_wdSender]) _wardriveCars[_wdSender].marker.setIcon(_wdGhostIcon('#FFB300'));
-          }, _wdAgeRemaining);
-        }
-
-        // Remove after 5min
-        var _wdExpireRemaining = Math.max(0, _wdExpireMs - _wdAge);
-        _wardriveCars[_wdSender].expireTimer = setTimeout(function() {
-          if (_wardriveCars[_wdSender]) {
-            if (wardrivingLayer) wardrivingLayer.removeLayer(_wardriveCars[_wdSender].marker);
-            delete _wardriveCars[_wdSender];
-          }
-        }, _wdExpireRemaining);
-      }
-    })();
 
     // --- Build consolidated packet for feed + audio ---
     const consolidated = Object.assign({}, first, { observation_count: obsCount });

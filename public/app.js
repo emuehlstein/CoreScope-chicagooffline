@@ -3,11 +3,10 @@
 
 // --- Route/Payload name maps ---
 const ROUTE_TYPES = { 0: 'TRANSPORT_FLOOD', 1: 'FLOOD', 2: 'DIRECT', 3: 'TRANSPORT_DIRECT' };
-const PAYLOAD_TYPES = { 0: 'Request', 1: 'Response', 2: 'Direct Msg', 3: 'ACK', 4: 'Advert', 5: 'Channel Msg', 6: 'Group Data', 7: 'Anon Req', 8: 'Path', 9: 'Trace', 10: 'Multipart', 11: 'Control', 15: 'Raw Custom' };
 const PAYLOAD_COLORS = { 0: 'req', 1: 'response', 2: 'txt-msg', 3: 'ack', 4: 'advert', 5: 'grp-txt', 6: 'grp-data', 7: 'anon-req', 8: 'path', 9: 'trace', 10: 'multipart', 11: 'control', 15: 'raw-custom' };
 
 function routeTypeName(n) { return ROUTE_TYPES[n] || 'UNKNOWN'; }
-function payloadTypeName(n) { return PAYLOAD_TYPES[n] || 'UNKNOWN'; }
+function payloadTypeName(n) { return window.PayloadLabels.api.shortById(n) || 'UNKNOWN'; }
 function payloadTypeColor(n) { return PAYLOAD_COLORS[n] || 'unknown'; }
 function isTransportRoute(rt) { return rt === 0 || rt === 3; }
 /** Byte offset of path_len in raw_hex: 5 for transport routes (4 bytes of next/last hop codes precede it), 1 otherwise. */
@@ -131,11 +130,49 @@ const CLIENT_TTL = {
   nodeAnalytics: 60000, nodeSearch: 10000
 };
 // Fetch server cache config and use as client TTLs (server values are in seconds)
-fetch('/api/config/cache').then(r => r.json()).then(cfg => {
+CSApi.fetch('/api/config/cache').then(r => r.json()).then(cfg => {
   for (const [k, v] of Object.entries(cfg)) {
     if (k in CLIENT_TTL && typeof v === 'number') CLIENT_TTL[k] = v * 1000;
   }
 }).catch(() => {});
+// A packaged UI (a static host, the web container) can fail in two ways the
+// embedded UI never sees, and both would otherwise leave pages silently
+// empty. A blocked CORS request (the server does not list this origin)
+// rejects with a TypeError and no status: that becomes code
+// 'network_or_cors'. A wrong API base answers with a static host's HTML:
+// that becomes code 'not_json'. Each shows one toast a minute at most.
+const _apiProblemShownAt = {};
+function apiProblem(code, message, cause) {
+  const err = new Error(message);
+  err.code = code;
+  if (cause) err.cause = cause;
+  const now = Date.now();
+  if (!_apiProblemShownAt[code] || now - _apiProblemShownAt[code] > 60000) {
+    _apiProblemShownAt[code] = now;
+    if (window.CSAuth && typeof window.CSAuth.notify === 'function') window.CSAuth.notify(message);
+  }
+  return err;
+}
+async function apiFetchOrExplain(path) {
+  try {
+    return await CSApi.fetch('/api' + path);
+  } catch (e) {
+    if (CSApi.crossOrigin && e instanceof TypeError) throw apiProblem('network_or_cors', "Can't reach the CoreScope API", e);
+    throw e;
+  }
+}
+function rejectHtmlResponse(res, path) {
+  const ct = res.headers && typeof res.headers.get === 'function' ? res.headers.get('Content-Type') : null;
+  // Only HTML is refused: an /api answer is never a page, while some JSON
+  // handlers leave Content-Type to Go's sniffing (text/plain).
+  if (ct && /^text\/html/i.test(ct)) {
+    const err = apiProblem('not_json', 'Server returned an unexpected response');
+    err.status = res.status;
+    err.path = path;
+    err.retryAfter = res.headers.get('Retry-After');
+    throw err;
+  }
+}
 async function api(path, { ttl = 0, bust = false } = {}) {
   const t0 = performance.now();
   if (!bust && ttl > 0) {
@@ -170,7 +207,13 @@ async function api(path, { ttl = 0, bust = false } = {}) {
     let notified = false;
     try {
       while (true) {
-    const res = await fetch('/api' + path);
+        const res = await apiFetchOrExplain(path);
+        // On a packaged UI, a static host or proxy error page is not a server
+        // warm-up response, even when its status is 503: explain it before
+        // status/retry handling. The embedded UI keeps its old handling: a
+        // proxy's HTML 503 is retried below, and the server's SPA fallback for
+        // an unknown /api path fails to parse.
+        if (!CSApi.embedded) rejectHtmlResponse(res, path);
         if (res.status === 503 && attempt < maxAttempts) {
           const ra = parseInt(res.headers.get('Retry-After'), 10);
           const wait = isFinite(ra) && ra > 0 ? ra * 1000 : delay;
@@ -546,6 +589,15 @@ function formatTimestampWithTooltip(isoString, mode) {
   return { text, tooltip, isFuture };
 }
 
+function renderTimestampHtml(isoString) {
+  const f = formatTimestampWithTooltip(isoString);
+  const warn = f.isFuture
+    ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>'
+    : '';
+  return `<span class="timestamp-text" title="${escapeHtml(f.tooltip)}">${escapeHtml(f.text)}</span>${warn}`;
+}
+window.renderTimestampHtml = renderTimestampHtml;
+
 // Format a Date for chart axis labels, respecting customizer timestamp settings.
 // shortForm: true = time only (for intra-day), false = date+time (multi-day).
 function formatChartAxisLabel(d, shortForm) {
@@ -874,8 +926,7 @@ function connectWS() {
   clearTimeout(wsReconnectTimer);
   wsReconnectTimer = null;
   dropWS();
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const sock = new WebSocket(`${proto}//${location.host}`);
+  const sock = new WebSocket(CSApi.wsUrl('/ws'));
   ws = sock;
   // Measured from creation, so a handshake that never completes is caught too.
   wsLastMessageAt = Date.now();
@@ -1149,18 +1200,38 @@ const pages = {};
 function registerPage(name, mod) { pages[name] = mod; }
 
 // Tools landing page — shows sub-menu with Trace and Path Inspector (spec §2.8, M1 fix).
+function toolsPlannerCardHtml() {
+  return '<a href="#/tools/planner" class="tools-card"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> Repeater Planner</h3><p>Line of sight between points, the best relay for a link, and where new repeaters would best join the backbone.</p></a>';
+}
+let toolsLandingGen = 0;
 registerPage('tools-landing', {
   init: function (container) {
+    var gen = ++toolsLandingGen;
     container.innerHTML =
       '<div class="tools-landing">' +
         '<h2>Tools</h2>' +
         '<div class="tools-menu">' +
           '<a href="#/tools/path-inspector" class="tools-card"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Path Inspector</h3><p>Resolve prefix paths to candidate full-pubkey routes with confidence scoring.</p></a>' +
+          (window.MC_PLANNER_CFG ? toolsPlannerCardHtml() : '') +
           '<a href="#/tools/trace/" class="tools-card"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Trace Viewer</h3><p>View detailed packet traces by hash.</p></a>' +
         '</div>' +
       '</div>';
+    // Cold load: /api/config/client may not have answered yet, so the planner
+    // card is added once MeshConfigReady settles (same pattern as planner.js).
+    var ready = window.MeshConfigReady;
+    if (window.MC_PLANNER_CFG === undefined && ready && typeof ready.then === 'function') {
+      var addCard = function () {
+        if (gen !== toolsLandingGen || !window.MC_PLANNER_CFG) return;
+        var menu = container.querySelector && container.querySelector('.tools-menu');
+        if (!menu || menu.querySelector('a[href="#/tools/planner"]')) return;
+        var first = menu.firstElementChild;
+        if (first) first.insertAdjacentHTML('afterend', toolsPlannerCardHtml());
+        else menu.insertAdjacentHTML('beforeend', toolsPlannerCardHtml());
+      };
+      ready.then(addCard, function () {});
+    }
   },
-  destroy: function () {}
+  destroy: function () { toolsLandingGen++; }
 });
 
 let currentPage = null;
@@ -1188,7 +1259,7 @@ function routeTitle(page, param) {
     home: '', packets: 'Packets', nodes: 'Nodes', map: 'Map', live: 'Live',
     channels: 'Channels', observers: 'Observers', analytics: 'Analytics',
     'scope-audit': 'Scope Audit', perf: 'Performance', 'audio-lab': 'Audio Lab',
-    'tools-landing': 'Tools', traces: 'Packet Trace', 'path-inspector': 'Path Inspector',
+    'tools-landing': 'Tools', traces: 'Packet Trace', 'path-inspector': 'Path Inspector', planner: 'Repeater Planner',
     account: 'Account', admin: 'Admin', compare: 'Observer Comparison', 'rx-coverage': 'RX Coverage',
   };
   return Object.prototype.hasOwnProperty.call(names, page) ? names[page] : 'Not Found';
@@ -1283,6 +1354,10 @@ function navigate() {
     } else if (routeParam === 'path-inspector' || (routeParam && routeParam.startsWith('path-inspector'))) {
       basePage = 'path-inspector';
       routeParam = null;
+    } else if (routeParam === 'planner' || (routeParam && routeParam.startsWith('planner'))) {
+      // Repeater planner (#/tools/planner?mode=...); state lives in the hash query.
+      basePage = 'planner';
+      routeParam = null;
     } else if (!routeParam) {
       // Default tools landing shows menu with both entries.
       basePage = 'tools-landing';
@@ -1295,7 +1370,7 @@ function navigate() {
 
   // Update nav active state
   document.querySelectorAll('.nav-link[data-route]').forEach(el => {
-    el.classList.toggle('active', el.dataset.route === basePage || (el.dataset.route === 'tools' && (basePage === 'traces' || basePage === 'path-inspector' || basePage === 'tools-landing')));
+    el.classList.toggle('active', el.dataset.route === basePage || (el.dataset.route === 'tools' && (basePage === 'traces' || basePage === 'path-inspector' || basePage === 'planner' || basePage === 'tools-landing')));
   });
   // Update "More" button to show active state if a low-priority page is selected
   var moreBtn = document.getElementById('navMoreBtn');
@@ -1322,7 +1397,7 @@ function navigate() {
 
   const app = document.getElementById('app');
   // Pages with fixed-height containers (maps, virtual-scroll, split-panels)
-  const fixedPages = { packets: 1, nodes: 1, map: 1, live: 1, channels: 1, 'audio-lab': 1, globe: 1 };
+  const fixedPages = { packets: 1, nodes: 1, map: 1, live: 1, channels: 1, 'audio-lab': 1 };
   app.classList.toggle('app-fixed', basePage in fixedPages);
 
   // Issue #1369: ?embed=1 chrome suppression for cross-domain iframe embeds.
@@ -1481,17 +1556,15 @@ window.addEventListener('DOMContentLoaded', () => {
   // --- Hamburger Menu ---
   const hamburger = document.getElementById('hamburger');
   const navLinks = document.querySelector('.nav-links');
-  if (hamburger && navLinks) {
-    hamburger.addEventListener('click', () => {
-      const opening = !navLinks.classList.contains('open');
-      navLinks.classList.toggle('open');
-      document.body.classList.toggle('nav-open');
-      hamburger.setAttribute('aria-expanded', String(opening));
-    });
-    navLinks.querySelectorAll('.nav-link').forEach(link => {
-      link.addEventListener('click', closeNav);
-    });
-  }
+  hamburger.addEventListener('click', () => {
+    const opening = !navLinks.classList.contains('open');
+    navLinks.classList.toggle('open');
+    document.body.classList.toggle('nav-open');
+    hamburger.setAttribute('aria-expanded', String(opening));
+  });
+  navLinks.querySelectorAll('.nav-link').forEach(link => {
+    link.addEventListener('click', closeNav);
+  });
 
   // --- "More" dropdown — JS-driven Priority+ (Issue #1102) ---
   const navMoreBtn = document.getElementById('navMoreBtn');
@@ -1581,15 +1654,6 @@ window.addEventListener('DOMContentLoaded', () => {
       // Reset: show everything, then hide as needed.
       allLinks.forEach(a => a.classList.remove('is-overflow'));
       navMoreWrap.classList.remove('is-hidden');
-      // Chicago Offline override: always force non-priority links to overflow
-      // (CSS hides them inline; this ensures they populate the More dropdown)
-      if (window.innerWidth >= 1024) {
-        allLinks.forEach(a => {
-          if (a.dataset.priority !== 'high') a.classList.add('is-overflow');
-        });
-        rebuildMoreMenu();
-        return;
-      }
       // #1106: in the 768-1100px narrow-desktop band the CSS already
       // hides .nav-stats and tightens .nav-link padding (see the
       // "Nav narrow-desktop tightening" media query in style.css).
@@ -1858,9 +1922,9 @@ window.addEventListener('DOMContentLoaded', () => {
     searchTimeout = setTimeout(async () => {
       try {
         const [packets, nodes, channels, reported] = await Promise.all([
-          fetch('/api/packets?limit=5&hash=' + encodeURIComponent(q)).then(r => r.json()).catch(() => ({ packets: [] })),
-          fetch('/api/nodes?search=' + encodeURIComponent(q)).then(r => r.json()).catch(() => []),
-          fetch('/api/channels').then(r => r.json()).catch(() => []),
+          CSApi.fetch('/api/packets?limit=5&hash=' + encodeURIComponent(q)).then(r => r.json()).catch(() => ({ packets: [] })),
+          CSApi.fetch('/api/nodes?search=' + encodeURIComponent(q)).then(r => r.json()).catch(() => []),
+          CSApi.fetch('/api/channels').then(r => r.json()).catch(() => []),
           // Repeaters known only from their reported name are not in /api/nodes.
           window.ReportedNodes ? window.ReportedNodes.load() : Promise.resolve({ nodes: [] })
         ]);
@@ -1936,7 +2000,7 @@ window.addEventListener('DOMContentLoaded', () => {
       const stats = await api('/stats', { ttl: CLIENT_TTL.stats });
       const el = document.getElementById('navStats');
       if (el) {
-        el.innerHTML = `<span class="stat-val">${stats.totalPackets}</span> <svg width="14" height="14" viewBox="0 0 20 20" fill="none" class="stat-icon" title="packets"><rect x="2" y="2" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="12" y="2" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="2" y="12" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="12" y="12" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5"/></svg> · <span class="stat-val">${stats.totalNodes}</span> <svg width="14" height="14" viewBox="0 0 20 20" fill="none" class="stat-icon" title="nodes"><circle cx="10" cy="3" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="4" cy="12" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="16" cy="12" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="10" cy="17" r="2" stroke="currentColor" stroke-width="1.5"/><line x1="10" y1="5" x2="10" y2="15" stroke="currentColor" stroke-width="1.5"/><line x1="8.5" y1="4" x2="5.5" y2="11" stroke="currentColor" stroke-width="1.5"/><line x1="11.5" y1="4" x2="14.5" y2="11" stroke="currentColor" stroke-width="1.5"/></svg> · <span class="stat-val">${stats.totalObservers}</span> <svg width="14" height="14" viewBox="0 0 20 20" fill="none" class="stat-icon" title="observers"><path d="M10 2 L10 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="10" r="2" stroke="currentColor" stroke-width="1.5"/><path d="M4 6 L7.5 8.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M16 6 L12.5 8.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M3 14 L8 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M17 14 L12 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>${formatVersionBadge(stats.version, stats.commit, stats.engine, stats.buildTime)}`;
+        el.innerHTML = `<span class="stat-val">${stats.totalPackets}</span> pkts · <span class="stat-val">${stats.totalNodes}</span> nodes · <span class="stat-val">${stats.totalObservers}</span> obs`;
         el.querySelectorAll('.stat-val').forEach(s => s.classList.add('updated'));
         setTimeout(() => { el.querySelectorAll('.stat-val').forEach(s => s.classList.remove('updated')); }, 600);
         if (navPriorityFn) navPriorityFn();
@@ -1955,7 +2019,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // --- Theme Customization ---
   // Fetch theme config and apply via customizer v2 pipeline
-  fetch('/api/config/theme', { cache: 'no-store' }).then(r => r.json()).then(cfg => {
+  CSApi.fetch('/api/config/theme', { cache: 'no-store' }).then(r => r.json()).then(cfg => {
     // Normalize timestamp defaults
     cfg = cfg || {};
     if (!cfg.timestamps) cfg.timestamps = {};

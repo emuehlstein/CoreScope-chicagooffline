@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [3.18.0] - 2026-11-17
+
+See [docs/release-notes/v3.18.0.md](docs/release-notes/v3.18.0.md) for the full notes. 11 commits since v3.17.0: 5 fix, 3 feat, 1 test, 1 refactor, 1 docs.
+
+### Highlights
+- **`users.db` migrates to schema v9 with user accounts on** (#2415) - a v3.17.x binary refuses it afterwards, so keep the pre-upgrade copy for a rollback.
+- **The UI's live feed connects to `/ws` instead of `/`** (#2383) - a reverse proxy that forwards WebSocket upgrades only on `/` must forward `/ws` too.
+- **Radio line of sight on packet routes and a repeater planner** (#2391) - SRTM terrain, in memory only. Opt-in (`los`, `planner`).
+- **Repeater info and claims** (#2415, #2416, #2417) - height, gain, power, status and notes per repeater, edited by registered users. Needs user accounts.
+- **Three ways to deploy the UI** (#2383) - all-in-one as today, a separate web container, or a static host against a server on another origin.
+- **Memory after eviction** (#2327) and **map tile overrides on every page** (#2386).
+
+No manual migration step.
+
+## [3.17.0] - 2026-11-11
+
+See [docs/release-notes/v3.17.0.md](docs/release-notes/v3.17.0.md) for the full notes. 24 commits since v3.16.0: 11 fix, 5 docs, 4 feat, 2 test, 1 ui, 1 chore.
+
+### Highlights
+- **Neighbour reports hide blacklisted and hidden nodes** (#2357) - the only change visible without configuring anything; reported totals and stored reports are unchanged.
+- **Map markers after a saved position past 180 degrees** (#2378) and **native arm64 image builds** (#2359) - fixes for problems operators reported on v3.16.0.
+- **A UI on another origin** (#2362) - `corsAllowedOrigins` wildcards for preview deployments, case-insensitive matching, exposed `Retry-After` and `X-CoreScope-Load-Status`. Opt-in.
+- **Map**: historical foreign-advert flag (#2371) and deep links to a chosen path view (#2376); node pages link to the map and packets (#2295).
+- **CoreDrive RX QR code on the Coverage page** (#2389) with `clientRxCoverage.appUrl`. Opt-in.
+
+No manual migration step.
+
 ## [3.16.0] - 2026-10-29
 
 See [docs/release-notes/v3.16.0.md](docs/release-notes/v3.16.0.md) for the full notes. 47 commits since v3.15.0: 23 fix, 9 feat, 6 docs, 2 test, 2 perf, 2 ci, 1 ui, 1 deps, 1 chore.
